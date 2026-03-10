@@ -64,6 +64,8 @@ sentry_target_sources_cwd(sentry
 	transports/sentry_disk_transport.c
 	transports/sentry_disk_transport.h
 	transports/sentry_function_transport.c
+	transports/sentry_http_transport.c
+	transports/sentry_http_transport.h
 	unwinder/sentry_unwinder.c
 )
 
@@ -119,11 +121,11 @@ endif()
 # transport
 if(SENTRY_TRANSPORT_CURL)
 	sentry_target_sources_cwd(sentry
-		transports/sentry_transport_curl.c
+		transports/sentry_http_transport_curl.c
 	)
 elseif(SENTRY_TRANSPORT_WINHTTP)
 	sentry_target_sources_cwd(sentry
-		transports/sentry_transport_winhttp.c
+		transports/sentry_http_transport_winhttp.c
 	)
 elseif(SENTRY_TRANSPORT_NONE)
 	sentry_target_sources_cwd(sentry
@@ -152,6 +154,56 @@ elseif(SENTRY_BACKEND_INPROC)
 	sentry_target_sources_cwd(sentry
 		backends/sentry_backend_inproc.c
 	)
+elseif(SENTRY_BACKEND_NATIVE)
+	target_compile_definitions(sentry PRIVATE SENTRY_BACKEND_NATIVE)
+	sentry_target_sources_cwd(sentry
+		backends/sentry_backend_native.c
+		backends/native/sentry_crash_ipc.c
+		backends/native/sentry_crash_daemon.c
+		backends/native/sentry_crash_handler.c
+		backends/native/minidump/sentry_minidump_format.h
+		backends/native/minidump/sentry_minidump_writer.h
+	)
+
+	# Platform-specific minidump writers
+	if(LINUX OR ANDROID)
+		sentry_target_sources_cwd(sentry
+			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_linux.c
+		)
+	elseif(APPLE)
+		sentry_target_sources_cwd(sentry
+			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_macos.c
+		)
+	elseif(WIN32)
+		sentry_target_sources_cwd(sentry
+			backends/native/minidump/sentry_minidump_windows.c
+		)
+	endif()
+
+	# Add include directory for native backend headers
+	target_include_directories(sentry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backends/native)
+
+	# Platform-specific libraries for native backend
+	if(LINUX OR ANDROID)
+		# Linux needs pthread and rt for shared memory
+		target_link_libraries(sentry PRIVATE pthread rt)
+	elseif(APPLE)
+		# macOS needs CoreFoundation and Security frameworks
+		find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+		find_library(SECURITY_LIBRARY Security REQUIRED)
+		target_link_libraries(sentry PRIVATE
+			${COREFOUNDATION_LIBRARY}
+			${SECURITY_LIBRARY}
+		)
+	elseif(WIN32)
+		# Windows needs dbghelp for MiniDumpWriteDump
+		target_link_libraries(sentry PRIVATE dbghelp)
+	endif()
+
+	# Enable C11 for atomics support
+	set_property(TARGET sentry PROPERTY C_STANDARD 11)
 elseif(SENTRY_BACKEND_NONE)
 	sentry_target_sources_cwd(sentry
 		backends/sentry_backend_none.c

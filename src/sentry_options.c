@@ -8,6 +8,7 @@
 #include "sentry_string.h"
 #include "sentry_sync.h"
 #include "sentry_transport.h"
+#include "sentry_utils.h"
 #include <stdlib.h>
 
 sentry_options_t *
@@ -69,12 +70,18 @@ sentry_options_new(void)
 #endif
     opts->backend = sentry__backend_new();
     opts->transport = sentry__transport_new_default();
-    opts->sample_rate = 1.0;
     opts->refcount = 1;
     opts->shutdown_timeout = SENTRY_DEFAULT_SHUTDOWN_TIMEOUT;
-    opts->traces_sample_rate = 0.0;
+    sentry_options_set_sample_rate(
+        opts, sentry__getenv_double("SENTRY_SAMPLE_RATE", 1.0));
+    sentry_options_set_traces_sample_rate(
+        opts, sentry__getenv_double("SENTRY_TRACES_SAMPLE_RATE", 0.0));
     opts->max_spans = SENTRY_SPANS_MAX;
     opts->handler_strategy = SENTRY_HANDLER_STRATEGY_DEFAULT;
+    opts->minidump_mode = SENTRY_MINIDUMP_MODE_SMART; // Default: balanced mode
+    opts->crash_reporting_mode
+        = SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP; // Default: best of
+                                                            // both worlds
 
     return opts;
 }
@@ -522,6 +529,39 @@ sentry_options_set_system_crash_reporter_enabled(
     sentry_options_t *opts, int enabled)
 {
     opts->system_crash_reporter_enabled = !!enabled;
+}
+
+void
+sentry_options_set_minidump_mode(
+    sentry_options_t *opts, sentry_minidump_mode_t mode)
+{
+    // Clamp to valid range
+    if (mode < SENTRY_MINIDUMP_MODE_STACK_ONLY) {
+        mode = SENTRY_MINIDUMP_MODE_STACK_ONLY;
+    } else if (mode > SENTRY_MINIDUMP_MODE_FULL) {
+        mode = SENTRY_MINIDUMP_MODE_FULL;
+    }
+    opts->minidump_mode = mode;
+}
+
+void
+sentry_options_set_crash_reporting_mode(
+    sentry_options_t *opts, sentry_crash_reporting_mode_t mode)
+{
+    // Clamp to valid range (cast to int to handle negative values)
+    int imode = (int)mode;
+    if (imode < SENTRY_CRASH_REPORTING_MODE_MINIDUMP) {
+        imode = SENTRY_CRASH_REPORTING_MODE_MINIDUMP;
+    } else if (imode > SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP) {
+        imode = SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP;
+    }
+    opts->crash_reporting_mode = imode;
+}
+
+sentry_crash_reporting_mode_t
+sentry_options_get_crash_reporting_mode(const sentry_options_t *opts)
+{
+    return (sentry_crash_reporting_mode_t)opts->crash_reporting_mode;
 }
 
 void
