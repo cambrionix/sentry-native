@@ -2,8 +2,9 @@
 	path = external/libunwindstack-ndk
 	url = https://github.com/getsentry/libunwindstack-ndk
 [submodule "external/breakpad"]
-	path = external/breakpad
-	url = https://github.com/getsentry/breakpad.git
+    path = external/breakpad
+    url = git@bitbucket.org:cambrionix/breakpad.git
+    branch = Cambrionix
 [submodule "external/third_party/lss"]
 	path = external/third_party/lss
 	url = https://github.com/getsentry/chromium-linux-syscall-support
