@@ -3,10 +3,12 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
-from tests.conditions import is_tsan, is_x86, is_asan
+from tests import adb
+from tests.conditions import is_android, is_tsan, is_x86, is_asan
 
 project_fixture_path = pathlib.Path("tests/fixtures/dotnet_signal")
 
@@ -49,19 +51,23 @@ def run_dotnet(tmp_path, args):
 
 
 def run_dotnet_managed_exception(tmp_path):
-    return run_dotnet(tmp_path, ["dotnet", "run", "managed-exception"])
+    return run_dotnet(
+        tmp_path, ["dotnet", "run", "-f:net10.0", "--", "managed-exception"]
+    )
 
 
 def run_dotnet_unhandled_managed_exception(tmp_path):
-    return run_dotnet(tmp_path, ["dotnet", "run", "unhandled-managed-exception"])
+    return run_dotnet(
+        tmp_path, ["dotnet", "run", "-f:net10.0", "--", "unhandled-managed-exception"]
+    )
 
 
 def run_dotnet_native_crash(tmp_path):
-    return run_dotnet(tmp_path, ["dotnet", "run", "native-crash"])
+    return run_dotnet(tmp_path, ["dotnet", "run", "-f:net10.0", "--", "native-crash"])
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux" or is_x86 or is_asan or is_tsan,
+    bool(sys.platform != "linux" or is_x86 or is_asan or is_tsan or is_android),
     reason="dotnet signal handling is currently only supported on 64-bit Linux without sanitizers",
 )
 def test_dotnet_signals_inproc(cmake):
@@ -165,7 +171,7 @@ def run_aot_native_crash(tmp_path):
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux" or is_x86 or is_asan or is_tsan,
+    bool(sys.platform != "linux" or is_x86 or is_asan or is_tsan or is_android),
     reason="dotnet AOT signal handling is currently only supported on 64-bit Linux without sanitizers",
 )
 def test_aot_signals_inproc(cmake):
@@ -199,6 +205,7 @@ def test_aot_signals_inproc(cmake):
             [
                 "dotnet",
                 "publish",
+                "-f:net10.0",
                 "-p:PublishAot=true",
                 "-p:Configuration=Release",
                 "-o",
@@ -255,3 +262,259 @@ def test_aot_signals_inproc(cmake):
         shutil.rmtree(tmp_path / ".sentry-native", ignore_errors=True)
         shutil.rmtree(project_fixture_path / "bin", ignore_errors=True)
         shutil.rmtree(project_fixture_path / "obj", ignore_errors=True)
+
+
+ANDROID_PACKAGE = "io.sentry.ndk.dotnet.signal.test"
+
+
+def wait_for(condition, timeout=10, interval=0.5):
+    start = time.time()
+    while time.time() - start < timeout:
+        if condition():
+            return True
+        time.sleep(interval)
+    return condition()
+
+
+def run_android(args=None, strategy=None, reinit=False, timeout=30):
+    if args is None:
+        args = []
+    adb("logcat", "-c")
+    adb("shell", "am", "force-stop", ANDROID_PACKAGE)
+    adb(
+        "shell", "run-as {} sh -c 'rm -rf files/.sentry-native'".format(ANDROID_PACKAGE)
+    )
+    intent_args = []
+    for arg in args:
+        intent_args += ["--es", "arg", arg]
+    if strategy:
+        intent_args += ["--es", "strategy", strategy]
+    if reinit:
+        intent_args += ["--es", "reinit", "true"]
+    try:
+        adb(
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            "{}/dotnet_signal.MainActivity".format(ANDROID_PACKAGE),
+            *intent_args,
+            check=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+    pid = adb(
+        "shell", "pidof", ANDROID_PACKAGE, capture_output=True, text=True
+    ).stdout.strip()
+    wait_for(
+        lambda: adb(
+            "shell", "pidof", ANDROID_PACKAGE, capture_output=True, text=True
+        ).returncode
+        != 0,
+        timeout=timeout,
+    )
+    logcat_args = ["logcat", "-d"]
+    if pid:
+        logcat_args += ["--pid=" + pid]
+    return adb(*logcat_args, capture_output=True, text=True).stdout
+
+
+def run_android_managed_exception(strategy=None, reinit=False):
+    return run_android(["managed-exception"], strategy=strategy, reinit=reinit)
+
+
+def run_android_unhandled_managed_exception(strategy=None):
+    return run_android(["unhandled-managed-exception"], strategy=strategy)
+
+
+def run_android_native_crash(strategy=None, reinit=False):
+    return run_android(["native-crash"], strategy=strategy, reinit=reinit)
+
+
+ndk_aar_path = (
+    pathlib.Path(__file__).parent.parent
+    / "ndk"
+    / "lib"
+    / "build"
+    / "outputs"
+    / "aar"
+    / "sentry-native-ndk-release.aar"
+)
+
+
+@pytest.mark.skipif(
+    not is_android or int(is_android) < 26,
+    reason="needs Android API 26+ (tombstoned)",
+)
+# Mono on Android keeps using CHAIN_AT_START. Preload is the CoreCLR path,
+# where sentry-native can enter the signal chain before the runtime installs
+# its own handlers.
+@pytest.mark.parametrize(
+    "runtime,strategy",
+    [
+        ("mono", "chain-at-start"),
+        ("coreclr", "preload"),
+    ],
+)
+def test_android_signals_inproc(cmake, runtime, strategy):
+    if shutil.which("dotnet") is None:
+        pytest.skip("dotnet is not installed")
+
+    if strategy == "preload":
+        ndk_dir = pathlib.Path(__file__).parent.parent / "ndk"
+        subprocess.run(["./gradlew", "assembleRelease"], cwd=ndk_dir, check=True)
+
+    use_mono = runtime == "mono"
+    is_preload = strategy == "preload"
+
+    arch = os.environ.get("ANDROID_ARCH", "x86_64")
+    rid_map = {
+        "x86_64": "android-x64",
+        "x86": "android-x86",
+        "arm64-v8a": "android-arm64",
+        "armeabi-v7a": "android-arm",
+    }
+
+    try:
+        tmp_path = cmake(
+            ["sentry"],
+            {"SENTRY_BACKEND": "inproc", "SENTRY_TRANSPORT": "none"},
+        )
+
+        # build libcrash.so with NDK clang
+        ndk_prebuilt = pathlib.Path(
+            "{}/ndk/{}/toolchains/llvm/prebuilt".format(
+                os.environ["ANDROID_HOME"], os.environ["ANDROID_NDK"]
+            )
+        )
+        triples = {
+            "x86_64": "x86_64-linux-android",
+            "x86": "i686-linux-android",
+            "arm64-v8a": "aarch64-linux-android",
+            "armeabi-v7a": "armv7a-linux-androideabi",
+        }
+        ndk_clang = str(
+            next(ndk_prebuilt.iterdir())
+            / "bin"
+            / "{}{}-clang".format(triples[arch], os.environ["ANDROID_API"])
+        )
+        native_lib_dir = project_fixture_path / "native" / arch
+        native_lib_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                ndk_clang,
+                "-Wall",
+                "-Wextra",
+                "-fPIC",
+                "-shared",
+                str(project_fixture_path / "crash.c"),
+                "-o",
+                str(native_lib_dir / "libcrash.so"),
+            ],
+            check=True,
+        )
+
+        # for chain-at-start, bundle the cmake-built libsentry.so directly
+        # (preload uses the AAR which brings its own libsentry.so)
+        if not is_preload:
+            shutil.copy2(tmp_path / "libsentry.so", native_lib_dir / "libsentry.so")
+
+        # build and install the APK
+        build_args = [
+            "dotnet",
+            "build",
+            "-f:net10.0-android",
+            "-p:RuntimeIdentifier={}".format(rid_map[arch]),
+            "-p:Configuration=Release",
+            "-p:UseMonoRuntime={}".format(str(use_mono).lower()),
+        ]
+        if is_preload:
+            build_args += [
+                "-p:EnablePreload=true",
+                "-p:NdkAarPath={}".format(ndk_aar_path),
+            ]
+        subprocess.run(build_args, cwd=project_fixture_path, check=True)
+        apk_dir = (
+            project_fixture_path / "bin" / "Release" / "net10.0-android" / rid_map[arch]
+        )
+        apk_path = next(apk_dir.glob("*-Signed.apk"))
+        adb("install", "-r", str(apk_path), check=True)
+
+        def run_as(cmd, **kwargs):
+            return adb(
+                "shell",
+                'run-as {} sh -c "{}"'.format(ANDROID_PACKAGE, cmd),
+                **kwargs,
+            )
+
+        db = "files/.sentry-native"
+
+        def file_exists(path):
+            return run_as("test -f " + path, capture_output=True).returncode == 0
+
+        def dir_exists(path):
+            return run_as("test -d " + path, capture_output=True).returncode == 0
+
+        def has_envelope():
+            result = run_as(
+                "find " + db + " -name '*.envelope'", capture_output=True, text=True
+            )
+            return bool(result.stdout.strip())
+
+        # Preload replaces CHAIN_AT_START in the CoreCLR path. Once the runtime
+        # chains native crashes back to sentry-native, the app-side handler strategy
+        # should be DEFAULT rather than CHAIN_AT_START.
+        app_strategy = "default-strategy" if is_preload else None
+
+        # managed exception: handled, no crash
+        logcat = run_android_managed_exception(strategy=app_strategy)
+        assert not (
+            "NullReferenceException" in logcat
+        ), f"Managed exception leaked.\nlogcat:\n{logcat}"
+        assert wait_for(lambda: dir_exists(db)), "No database-path exists"
+        assert not file_exists(db + "/last_crash"), "A crash was registered"
+        assert not has_envelope(), "Unexpected envelope found"
+
+        # unhandled managed exception: the runtime calls exit(1), the native
+        # SDK should not register a crash (sentry-dotnet handles this at the
+        # managed layer via UnhandledExceptionRaiser)
+        logcat = run_android_unhandled_managed_exception(strategy=app_strategy)
+        assert (
+            "NullReferenceException" in logcat
+        ), f"Expected NullReferenceException.\nlogcat:\n{logcat}"
+        assert wait_for(lambda: dir_exists(db)), "No database-path exists"
+        assert not file_exists(db + "/last_crash"), "A crash was registered"
+        assert not has_envelope(), "Unexpected envelope found"
+
+        # native crash
+        run_android_native_crash(strategy=app_strategy)
+        assert wait_for(lambda: file_exists(db + "/last_crash")), "Crash marker missing"
+        assert wait_for(has_envelope), "Crash envelope is missing"
+
+        if is_preload:
+            # after close/reinit, managed exceptions must still be handled by
+            # the runtime (not caught as native crashes by sentry)
+            logcat = run_android_managed_exception(strategy=app_strategy, reinit=True)
+            assert not (
+                "NullReferenceException" in logcat
+            ), f"Managed exception leaked after reinit.\nlogcat:\n{logcat}"
+            assert wait_for(lambda: dir_exists(db)), "No database-path exists"
+            assert not file_exists(
+                db + "/last_crash"
+            ), "A crash was registered after reinit"
+            assert not has_envelope(), "Unexpected envelope found after reinit"
+
+            # after close/reinit, native crashes must still be captured through
+            # the preloaded chain position
+            run_android_native_crash(strategy=app_strategy, reinit=True)
+            assert wait_for(
+                lambda: file_exists(db + "/last_crash")
+            ), "Crash marker missing after reinit"
+            assert wait_for(has_envelope), "Crash envelope is missing after reinit"
+    finally:
+        shutil.rmtree(project_fixture_path / "native", ignore_errors=True)
+        shutil.rmtree(project_fixture_path / "bin", ignore_errors=True)
+        shutil.rmtree(project_fixture_path / "obj", ignore_errors=True)
+        adb("uninstall", ANDROID_PACKAGE, check=False)

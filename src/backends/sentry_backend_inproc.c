@@ -26,6 +26,10 @@
 #ifdef SENTRY_PLATFORM_UNIX
 #    include <poll.h>
 #endif
+#ifdef SENTRY_PLATFORM_ANDROID
+#    include <android/api-level.h>
+#    include <sys/syscall.h>
+#endif
 #include <string.h>
 
 /**
@@ -195,6 +199,14 @@ static volatile long g_handler_has_work = 0;
 #define CRASH_STATE_HANDLING 1
 #define CRASH_STATE_DONE 2
 static volatile long g_crash_handling_state = CRASH_STATE_IDLE;
+
+// Set once handlers were installed via sentry__backend_preload(). In this
+// mode sentry may keep its chain position across sentry_close() until either
+// full init reuses it, or a pre-init/post-close signal falls through, and
+// consumes the preload state.
+#ifdef SENTRY_PLATFORM_UNIX
+static volatile long g_preloaded = 0;
+#endif
 
 // trigger/schedule primitives that block the other side until this side is done
 #ifdef SENTRY_PLATFORM_UNIX
@@ -465,6 +477,37 @@ invoke_signal_handler(int signum, siginfo_t *info, void *user_context)
 }
 
 static int
+install_signal_handlers(void)
+{
+    if (sentry__atomic_fetch(&g_preloaded)) {
+        return 0;
+    }
+
+    memset(g_previous_handlers, 0, sizeof(g_previous_handlers));
+    for (size_t i = 0; i < SIGNAL_COUNT; ++i) {
+        if (sigaction(
+                SIGNAL_DEFINITIONS[i].signum, NULL, &g_previous_handlers[i])
+            == -1) {
+            return 1;
+        }
+    }
+
+    setup_sigaltstack(&g_signal_stack, "init");
+
+    sigemptyset(&g_sigaction.sa_mask);
+    g_sigaction.sa_sigaction = handle_signal;
+    // SA_NODEFER allows the signal to be delivered while the handler is
+    // running. This is needed for recursive crash detection to work -
+    // without it, a crash during crash handling would block the signal
+    // and leave the process in an undefined state.
+    g_sigaction.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    for (size_t i = 0; i < SIGNAL_COUNT; ++i) {
+        sigaction(SIGNAL_DEFINITIONS[i].signum, &g_sigaction, NULL);
+    }
+    return 0;
+}
+
+static int
 startup_inproc_backend(
     sentry_backend_t *backend, const sentry_options_t *options)
 {
@@ -480,6 +523,17 @@ startup_inproc_backend(
         options ? sentry_options_get_handler_strategy(options) :
 #    endif
                 SENTRY_HANDLER_STRATEGY_DEFAULT;
+#    ifdef SENTRY_PLATFORM_ANDROID
+    // CHAIN_AT_START invokes the previous handler and expects to regain
+    // control. On Android API < 26, the old debuggerd daemon kills the
+    // crashing process via SIGKILL after the chained handler triggers
+    // it, so we fall back to DEFAULT which chains at the end instead.
+    if (g_backend_config.handler_strategy
+            == SENTRY_HANDLER_STRATEGY_CHAIN_AT_START
+        && android_get_device_api_level() < 26) {
+        g_backend_config.handler_strategy = SENTRY_HANDLER_STRATEGY_DEFAULT;
+    }
+#    endif
     if (backend) {
         backend->data = &g_backend_config;
     }
@@ -488,30 +542,7 @@ startup_inproc_backend(
         return 1;
     }
 
-    // save the old signal handlers
-    memset(g_previous_handlers, 0, sizeof(g_previous_handlers));
-    for (size_t i = 0; i < SIGNAL_COUNT; ++i) {
-        if (sigaction(
-                SIGNAL_DEFINITIONS[i].signum, NULL, &g_previous_handlers[i])
-            == -1) {
-            return 1;
-        }
-    }
-
-    setup_sigaltstack(&g_signal_stack, "init");
-
-    // install our own signal handler
-    sigemptyset(&g_sigaction.sa_mask);
-    g_sigaction.sa_sigaction = handle_signal;
-    // SA_NODEFER allows the signal to be delivered while the handler is
-    // running. This is needed for recursive crash detection to work -
-    // without it, a crash during crash handling would block the signal
-    // and leave the process in an undefined state.
-    g_sigaction.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
-    for (size_t i = 0; i < SIGNAL_COUNT; ++i) {
-        sigaction(SIGNAL_DEFINITIONS[i].signum, &g_sigaction, NULL);
-    }
-    return 0;
+    return install_signal_handlers();
 }
 
 static void
@@ -519,8 +550,19 @@ shutdown_inproc_backend(sentry_backend_t *backend)
 {
     stop_handler_thread();
 
-    teardown_sigaltstack(&g_signal_stack);
-    reset_signal_handlers();
+    // In Android preload mode, we intentionally keep our signal handlers
+    // installed across shutdown. The handler thread is torn down, but our
+    // position in the signal chain must remain stable so that a later
+    // sentry_init() can reactivate full crash handling without losing the
+    // ordering relative to the managed runtime.
+    //
+    // While in this state, full inproc crash processing is inactive and any
+    // signal we still observe will fall through to the previously installed
+    // handler.
+    if (!sentry__atomic_fetch(&g_preloaded)) {
+        teardown_sigaltstack(&g_signal_stack);
+        reset_signal_handlers();
+    }
 
     if (backend) {
         backend->data = NULL;
@@ -1175,7 +1217,7 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
                 sentry__attachment_free(screenshot);
             }
 
-            if (!sentry__launch_external_crash_reporter(envelope)) {
+            if (!sentry__launch_external_crash_reporter(options, envelope)) {
                 // capture the envelope with the disk transport
                 sentry_transport_t *disk_transport
                     = sentry_new_disk_transport(options->run);
@@ -1351,7 +1393,7 @@ has_handler_thread_crashed(void)
     return false;
 }
 
-static void
+static bool
 dispatch_ucontext(const sentry_ucontext_t *uctx,
     const struct signal_slot *sig_slot, int handler_depth)
 {
@@ -1365,7 +1407,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
     // Disable stdio-based logging - not safe in signal handler context.
     sentry__logger_disable();
     process_ucontext_deferred(uctx, sig_slot, skip_hooks);
-    return;
+    return true;
 #else
     if (has_handler_thread_crashed()) {
         // Disable stdio-based logging since we're now in signal handler context
@@ -1377,7 +1419,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
         // Always skip hooks here since the first attempt (from handler thread)
         // already failed, likely due to a crashing hook.
         process_ucontext_deferred(uctx, sig_slot, true);
-        return;
+        return true;
     }
 
     // Try to become the crash handler. Only one thread can transition
@@ -1398,7 +1440,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
             sentry__cpu_relax();
         }
         // State is now DONE: just return and let the signal propagate
-        return;
+        return false;
     }
 
     // We are the first handler. Check if handler thread is available.
@@ -1406,7 +1448,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
         // Disable stdio-based logging - not safe in signal handler context.
         sentry__logger_disable();
         process_ucontext_deferred(uctx, sig_slot, skip_hooks);
-        return;
+        return true;
     }
 
     g_handler_state.uctx = *uctx;
@@ -1460,7 +1502,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
         int depth = sentry__enter_signal_handler();
         if (depth >= 3) {
             // Multiple recursive crashes - bail out
-            return;
+            return true;
         }
         // Disable stdio-based logging - not safe in signal handler context.
         sentry__logger_disable();
@@ -1469,7 +1511,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
         // always 1, which would incorrectly re-run hooks on a recursive
         // crash where the pipe also fails.
         process_ucontext_deferred(uctx, sig_slot, skip_hooks);
-        return;
+        return true;
     }
 #    elif defined(SENTRY_PLATFORM_WINDOWS)
     if (g_handler_semaphore) {
@@ -1486,7 +1528,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
         // Disable stdio-based logging - not safe in signal handler context.
         sentry__logger_disable();
         process_ucontext_deferred(uctx, sig_slot, skip_hooks);
-        return;
+        return true;
     }
 #    endif
 
@@ -1516,6 +1558,7 @@ dispatch_ucontext(const sentry_ucontext_t *uctx,
     (void)!sentry__enter_signal_handler();
 #    endif
 
+    return true;
 #endif
 }
 
@@ -1563,6 +1606,29 @@ process_ucontext(const sentry_ucontext_t *uctx)
         uintptr_t ip = get_instruction_pointer(uctx);
         uintptr_t sp = get_stack_pointer(uctx);
 
+#    ifdef SENTRY_PLATFORM_ANDROID
+        // Mask the signal so SA_NODEFER doesn't let re-raises from the chained
+        // handler kill the process before we regain control.
+        sigset_t mask, old_mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, uctx->signum);
+        // Raw syscall because ART's libsigchain intercepts
+        // sigprocmask() and silently drops the request when called
+        // outside its own special handlers. Without the raw syscall
+        // the mask change would be ignored and SA_NODEFER would let
+        // the chained handler's raise() re-deliver the signal
+        // immediately, crashing the process before we can inspect
+        // the modified IP/SP.
+        //
+        // DANGER: this makes libsigchain's internal mask state
+        // diverge from the kernel's actual mask. If ART ever relies
+        // on that state for correctness (e.g. GC safepoints), this
+        // could cause subtle failures. We restore the mask right
+        // after the chained handler returns, limiting the window.
+        syscall(
+            SYS_rt_sigprocmask, SIG_BLOCK, &mask, &old_mask, sizeof(sigset_t));
+#    endif
+
         // invoke the previous handler (typically the CLR/Mono
         // signal-to-managed-exception handler)
         invoke_signal_handler(
@@ -1578,6 +1644,19 @@ process_ucontext(const sentry_ucontext_t *uctx)
             return;
         }
 
+#    ifdef SENTRY_PLATFORM_ANDROID
+        // restore our handler after resend_signal() set SIG_DFL
+        sigaction(uctx->signum, &g_sigaction, NULL);
+
+        // consume pending signal
+        struct timespec timeout = { 0, 0 };
+        syscall(SYS_rt_sigtimedwait, &mask, NULL, &timeout, sizeof(sigset_t));
+
+        // unmask
+        syscall(
+            SYS_rt_sigprocmask, SIG_SETMASK, &old_mask, NULL, sizeof(sigset_t));
+#    endif
+
         // return from runtime handler; continue processing the crash on the
         // signal thread until the worker takes over
     }
@@ -1590,6 +1669,34 @@ process_ucontext(const sentry_ucontext_t *uctx)
         SENTRY_SIGNAL_SAFE_LOG(
             "multiple recursive crashes detected, bailing out");
         goto cleanup;
+    }
+
+    // If we were only preloaded (before sentry_init()) or were closed after
+    // preload (handlers still installed, but no handler thread), do not attempt
+    // full crash capture here. In this state, preload only serves as a
+    // placeholder in the signal chain.
+    //
+    // We therefore remove our placeholder from the chain and forward the
+    // signal to the previously installed handler set.
+    //
+    // This path is expected to be terminal for real crash signals. If it
+    // returns, preload mode is consumed for the remainder of the process
+    // lifetime until a later sentry_init() reinstalls handlers from the
+    // then-current chain.
+    //
+    // This also covers the window after preload but before the managed runtime
+    // has installed its own handlers: a signal seen in that window is forwarded
+    // to the pre-preload handler set rather than being captured by Sentry.
+    if (sentry__atomic_fetch(&g_preloaded)
+        && !sentry__atomic_fetch(&g_handler_thread_ready)) {
+        SENTRY_SIGNAL_SAFE_LOG(
+            "handler thread not ready, falling through to previous handler");
+        reset_signal_handlers();
+        sentry__atomic_store(&g_preloaded, 0);
+        sentry__leave_signal_handler();
+        invoke_signal_handler(
+            uctx->signum, uctx->siginfo, (void *)uctx->user_context);
+        return;
     }
 #endif
 
@@ -1618,10 +1725,17 @@ process_ucontext(const sentry_ucontext_t *uctx)
 
     // invoke the handler thread for signal unsafe actions
 #ifdef SENTRY_PLATFORM_UNIX
-    dispatch_ucontext(uctx, sig_slot, handler_depth);
+    bool is_handling_thread = dispatch_ucontext(uctx, sig_slot, handler_depth);
 #else
-    dispatch_ucontext(uctx, sig_slot, 1);
+    bool is_handling_thread = dispatch_ucontext(uctx, sig_slot, 1);
 #endif
+
+    // Non-handling threads (that lost the CAS race) should just return.
+    // Signal handlers are already reset by the handling thread, so
+    // re-executing the crashing instruction will hit the default handler.
+    if (!is_handling_thread) {
+        return;
+    }
 
 #ifdef SENTRY_PLATFORM_UNIX
 cleanup:
@@ -1681,6 +1795,16 @@ static void
 handle_except(sentry_backend_t *UNUSED(backend), const sentry_ucontext_t *uctx)
 {
     process_ucontext(uctx);
+}
+
+void
+sentry__backend_preload(void)
+{
+#ifdef SENTRY_PLATFORM_UNIX
+    if (install_signal_handlers() == 0) {
+        sentry__atomic_store(&g_preloaded, 1);
+    }
+#endif
 }
 
 sentry_backend_t *

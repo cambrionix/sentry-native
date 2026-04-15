@@ -176,6 +176,7 @@ native_backend_startup(
     // Pass debug logging setting to daemon
     ctx->debug_enabled = options->debug;
     ctx->attach_screenshot = options->attach_screenshot;
+    ctx->cache_keep = options->cache_keep;
 
     // Set up event and breadcrumb paths
     sentry_path_t *run_path = options->run->run_path;
@@ -200,6 +201,37 @@ native_backend_startup(
 #else
         strncpy(ctx->dsn, options->dsn->raw, sizeof(ctx->dsn) - 1);
         ctx->dsn[sizeof(ctx->dsn) - 1] = '\0';
+#endif
+    }
+
+    // Store transport configuration for daemon's curl transport
+    if (options->ca_certs) {
+#ifdef _WIN32
+        strncpy_s(
+            ctx->ca_certs, sizeof(ctx->ca_certs), options->ca_certs, _TRUNCATE);
+#else
+        strncpy(ctx->ca_certs, options->ca_certs, sizeof(ctx->ca_certs) - 1);
+        ctx->ca_certs[sizeof(ctx->ca_certs) - 1] = '\0';
+#endif
+    }
+
+    if (options->proxy) {
+#ifdef _WIN32
+        strncpy_s(ctx->proxy, sizeof(ctx->proxy), options->proxy, _TRUNCATE);
+#else
+        strncpy(ctx->proxy, options->proxy, sizeof(ctx->proxy) - 1);
+        ctx->proxy[sizeof(ctx->proxy) - 1] = '\0';
+#endif
+    }
+
+    if (options->user_agent) {
+#ifdef _WIN32
+        strncpy_s(ctx->user_agent, sizeof(ctx->user_agent), options->user_agent,
+            _TRUNCATE);
+#else
+        strncpy(
+            ctx->user_agent, options->user_agent, sizeof(ctx->user_agent) - 1);
+        ctx->user_agent[sizeof(ctx->user_agent) - 1] = '\0';
 #endif
     }
 
@@ -287,18 +319,22 @@ native_backend_startup(
 #else
     // Other platforms: Use out-of-process daemon
     // Pass the notification handles (eventfd/pipe on Unix, events on Windows)
+    const char *daemon_handler_path
+        = options->handler_path ? options->handler_path->path : NULL;
 #    if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
     uint64_t tid = (uint64_t)pthread_self();
-    state->daemon_pid = sentry__crash_daemon_start(
-        getpid(), tid, state->ipc->notify_fd, state->ipc->ready_fd);
+    state->daemon_pid = sentry__crash_daemon_start(getpid(), tid,
+        state->ipc->notify_fd, state->ipc->ready_fd, daemon_handler_path);
 #    elif defined(SENTRY_PLATFORM_MACOS)
     uint64_t tid = (uint64_t)pthread_self();
-    state->daemon_pid = sentry__crash_daemon_start(
-        getpid(), tid, state->ipc->notify_pipe[0], state->ipc->ready_pipe[1]);
+    state->daemon_pid
+        = sentry__crash_daemon_start(getpid(), tid, state->ipc->notify_pipe[0],
+            state->ipc->ready_pipe[1], daemon_handler_path);
 #    elif defined(SENTRY_PLATFORM_WINDOWS)
     uint64_t tid = (uint64_t)GetCurrentThreadId();
     state->daemon_pid = sentry__crash_daemon_start(GetCurrentProcessId(), tid,
-        state->ipc->event_handle, state->ipc->ready_event_handle);
+        state->ipc->event_handle, state->ipc->ready_event_handle,
+        daemon_handler_path);
 #    endif
 
     // On Windows, pid_t is DWORD (unsigned), so (pid_t)-1 == 0xFFFFFFFF.
@@ -506,7 +542,7 @@ native_backend_free(sentry_backend_t *backend)
 
 static void
 native_backend_flush_scope(
-    sentry_backend_t *backend, const sentry_options_t *options)
+    sentry_backend_t *backend, const sentry_options_t *UNUSED(options))
 {
     native_backend_state_t *state = (native_backend_state_t *)backend->data;
     if (!state || !state->event_path) {
@@ -622,16 +658,6 @@ native_backend_flush_scope(
                 sentry__path_free(run_path);
             }
         }
-    }
-
-    // Flush external crash report envelope if configured
-    if (options->external_crash_reporter && state->envelope_path) {
-        sentry_envelope_t *envelope = sentry__envelope_new();
-        if (envelope && options->session) {
-            sentry__envelope_add_session(envelope, options->session);
-            sentry__run_write_external(options->run, envelope);
-        }
-        sentry_envelope_free(envelope);
     }
 }
 
@@ -891,6 +917,11 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
             sentry_value_decref(event);
         }
     }
+}
+
+void
+sentry__backend_preload(void)
+{
 }
 
 /**

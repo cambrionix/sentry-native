@@ -68,6 +68,10 @@ signal_safe_memzero(void *dest, size_t n)
 #        include <dirent.h>
 #        include <stdlib.h>
 #        include <sys/syscall.h>
+#        ifdef SENTRY_WITH_UNWINDER_LIBUNWIND
+#            define UNW_LOCAL_ONLY
+#            include <libunwind.h>
+#        endif
 #    endif
 
 #    if defined(SENTRY_PLATFORM_MACOS)
@@ -286,6 +290,34 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
     ctx->platform.threads[0].tid = ctx->crashed_tid;
     signal_safe_memcpy(&ctx->platform.threads[0].context, uctx,
         sizeof(ctx->platform.threads[0].context));
+
+    // Capture backtrace using libunwind (DWARF-based, works without frame
+    // pointers). This runs in the signal handler, which is safe because
+    // libunwind's core unwinding API (unw_init_local2, unw_step, unw_get_reg)
+    // is async-signal-safe. The daemon will prefer this over FP-based walking.
+#        ifdef SENTRY_WITH_UNWINDER_LIBUNWIND
+    ctx->platform.backtrace_count = 0;
+    {
+        unw_cursor_t cursor;
+        int ret = unw_init_local2(
+            &cursor, (unw_context_t *)uctx, UNW_INIT_SIGNAL_FRAME);
+        if (ret == 0) {
+            size_t n = 0;
+            while (n < SENTRY_CRASH_MAX_BACKTRACE_FRAMES) {
+                unw_word_t ip = 0;
+                if (unw_get_reg(&cursor, UNW_REG_IP, &ip) < 0 || ip == 0) {
+                    break;
+                }
+                ctx->platform.backtrace_ips[n++] = (uint64_t)ip;
+                if (unw_step(&cursor) <= 0) {
+                    break;
+                }
+            }
+            ctx->platform.backtrace_count = n;
+        }
+    }
+#        endif
+
 #    elif defined(SENTRY_PLATFORM_MACOS)
     ctx->platform.signum = signum;
     // Use signal-safe memcpy to avoid TSAN-intercepted memcpy in signal handler
@@ -566,6 +598,46 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
         // Copy module name (signal-safe)
         safe_strncpy(module->name, name, sizeof(module->name));
     }
+
+    // Save module header pages to a single file for the daemon.
+    // The first 4096 bytes of each module contain the Mach-O header and load
+    // commands. System dylibs in the shared cache can't be read from disk,
+    // but we can read them from this process's address space.
+    // File format: module[0] header (4096 bytes) || module[1] header || ...
+    {
+        char hdr_path[SENTRY_CRASH_MAX_PATH];
+        size_t pos = safe_strlen(ctx->database_path);
+        if (pos + 22 < sizeof(hdr_path)) { // "/__sentry-modheaders\0"
+            safe_strncpy(hdr_path, ctx->database_path, sizeof(hdr_path));
+            const char *suffix = "/__sentry-modheaders";
+            for (size_t si = 0; suffix[si] != '\0'; si++) {
+                hdr_path[pos++] = suffix[si];
+            }
+            hdr_path[pos] = '\0';
+
+            int hdr_fd = open(hdr_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (hdr_fd >= 0) {
+                // Zero page used as fallback when write fails, ensuring
+                // each module's slot stays aligned at 4096-byte boundaries.
+                static const char zero_page[4096] = { 0 };
+                for (uint32_t mi = 0; mi < ctx->module_count; mi++) {
+                    const void *base = (const void *)(uintptr_t)ctx->modules[mi]
+                                           .base_address;
+                    ssize_t written = write(hdr_fd, base, 4096);
+                    if (written < 0) {
+                        // Write failed (EFAULT etc.) - write zeros to
+                        // maintain alignment for subsequent modules.
+                        write(hdr_fd, zero_page, 4096);
+                    } else if (written < 4096) {
+                        // Short write - pad with zeros to maintain
+                        // alignment.
+                        write(hdr_fd, zero_page, (size_t)(4096 - written));
+                    }
+                }
+                close(hdr_fd);
+            }
+        }
+    }
 #    endif
 
     // Enable signal-safe page allocator before calling exception handler
@@ -739,6 +811,35 @@ sentry__crash_handler_init(sentry_crash_ipc_t *ipc)
         }
         installed_count++;
     }
+
+    // Prime libunwind's internal cache by performing a short unwind.
+    // This forces dl_iterate_phdr to be called now (while safe) rather than
+    // in the signal handler where it could deadlock if the crash occurs
+    // during dlopen/dlclose.
+#    if (defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID))   \
+        && defined(SENTRY_WITH_UNWINDER_LIBUNWIND)
+    {
+        unw_context_t uc;
+        unw_cursor_t cursor;
+#        ifdef __clang__
+#            pragma clang diagnostic push
+#            pragma clang diagnostic ignored                                   \
+                "-Wgnu-statement-expression-from-macro-expansion"
+#        endif
+        if (unw_getcontext(&uc) == 0) {
+#        ifdef __clang__
+#            pragma clang diagnostic pop
+#        endif
+            if (unw_init_local(&cursor, &uc) == 0) {
+                // Walk a few frames to ensure .eh_frame info is cached
+                for (int i = 0; i < 5 && unw_step(&cursor) > 0; i++) {
+                    // intentionally empty - just priming the cache
+                }
+            }
+        }
+        SENTRY_DEBUG("libunwind cache primed");
+    }
+#    endif
 
     SENTRY_DEBUG("crash handler initialized");
     return 0;

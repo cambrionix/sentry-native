@@ -12,6 +12,8 @@
 #include "sentry_path.h"
 #include "sentry_process.h"
 #include "sentry_screenshot.h"
+#include "sentry_string.h"
+#include "sentry_symbolizer.h"
 #include "sentry_sync.h"
 #include "sentry_transport.h"
 #include "sentry_utils.h"
@@ -51,7 +53,7 @@
 
 // Forward declaration for StackWalk64-based stack unwinding (defined later)
 static size_t walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
-    const CONTEXT *ctx_record, void **frames, size_t max_frames);
+    const CONTEXT *ctx_record, sentry_frame_info_t *frames, size_t max_frames);
 #endif
 
 // Provide default ASAN options for sentry-crash daemon executable
@@ -721,7 +723,7 @@ build_stacktrace_for_thread(
     HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
         FALSE, (DWORD)ctx->crashed_pid);
     if (hProcess) {
-        void *stack_frames[MAX_STACK_FRAMES];
+        sentry_frame_info_t stack_frames[MAX_STACK_FRAMES];
         // Make a copy since StackWalk64 may modify the context
         CONTEXT ctx_copy = *walk_context;
         size_t dbghelp_frame_count = walk_stack_with_dbghelp(hProcess,
@@ -735,7 +737,8 @@ build_stacktrace_for_thread(
             for (size_t i = 0;
                 i < dbghelp_frame_count && frame_count < MAX_STACK_FRAMES;
                 i++) {
-                uint64_t frame_addr = (uint64_t)(uintptr_t)stack_frames[i];
+                uint64_t frame_addr
+                    = (uint64_t)(uintptr_t)stack_frames[i].instruction_addr;
                 temp_frames[frame_count] = sentry_value_new_object();
                 sentry_value_set_by_key(temp_frames[frame_count],
                     "instruction_addr", sentry__value_new_addr(frame_addr));
@@ -744,7 +747,22 @@ build_stacktrace_for_thread(
                     sentry_value_new_string(i == 0 ? "context" : "cfi"));
                 enrich_frame_with_module_info(
                     ctx, temp_frames[frame_count], frame_addr);
+                if (stack_frames[i].symbol) {
+                    sentry_value_set_by_key(temp_frames[frame_count],
+                        "function",
+                        sentry_value_new_string(stack_frames[i].symbol));
+                }
+                if (stack_frames[i].symbol_addr) {
+                    sentry_value_set_by_key(temp_frames[frame_count],
+                        "symbol_addr",
+                        sentry__value_new_addr(
+                            (uint64_t)(uintptr_t)stack_frames[i].symbol_addr));
+                }
                 frame_count++;
+            }
+
+            for (size_t i = 0; i < dbghelp_frame_count; i++) {
+                sentry_free((char *)stack_frames[i].symbol);
             }
 
             // Sentry expects frames in reverse order (outermost caller first)
@@ -771,6 +789,54 @@ build_stacktrace_for_thread(
     // Build frame list - collect in callee-first order, then reverse for Sentry
     sentry_value_t temp_frames[MAX_STACK_FRAMES];
     int frame_count = 0;
+
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+    // Use pre-captured libunwind backtrace if available (DWARF-based, works
+    // without frame pointers). This is preferred over FP-based walking for
+    // the crashed thread.
+    if (ctx->platform.backtrace_count > 0
+        && (thread_idx == SIZE_MAX || thread_idx == 0)) {
+        SENTRY_DEBUGF("Using pre-captured libunwind backtrace (%zu frames)",
+            ctx->platform.backtrace_count);
+
+        for (size_t i = 0;
+            i < ctx->platform.backtrace_count && frame_count < MAX_STACK_FRAMES;
+            i++) {
+            uint64_t frame_ip = ctx->platform.backtrace_ips[i];
+            if (frame_ip == 0 || !is_valid_code_addr(frame_ip)) {
+                continue;
+            }
+            temp_frames[frame_count] = sentry_value_new_object();
+            sentry_value_set_by_key(temp_frames[frame_count],
+                "instruction_addr", sentry__value_new_addr(frame_ip));
+            sentry_value_set_by_key(temp_frames[frame_count], "trust",
+                sentry_value_new_string(i == 0 ? "context" : "cfi"));
+            enrich_frame_with_module_info(
+                ctx, temp_frames[frame_count], frame_ip);
+            frame_count++;
+        }
+
+        if (stack_buf) {
+            sentry_free(stack_buf);
+        }
+
+        if (frame_count == 0) {
+            sentry_value_decref(frames);
+            sentry_value_decref(stacktrace);
+            return sentry_value_new_null();
+        }
+
+        // Sentry expects frames in reverse order (outermost caller first)
+        for (int i = frame_count - 1; i >= 0; i--) {
+            sentry_value_append(frames, temp_frames[i]);
+        }
+
+        sentry_value_set_by_key(stacktrace, "frames", frames);
+        sentry_value_set_by_key(
+            stacktrace, "registers", build_registers_from_ctx(ctx, thread_idx));
+        return stacktrace;
+    }
+#endif
 
     // Add the crashing frame (instruction pointer)
     if (ip != 0 && is_valid_code_addr(ip)) {
@@ -1144,6 +1210,26 @@ enumerate_threads_from_proc(sentry_crash_context_t *ctx)
     pid_t crashed_tid = ctx->platform.threads[0].tid;
     size_t thread_count = 1; // Start at 1 since we already have crashed thread
 
+    // Read thread name for the crashed thread (index 0)
+    ctx->platform.threads[0].name[0] = '\0';
+    {
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/task/%d/comm",
+            ctx->crashed_pid, crashed_tid);
+        FILE *comm_file = fopen(comm_path, "r");
+        if (comm_file) {
+            if (fgets(ctx->platform.threads[0].name,
+                    sizeof(ctx->platform.threads[0].name), comm_file)) {
+                // Trim trailing newline
+                size_t len = strlen(ctx->platform.threads[0].name);
+                if (len > 0 && ctx->platform.threads[0].name[len - 1] == '\n') {
+                    ctx->platform.threads[0].name[len - 1] = '\0';
+                }
+            }
+            fclose(comm_file);
+        }
+    }
+
     struct dirent *entry;
     while ((entry = readdir(dir)) && thread_count < SENTRY_CRASH_MAX_THREADS) {
         if (entry->d_name[0] == '.') {
@@ -1159,6 +1245,28 @@ enumerate_threads_from_proc(sentry_crash_context_t *ctx)
         ctx->platform.threads[thread_count].tid = tid;
         memset(&ctx->platform.threads[thread_count].context, 0,
             sizeof(ctx->platform.threads[thread_count].context));
+
+        // Read thread name from /proc/[pid]/task/[tid]/comm
+        ctx->platform.threads[thread_count].name[0] = '\0';
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/task/%d/comm",
+            ctx->crashed_pid, tid);
+        FILE *comm_file = fopen(comm_path, "r");
+        if (comm_file) {
+            if (fgets(ctx->platform.threads[thread_count].name,
+                    sizeof(ctx->platform.threads[thread_count].name),
+                    comm_file)) {
+                // Trim trailing newline
+                size_t len = strlen(ctx->platform.threads[thread_count].name);
+                if (len > 0
+                    && ctx->platform.threads[thread_count].name[len - 1]
+                        == '\n') {
+                    ctx->platform.threads[thread_count].name[len - 1] = '\0';
+                }
+            }
+            fclose(comm_file);
+        }
+
         thread_count++;
     }
 
@@ -1200,7 +1308,7 @@ stack_walk_read_memory(HANDLE hProcess, DWORD64 lpBaseAddress, PVOID lpBuffer,
  */
 static size_t
 walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
-    const CONTEXT *ctx_record, void **frames, size_t max_frames)
+    const CONTEXT *ctx_record, sentry_frame_info_t *frames, size_t max_frames)
 {
     // Open thread handle for the crashed thread
     HANDLE hThread = OpenThread(
@@ -1261,6 +1369,10 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
     stack_frame.AddrFrame.Mode = AddrModeFlat;
     stack_frame.AddrStack.Mode = AddrModeFlat;
 
+    const size_t sym_info_size
+        = sizeof(SYMBOL_INFOW) + MAX_SYM_NAME * sizeof(WCHAR);
+    SYMBOL_INFOW *sym_info = (SYMBOL_INFOW *)sentry_malloc(sym_info_size);
+
     size_t frame_count = 0;
     while (frame_count < max_frames
         && StackWalk64(machine_type, hProcess, hThread, &stack_frame, &ctx,
@@ -1269,10 +1381,31 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
         if (stack_frame.AddrPC.Offset == 0) {
             break;
         }
-        frames[frame_count++] = (void *)(uintptr_t)stack_frame.AddrPC.Offset;
-        SENTRY_DEBUGF("StackWalk64 frame %zu: 0x%llx", frame_count - 1,
-            (unsigned long long)stack_frame.AddrPC.Offset);
+        memset(&frames[frame_count], 0, sizeof(sentry_frame_info_t));
+        frames[frame_count].instruction_addr
+            = (void *)(uintptr_t)stack_frame.AddrPC.Offset;
+
+        if (sym_info) {
+            memset(sym_info, 0, sym_info_size);
+            sym_info->SizeOfStruct = sizeof(SYMBOL_INFOW);
+            sym_info->MaxNameLen = MAX_SYM_NAME;
+
+            if (SymFromAddrW(
+                    hProcess, stack_frame.AddrPC.Offset, NULL, sym_info)) {
+                frames[frame_count].symbol
+                    = sentry__string_from_wstr(sym_info->Name);
+                frames[frame_count].symbol_addr
+                    = (void *)(uintptr_t)sym_info->Address;
+            }
+        }
+
+        SENTRY_DEBUGF("StackWalk64 frame %zu: 0x%llx %s", frame_count,
+            (unsigned long long)stack_frame.AddrPC.Offset,
+            frames[frame_count].symbol ? frames[frame_count].symbol : "");
+        frame_count++;
     }
+
+    sentry_free(sym_info);
 
     SymCleanup(hProcess);
     CloseHandle(hThread);
@@ -1551,6 +1684,35 @@ thread_id_exists(
 }
 
 /**
+ * Retrieve the thread name via GetThreadDescription (Windows 10 1607+).
+ */
+static void
+get_thread_name(HANDLE hThread, sentry_thread_context_windows_t *tctx)
+{
+    typedef HRESULT(WINAPI * GetThreadDescription_t)(HANDLE, PWSTR *);
+    static GetThreadDescription_t get_thread_description
+        = (GetThreadDescription_t)-1;
+    if (get_thread_description == (GetThreadDescription_t)-1) {
+        get_thread_description = (GetThreadDescription_t)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription");
+    }
+
+    tctx->name[0] = '\0';
+    if (!get_thread_description || !hThread) {
+        return;
+    }
+
+    PWSTR description = NULL;
+    HRESULT hr = get_thread_description(hThread, &description);
+    if (SUCCEEDED(hr) && description && description[0] != L'\0') {
+        WideCharToMultiByte(CP_UTF8, 0, description, -1, tctx->name,
+            sizeof(tctx->name), NULL, NULL);
+        tctx->name[sizeof(tctx->name) - 1] = '\0';
+    }
+    LocalFree(description);
+}
+
+/**
  * Enumerate threads from the crashed process for the native event on Windows
  * Captures thread contexts for stack walking.
  */
@@ -1566,6 +1728,14 @@ enumerate_threads_from_process(sentry_crash_context_t *ctx)
     // Keep the crashed thread at index 0 (already captured)
     DWORD crashed_tid = (DWORD)ctx->crashed_tid;
     DWORD thread_count = 1;
+
+    // Retrieve the name for the crashed thread (index 0)
+    HANDLE hCrashedThread
+        = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, crashed_tid);
+    get_thread_name(hCrashedThread, &ctx->platform.threads[0]);
+    if (hCrashedThread) {
+        CloseHandle(hCrashedThread);
+    }
 
     SENTRY_DEBUGF(
         "enumerate_threads: start, crashed_tid=%lu, threads[0].id=%lu",
@@ -1601,6 +1771,9 @@ enumerate_threads_from_process(sentry_crash_context_t *ctx)
                     (unsigned long)te32.th32ThreadID, GetLastError());
                 continue;
             }
+
+            // Retrieve thread name before suspending
+            get_thread_name(hThread, &ctx->platform.threads[thread_count]);
 
             // Suspend thread to safely capture context
             // (likely already suspended due to crash, but be safe)
@@ -1660,13 +1833,10 @@ build_stacktrace_from_ctx(const sentry_crash_context_t *ctx)
  *
  * @param ctx Crash context
  * @param event_file_path Path to event file from parent process
- * @param include_threads Whether to include threads in the event.
- *        Set to false when minidump is attached (Sentry extracts threads from
- * minidump).
  */
 static sentry_value_t
-build_native_crash_event(const sentry_crash_context_t *ctx,
-    const char *event_file_path, bool include_threads)
+build_native_crash_event(
+    const sentry_crash_context_t *ctx, const char *event_file_path)
 {
     // Read base event from parent's file
     sentry_value_t event = sentry_value_new_null();
@@ -1749,10 +1919,8 @@ build_native_crash_event(const sentry_crash_context_t *ctx,
     sentry_value_set_by_key(exceptions, "values", exc_values);
     sentry_value_set_by_key(event, "exception", exceptions);
 
-    // Add threads only when minidump is NOT attached
-    // (When minidump is attached, Sentry extracts threads from it, avoiding
-    // duplication)
-    if (include_threads) {
+    // Always add threads with names to the event JSON
+    {
         sentry_value_t threads = sentry_value_new_object();
         sentry_value_t thread_values = sentry_value_new_list();
 
@@ -1794,6 +1962,12 @@ build_native_crash_event(const sentry_crash_context_t *ctx,
             sentry_value_set_by_key(
                 thread, "id", sentry_value_new_int32((int32_t)tctx->tid));
 
+            // Set thread name if available
+            if (tctx->name[0] != '\0') {
+                sentry_value_set_by_key(
+                    thread, "name", sentry_value_new_string(tctx->name));
+            }
+
             bool is_crashed = (tctx->tid == ctx->crashed_tid);
             sentry_value_set_by_key(
                 thread, "crashed", sentry_value_new_bool(is_crashed));
@@ -1823,6 +1997,12 @@ build_native_crash_event(const sentry_crash_context_t *ctx,
 
             sentry_value_set_by_key(
                 thread, "id", sentry_value_new_int32((int32_t)tctx->thread_id));
+
+            // Set thread name if available
+            if (tctx->name[0] != '\0') {
+                sentry_value_set_by_key(
+                    thread, "name", sentry_value_new_string(tctx->name));
+            }
 
             bool is_crashed = (tctx->thread_id == (DWORD)ctx->crashed_tid);
             sentry_value_set_by_key(
@@ -2005,37 +2185,20 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
     const char *event_file_path, const char *minidump_path,
     sentry_path_t *run_folder)
 {
-    // Build native crash event
-    // Include threads only when minidump is NOT attached (Sentry extracts
-    // threads from minidump, so including them would cause duplication)
-    bool include_threads = (minidump_path == NULL || minidump_path[0] == '\0');
-    SENTRY_DEBUGF("write_envelope_with_native_stacktrace: minidump_path=%s, "
-                  "include_threads=%d",
-        minidump_path ? minidump_path : "(null)", include_threads);
-    sentry_value_t event
-        = build_native_crash_event(ctx, event_file_path, include_threads);
-
-    // Log whether event has threads (for debugging duplication issues)
-    sentry_value_t event_threads = sentry_value_get_by_key(event, "threads");
-    if (!sentry_value_is_null(event_threads)) {
-        sentry_value_t thread_values
-            = sentry_value_get_by_key(event_threads, "values");
-        size_t thread_count = sentry_value_get_length(thread_values);
-        SENTRY_WARNF("EVENT HAS THREADS: %zu threads in event JSON (expected: "
-                     "%s)",
-            thread_count, include_threads ? "yes" : "NO - SHOULD BE EMPTY!");
-    } else {
-        SENTRY_DEBUGF("Event has no threads (include_threads=%d, minidump "
-                      "will provide threads)",
-            include_threads);
-    }
+    // Build native crash event (always include threads with names)
+    SENTRY_DEBUGF("write_envelope_with_native_stacktrace: minidump_path=%s",
+        minidump_path ? minidump_path : "(null)");
+    sentry_value_t event = build_native_crash_event(ctx, event_file_path);
 
     // Serialize event to JSON
     char *event_json = sentry_value_to_json(event);
+    char *event_id = sentry__string_clone(
+        sentry_value_as_string(sentry_value_get_by_key(event, "event_id")));
     sentry_value_decref(event);
 
     if (!event_json) {
         SENTRY_WARN("Failed to serialize native crash event to JSON");
+        sentry_free(event_id);
         return false;
     }
 
@@ -2054,6 +2217,7 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
     if (fd < 0) {
         SENTRY_WARN("Failed to open envelope file for writing");
         sentry_free(event_json);
+        sentry_free(event_id);
         return false;
     }
 
@@ -2062,12 +2226,19 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
         = options && options->dsn ? sentry_options_get_dsn(options) : NULL;
     char header_buf[SENTRY_CRASH_ENVELOPE_HEADER_SIZE];
     int header_len;
-    if (dsn) {
+    if (dsn && event_id && event_id[0] != '\0') {
+        header_len = snprintf(header_buf, sizeof(header_buf),
+            "{\"dsn\":\"%s\",\"event_id\":\"%s\"}\n", dsn, event_id);
+    } else if (dsn) {
         header_len = snprintf(
             header_buf, sizeof(header_buf), "{\"dsn\":\"%s\"}\n", dsn);
+    } else if (event_id && event_id[0] != '\0') {
+        header_len = snprintf(header_buf, sizeof(header_buf),
+            "{\"event_id\":\"%s\"}\n", event_id);
     } else {
         header_len = snprintf(header_buf, sizeof(header_buf), "{}\n");
     }
+    sentry_free(event_id);
     if (header_len > 0 && header_len < (int)sizeof(header_buf)) {
 #if defined(SENTRY_PLATFORM_UNIX)
         if (write(fd, header_buf, header_len) != header_len) {
@@ -2220,6 +2391,17 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
         }
     }
 
+    // Add screenshot attachment if captured by the daemon
+    if (options && options->attach_screenshot && run_folder) {
+        sentry_path_t *screenshot_path
+            = sentry__path_join_str(run_folder, "screenshot.png");
+        if (screenshot_path) {
+            write_attachment_to_envelope(
+                fd, screenshot_path->path, "screenshot.png", "image/png");
+            sentry__path_free(screenshot_path);
+        }
+    }
+
 #if defined(SENTRY_PLATFORM_UNIX)
     close(fd);
 #elif defined(SENTRY_PLATFORM_WINDOWS)
@@ -2238,6 +2420,23 @@ write_envelope_with_minidump(const sentry_options_t *options,
     const char *envelope_path, const char *event_msgpack_path,
     const char *minidump_path, sentry_path_t *run_folder)
 {
+    // Read event JSON data
+    size_t event_size = 0;
+    char *event_json = NULL;
+    char *event_id = NULL;
+    sentry_path_t *ev_path = sentry__path_from_str(event_msgpack_path);
+    if (ev_path) {
+        event_json = sentry__path_read_to_buffer(ev_path, &event_size);
+        sentry__path_free(ev_path);
+        if (event_json && event_size > 0) {
+            sentry_value_t event
+                = sentry__value_from_json(event_json, event_size);
+            event_id = sentry__string_clone(sentry_value_as_string(
+                sentry_value_get_by_key(event, "event_id")));
+            sentry_value_decref(event);
+        }
+    }
+
     // Open envelope file for writing
 #if defined(SENTRY_PLATFORM_UNIX)
     int fd = open(envelope_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -2251,20 +2450,29 @@ write_envelope_with_minidump(const sentry_options_t *options,
 #endif
     if (fd < 0) {
         SENTRY_WARN("Failed to open envelope file for writing");
+        sentry_free(event_json);
+        sentry_free(event_id);
         return false;
     }
 
-    // Write envelope headers (just DSN if available)
+    // Write envelope headers (just DSN and event ID if available)
     const char *dsn
         = options && options->dsn ? sentry_options_get_dsn(options) : NULL;
     char header_buf[SENTRY_CRASH_ENVELOPE_HEADER_SIZE];
     int header_len;
-    if (dsn) {
+    if (dsn && event_id && event_id[0] != '\0') {
+        header_len = snprintf(header_buf, sizeof(header_buf),
+            "{\"dsn\":\"%s\",\"event_id\":\"%s\"}\n", dsn, event_id);
+    } else if (dsn) {
         header_len = snprintf(
             header_buf, sizeof(header_buf), "{\"dsn\":\"%s\"}\n", dsn);
+    } else if (event_id && event_id[0] != '\0') {
+        header_len = snprintf(header_buf, sizeof(header_buf),
+            "{\"event_id\":\"%s\"}\n", event_id);
     } else {
         header_len = snprintf(header_buf, sizeof(header_buf), "{}\n");
     }
+    sentry_free(event_id);
     if (header_len > 0 && header_len < (int)sizeof(header_buf)) {
 #if defined(SENTRY_PLATFORM_UNIX)
         if (write(fd, header_buf, header_len) != header_len) {
@@ -2275,39 +2483,30 @@ write_envelope_with_minidump(const sentry_options_t *options,
 #endif
     }
 
-    // Read event JSON data
-    sentry_path_t *ev_path = sentry__path_from_str(event_msgpack_path);
-    if (ev_path) {
-        size_t event_size = 0;
-        char *event_json = sentry__path_read_to_buffer(ev_path, &event_size);
-        sentry__path_free(ev_path);
-
-        if (event_json && event_size > 0) {
-            // Write event item header
-            char event_header[SENTRY_CRASH_ITEM_HEADER_SIZE];
-            int ev_header_len = snprintf(event_header, sizeof(event_header),
-                "{\"type\":\"event\",\"length\":%zu}\n", event_size);
-            if (ev_header_len > 0
-                && ev_header_len < (int)sizeof(event_header)) {
+    // Write event item
+    if (event_json && event_size > 0) {
+        char event_header[SENTRY_CRASH_ITEM_HEADER_SIZE];
+        int ev_header_len = snprintf(event_header, sizeof(event_header),
+            "{\"type\":\"event\",\"length\":%zu}\n", event_size);
+        if (ev_header_len > 0 && ev_header_len < (int)sizeof(event_header)) {
 #if defined(SENTRY_PLATFORM_UNIX)
-                if (write(fd, event_header, ev_header_len) != ev_header_len) {
-                    SENTRY_WARN("Failed to write event header to envelope");
-                }
-                if (write(fd, event_json, event_size) != (ssize_t)event_size) {
-                    SENTRY_WARN("Failed to write event data to envelope");
-                }
-                if (write(fd, "\n", 1) != 1) {
-                    SENTRY_WARN("Failed to write event newline to envelope");
-                }
-#elif defined(SENTRY_PLATFORM_WINDOWS)
-                _write(fd, event_header, (unsigned int)ev_header_len);
-                _write(fd, event_json, (unsigned int)event_size);
-                _write(fd, "\n", 1);
-#endif
+            if (write(fd, event_header, ev_header_len) != ev_header_len) {
+                SENTRY_WARN("Failed to write event header to envelope");
             }
-            sentry_free(event_json);
+            if (write(fd, event_json, event_size) != (ssize_t)event_size) {
+                SENTRY_WARN("Failed to write event data to envelope");
+            }
+            if (write(fd, "\n", 1) != 1) {
+                SENTRY_WARN("Failed to write event newline to envelope");
+            }
+#elif defined(SENTRY_PLATFORM_WINDOWS)
+            _write(fd, event_header, (unsigned int)ev_header_len);
+            _write(fd, event_json, (unsigned int)event_size);
+            _write(fd, "\n", 1);
+#endif
         }
     }
+    sentry_free(event_json);
 
     // Add minidump as attachment
 #if defined(SENTRY_PLATFORM_UNIX)
@@ -2423,6 +2622,17 @@ write_envelope_with_minidump(const sentry_options_t *options,
                     sentry_value_decref(attach_list);
                 }
             }
+        }
+    }
+
+    // Add screenshot attachment if captured by the daemon
+    if (options && options->attach_screenshot && run_folder) {
+        sentry_path_t *screenshot_path
+            = sentry__path_join_str(run_folder, "screenshot.png");
+        if (screenshot_path) {
+            write_attachment_to_envelope(
+                fd, screenshot_path->path, "screenshot.png", "image/png");
+            sentry__path_free(screenshot_path);
         }
     }
 
@@ -2712,14 +2922,17 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 
     SENTRY_DEBUG("Envelope loaded, sending via transport");
 
-    // Send directly via transport
-    if (options && options->transport) {
-        SENTRY_DEBUG("Calling transport send_envelope");
-        sentry__transport_send_envelope(options->transport, envelope);
-        SENTRY_DEBUG("Crash envelope sent to transport (queued)");
-    } else {
-        SENTRY_WARN("No transport available for sending envelope");
-        sentry_envelope_free(envelope);
+    // Send directly via transport, or to external crash reporter
+    if (!sentry__launch_external_crash_reporter(options, envelope)) {
+        // Send directly via transport
+        if (options && options->transport) {
+            SENTRY_DEBUG("Calling transport send_envelope");
+            sentry__transport_send_envelope(options->transport, envelope);
+            SENTRY_DEBUG("Crash envelope sent to transport (queued)");
+        } else {
+            SENTRY_WARN("No transport available for sending envelope");
+            sentry_envelope_free(envelope);
+        }
     }
 
     // Clean up temporary envelope file (keep minidump for
@@ -2799,23 +3012,17 @@ done:
  * Check if parent process is still alive
  */
 static bool
-is_parent_alive(pid_t parent_pid)
+is_parent_alive(sentry_process_handle_t parent)
 {
 #if defined(SENTRY_PLATFORM_UNIX)
     // Send signal 0 to check if process exists
-    return kill(parent_pid, 0) == 0 || errno != ESRCH;
+    return kill(parent, 0) == 0 || errno != ESRCH;
 #elif defined(SENTRY_PLATFORM_WINDOWS)
-    // Open handle to process with minimum rights
-    HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
-    if (!hProcess) {
+    if (!parent) {
         return false; // Process doesn't exist or can't be accessed
     }
     // Check if process has exited
-    DWORD exit_code;
-    bool alive
-        = GetExitCodeProcess(hProcess, &exit_code) && exit_code == STILL_ACTIVE;
-    CloseHandle(hProcess);
-    return alive;
+    return WaitForSingleObject(parent, 0) == WAIT_TIMEOUT;
 #endif
 }
 
@@ -2966,6 +3173,8 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // Use debug logging and screenshot settings from parent process
     sentry_options_set_debug(options, ipc->shmem->debug_enabled);
     options->attach_screenshot = ipc->shmem->attach_screenshot;
+    options->cache_keep = ipc->shmem->cache_keep;
+    options->http_retry = false;
 
     // Set custom logger that writes to file
     if (log_file) {
@@ -2978,6 +3187,23 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         sentry_options_set_dsn(options, ipc->shmem->dsn);
     } else {
         SENTRY_DEBUG("No DSN configured");
+    }
+
+    // Set transport configuration from parent process options
+    if (ipc->shmem->ca_certs[0] != '\0') {
+        SENTRY_DEBUGF("Setting CA certs: %s", ipc->shmem->ca_certs);
+        sentry_options_set_ca_certs(options, ipc->shmem->ca_certs);
+    }
+
+    if (ipc->shmem->proxy[0] != '\0') {
+        SENTRY_DEBUGF("Setting proxy: %s", ipc->shmem->proxy);
+        sentry_options_set_proxy(options, ipc->shmem->proxy);
+    }
+
+    if (ipc->shmem->user_agent[0] != '\0') {
+        SENTRY_DEBUGF("Setting user agent: %s", ipc->shmem->user_agent);
+        sentry_free(options->user_agent);
+        options->user_agent = sentry__string_clone(ipc->shmem->user_agent);
     }
 
     // Create run with database path
@@ -3020,6 +3246,18 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     (void)ready_event_handle;
 #endif
 
+#if defined(SENTRY_PLATFORM_WINDOWS)
+    // Open handle to parent process with SYNCHRONIZE for WaitForSingleObject
+    // in is_parent_alive(). Once on startup because OpenProcess fails on OOM.
+    ipc->parent_handle = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)app_pid);
+    if (!ipc->parent_handle) {
+        SENTRY_WARNF(
+            "Failed to open parent process handle: %lu", GetLastError());
+    }
+#else
+    ipc->parent_handle = app_pid;
+#endif
+
     // Signal to parent that daemon is ready
     SENTRY_DEBUG("Signaling ready to parent");
     sentry__crash_ipc_signal_ready(ipc);
@@ -3055,7 +3293,7 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         }
 
         // Check if parent is still alive (only if no crash processed yet)
-        if (!crash_processed && !is_parent_alive(app_pid)) {
+        if (!crash_processed && !is_parent_alive(ipc->parent_handle)) {
             SENTRY_DEBUG("Parent process exited without crash");
             break;
         }
@@ -3066,7 +3304,7 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // Cleanup
     if (options) {
         if (options->transport) {
-            // Wait up to 2 seconds for transport to send pending envelopes
+            // Wait up to 10 seconds for transport to send pending envelopes
             // (crash envelope + logs envelope, etc.)
             sentry__transport_shutdown(
                 options->transport, SENTRY_CRASH_TRANSPORT_SHUTDOWN_TIMEOUT_MS);
@@ -3085,16 +3323,16 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
 
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
 pid_t
-sentry__crash_daemon_start(
-    pid_t app_pid, uint64_t app_tid, int notify_eventfd, int ready_eventfd)
+sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, int notify_eventfd,
+    int ready_eventfd, const char *handler_path)
 #elif defined(SENTRY_PLATFORM_MACOS)
 pid_t
-sentry__crash_daemon_start(
-    pid_t app_pid, uint64_t app_tid, int notify_pipe_read, int ready_pipe_write)
+sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid,
+    int notify_pipe_read, int ready_pipe_write, const char *handler_path)
 #elif defined(SENTRY_PLATFORM_WINDOWS)
 pid_t
 sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
-    HANDLE ready_event_handle)
+    HANDLE ready_event_handle, const char *handler_path)
 #endif
 {
 #if defined(SENTRY_PLATFORM_UNIX)
@@ -3147,63 +3385,48 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         char *argv[]
             = { "sentry-crash", pid_str, tid_str, notify_str, ready_str, NULL };
 
-        // Try multiple locations to find sentry-crash executable
-
-        // 1. Try to find sentry-crash relative to the main executable
-        //    This works best for test scenarios and bundled deployments
-        char exe_path[SENTRY_CRASH_MAX_PATH];
-        char daemon_path[SENTRY_CRASH_MAX_PATH];
+        // If handler_path was explicitly set via options, use it directly.
+        // Otherwise, look for sentry-crash next to the current executable
+        // (matching crashpad's behavior). No fallback chain — fail hard so
+        // configuration issues are visible.
+        if (handler_path && handler_path[0] != '\0') {
+            execv(handler_path, argv);
+        } else {
+            char exe_path[SENTRY_CRASH_MAX_PATH];
+            char daemon_path[SENTRY_CRASH_MAX_PATH];
 
 #    if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
-        ssize_t exe_len
-            = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-        if (exe_len > 0) {
-            exe_path[exe_len] = '\0';
-            const char *slash = strrchr(exe_path, '/');
-            if (slash) {
-                size_t dir_len = slash - exe_path + 1;
-                if (dir_len + strlen("sentry-crash") < sizeof(daemon_path)) {
-                    memcpy(daemon_path, exe_path, dir_len);
-                    strcpy(daemon_path + dir_len, "sentry-crash");
-                    execv(daemon_path, argv);
-                    // If execv fails, continue to next fallback
+            ssize_t exe_len
+                = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+            if (exe_len > 0) {
+                exe_path[exe_len] = '\0';
+                const char *slash = strrchr(exe_path, '/');
+                if (slash) {
+                    size_t dir_len = slash - exe_path + 1;
+                    if (dir_len + strlen("sentry-crash")
+                        < sizeof(daemon_path)) {
+                        memcpy(daemon_path, exe_path, dir_len);
+                        strcpy(daemon_path + dir_len, "sentry-crash");
+                        execv(daemon_path, argv);
+                    }
                 }
             }
-        }
 #    elif defined(SENTRY_PLATFORM_MACOS)
-        uint32_t exe_size = sizeof(exe_path);
-        if (_NSGetExecutablePath(exe_path, &exe_size) == 0) {
-            const char *slash = strrchr(exe_path, '/');
-            if (slash) {
-                size_t dir_len = slash - exe_path + 1;
-                if (dir_len + strlen("sentry-crash") < sizeof(daemon_path)) {
-                    memcpy(daemon_path, exe_path, dir_len);
-                    strcpy(daemon_path + dir_len, "sentry-crash");
-                    execv(daemon_path, argv);
-                    // If execv fails, continue to next fallback
+            uint32_t exe_size = sizeof(exe_path);
+            if (_NSGetExecutablePath(exe_path, &exe_size) == 0) {
+                const char *slash = strrchr(exe_path, '/');
+                if (slash) {
+                    size_t dir_len = slash - exe_path + 1;
+                    if (dir_len + strlen("sentry-crash")
+                        < sizeof(daemon_path)) {
+                        memcpy(daemon_path, exe_path, dir_len);
+                        strcpy(daemon_path + dir_len, "sentry-crash");
+                        execv(daemon_path, argv);
+                    }
                 }
             }
-        }
 #    endif
-
-        // 2. Try to find sentry-crash in the same directory as libsentry
-        Dl_info dl_info;
-        void *func_ptr = (void *)(uintptr_t)&sentry__crash_daemon_start;
-        if (dladdr(func_ptr, &dl_info) && dl_info.dli_fname) {
-            const char *slash = strrchr(dl_info.dli_fname, '/');
-            if (slash) {
-                size_t dir_len = slash - dl_info.dli_fname + 1;
-                if (dir_len + strlen("sentry-crash") < sizeof(daemon_path)) {
-                    memcpy(daemon_path, dl_info.dli_fname, dir_len);
-                    strcpy(daemon_path + dir_len, "sentry-crash");
-                    execv(daemon_path, argv);
-                    // If execv fails, fall through to execvp
-                }
-            }
         }
-
-        // 3. Fallback: try from PATH
-        execvp("sentry-crash", argv);
 
         // exec failed - exit with error
         perror("Failed to exec sentry-crash");
@@ -3217,32 +3440,46 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // On Windows, create a separate daemon process using CreateProcess
     // Spawn the sentry-crash.exe executable
 
-    // Try to find sentry-crash.exe in the same directory as the current
-    // executable
-    wchar_t exe_dir[SENTRY_CRASH_MAX_PATH];
-    DWORD len = GetModuleFileNameW(NULL, exe_dir, SENTRY_CRASH_MAX_PATH);
-    if (len == 0 || len >= SENTRY_CRASH_MAX_PATH) {
-        SENTRY_WARN("Failed to get current executable path");
-        return (pid_t)-1;
-    }
+    wchar_t daemon_path_w[SENTRY_CRASH_MAX_PATH];
 
-    // Remove filename to get directory
-    wchar_t *last_slash = wcsrchr(exe_dir, L'\\');
-    if (last_slash) {
-        *(last_slash + 1) = L'\0'; // Keep the trailing backslash
-    }
+    // If handler_path was explicitly set via options, use it directly
+    if (handler_path && handler_path[0] != '\0') {
+        wchar_t *wpath = sentry__string_to_wstr(handler_path);
+        if (wpath) {
+            wcsncpy(daemon_path_w, wpath, SENTRY_CRASH_MAX_PATH - 1);
+            daemon_path_w[SENTRY_CRASH_MAX_PATH - 1] = L'\0';
+            sentry_free(wpath);
+        } else {
+            SENTRY_WARN("Failed to convert handler_path to wide string");
+            return (pid_t)-1;
+        }
+    } else {
+        // Try to find sentry-crash.exe in the same directory as the current
+        // executable
+        wchar_t exe_dir[SENTRY_CRASH_MAX_PATH];
+        DWORD len = GetModuleFileNameW(NULL, exe_dir, SENTRY_CRASH_MAX_PATH);
+        if (len == 0 || len >= SENTRY_CRASH_MAX_PATH) {
+            SENTRY_WARN("Failed to get current executable path");
+            return (pid_t)-1;
+        }
 
-    // Build full path to sentry-crash.exe
-    wchar_t daemon_path[SENTRY_CRASH_MAX_PATH];
-    int path_len = _snwprintf(
-        daemon_path, SENTRY_CRASH_MAX_PATH, L"%ssentry-crash.exe", exe_dir);
-    if (path_len < 0 || path_len >= SENTRY_CRASH_MAX_PATH) {
-        SENTRY_WARN("Daemon path too long");
-        return (pid_t)-1;
+        // Remove filename to get directory
+        wchar_t *last_slash = wcsrchr(exe_dir, L'\\');
+        if (last_slash) {
+            *(last_slash + 1) = L'\0'; // Keep the trailing backslash
+        }
+
+        // Build full path to sentry-crash.exe
+        int path_len = _snwprintf(daemon_path_w, SENTRY_CRASH_MAX_PATH,
+            L"%ssentry-crash.exe", exe_dir);
+        if (path_len < 0 || path_len >= SENTRY_CRASH_MAX_PATH) {
+            SENTRY_WARN("Daemon path too long");
+            return (pid_t)-1;
+        }
     }
 
     // Log the daemon path we're trying to launch for debugging
-    char *daemon_path_utf8 = sentry__string_from_wstr(daemon_path);
+    char *daemon_path_utf8 = sentry__string_from_wstr(daemon_path_w);
     if (daemon_path_utf8) {
         SENTRY_DEBUGF("Attempting to launch daemon: %s", daemon_path_utf8);
         sentry_free(daemon_path_utf8);
@@ -3252,7 +3489,7 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // <ready_event_handle>
     wchar_t cmd_line[SENTRY_CRASH_MAX_PATH + 128];
     int cmd_len = _snwprintf(cmd_line, sizeof(cmd_line) / sizeof(wchar_t),
-        L"\"%s\" %lu %llx %llu %llu", daemon_path, (unsigned long)app_pid,
+        L"\"%s\" %lu %llx %llu %llu", daemon_path_w, (unsigned long)app_pid,
         (unsigned long long)app_tid,
         (unsigned long long)(uintptr_t)event_handle,
         (unsigned long long)(uintptr_t)ready_event_handle);
@@ -3284,7 +3521,7 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
             &si, // Startup info
             &pi)) { // Process information
         DWORD error = GetLastError();
-        char *daemon_path_err = sentry__string_from_wstr(daemon_path);
+        char *daemon_path_err = sentry__string_from_wstr(daemon_path_w);
         if (daemon_path_err) {
             SENTRY_WARNF("Failed to create daemon process at '%s': Error %lu%s",
                 daemon_path_err, error,
