@@ -8,7 +8,7 @@ import time
 import pytest
 
 from tests import adb
-from tests.conditions import is_android, is_tsan, is_x86, is_asan
+from tests.conditions import is_android, is_arm32, is_tsan, is_x86, is_asan
 
 project_fixture_path = pathlib.Path("tests/fixtures/dotnet_signal")
 
@@ -67,7 +67,14 @@ def run_dotnet_native_crash(tmp_path):
 
 
 @pytest.mark.skipif(
-    bool(sys.platform != "linux" or is_x86 or is_asan or is_tsan or is_android),
+    bool(
+        sys.platform != "linux"
+        or is_x86
+        or is_arm32
+        or is_asan
+        or is_tsan
+        or is_android
+    ),
     reason="dotnet signal handling is currently only supported on 64-bit Linux without sanitizers",
 )
 def test_dotnet_signals_inproc(cmake):
@@ -171,7 +178,14 @@ def run_aot_native_crash(tmp_path):
 
 
 @pytest.mark.skipif(
-    bool(sys.platform != "linux" or is_x86 or is_asan or is_tsan or is_android),
+    bool(
+        sys.platform != "linux"
+        or is_x86
+        or is_arm32
+        or is_asan
+        or is_tsan
+        or is_android
+    ),
     reason="dotnet AOT signal handling is currently only supported on 64-bit Linux without sanitizers",
 )
 def test_aot_signals_inproc(cmake):
@@ -409,6 +423,7 @@ def test_android_signals_inproc(cmake, runtime, strategy):
                 "-Wextra",
                 "-fPIC",
                 "-shared",
+                "-Wl,-z,max-page-size=16384",
                 str(project_fixture_path / "crash.c"),
                 "-o",
                 str(native_lib_dir / "libcrash.so"),
@@ -429,6 +444,7 @@ def test_android_signals_inproc(cmake, runtime, strategy):
             "-p:RuntimeIdentifier={}".format(rid_map[arch]),
             "-p:Configuration=Release",
             "-p:UseMonoRuntime={}".format(str(use_mono).lower()),
+            "-p:EnablePreviewFeatures=true",
         ]
         if is_preload:
             build_args += [

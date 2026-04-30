@@ -71,35 +71,12 @@ sentry__options_unlock(void)
     sentry__mutex_unlock(&g_options_lock);
 }
 
-static void
-load_user_consent(sentry_options_t *opts)
-{
-    sentry_path_t *consent_path
-        = sentry__path_join_str(opts->database_path, "user-consent");
-    char *contents = sentry__path_read_to_buffer(consent_path, NULL);
-    sentry__path_free(consent_path);
-    switch (contents ? contents[0] : 0) {
-    case '1':
-        opts->user_consent = SENTRY_USER_CONSENT_GIVEN;
-        break;
-    case '0':
-        opts->user_consent = SENTRY_USER_CONSENT_REVOKED;
-        break;
-    default:
-        opts->user_consent = SENTRY_USER_CONSENT_UNKNOWN;
-        break;
-    }
-    sentry_free(contents);
-}
-
 bool
 sentry__should_skip_upload(void)
 {
     bool skip = true;
     SENTRY_WITH_OPTIONS (options) {
-        skip = options->require_user_consent
-            && sentry__atomic_fetch((long *)&options->user_consent)
-                != SENTRY_USER_CONSENT_GIVEN;
+        skip = sentry__run_should_skip_upload(options->run);
     }
     return skip;
 }
@@ -172,6 +149,8 @@ sentry_init(sentry_options_t *options)
 
     sentry_close();
 
+    sentry__client_report_reset();
+
     sentry_logger_t logger = { NULL, NULL, SENTRY_LEVEL_DEBUG };
 
     if (options->debug) {
@@ -205,8 +184,9 @@ sentry_init(sentry_options_t *options)
         SENTRY_WARN("failed to initialize run directory");
         goto fail;
     }
+    options->run->require_user_consent = options->require_user_consent;
 
-    load_user_consent(options);
+    sentry__run_load_user_consent(options->run, options->database_path);
 
     if (!options->dsn || !options->dsn->is_valid) {
         const char *raw_dsn = sentry_options_get_dsn(options);
@@ -435,7 +415,7 @@ static void
 set_user_consent(sentry_user_consent_t new_val)
 {
     SENTRY_WITH_OPTIONS (options) {
-        if (sentry__atomic_store((long *)&options->user_consent, new_val)
+        if (sentry__atomic_store(&options->run->user_consent, new_val)
             != new_val) {
             if (options->backend
                 && options->backend->user_consent_changed_func) {
@@ -447,6 +427,8 @@ set_user_consent(sentry_user_consent_t new_val)
             switch (new_val) {
             case SENTRY_USER_CONSENT_GIVEN:
                 sentry__path_write_buffer(consent_path, "1\n", 2);
+                // flush any envelopes cached while consent was revoked
+                sentry_transport_retry(options->transport);
                 break;
             case SENTRY_USER_CONSENT_REVOKED:
                 sentry__path_write_buffer(consent_path, "0\n", 2);
@@ -484,7 +466,7 @@ sentry_user_consent_get(void)
     sentry_user_consent_t rv = SENTRY_USER_CONSENT_UNKNOWN;
     SENTRY_WITH_OPTIONS (options) {
         rv = (sentry_user_consent_t)(int)sentry__atomic_fetch(
-            (long *)&options->user_consent);
+            &options->run->user_consent);
     }
     return rv;
 }
@@ -500,16 +482,25 @@ sentry_user_consent_is_required(void)
 }
 
 void
-sentry__capture_envelope(
-    sentry_transport_t *transport, sentry_envelope_t *envelope)
+sentry__capture_envelope(sentry_transport_t *transport,
+    sentry_envelope_t *envelope, const sentry_options_t *options)
 {
-    bool has_consent = !sentry__should_skip_upload();
-    if (!has_consent) {
-        SENTRY_INFO("discarding envelope due to missing user consent");
-        sentry_envelope_free(envelope);
+    if (!sentry__run_should_skip_upload(options->run)) {
+        sentry__transport_send_envelope(transport, envelope);
         return;
     }
-    sentry__transport_send_envelope(transport, envelope);
+    bool cached = false;
+    if (options->cache_keep || options->http_retry) {
+        cached = sentry__run_write_cache(options->run, envelope, 0);
+        if (cached && !sentry__run_should_skip_upload(options->run)) {
+            // consent given meanwhile -> trigger retry to avoid waiting
+            // until the next retry poll
+            sentry_transport_retry(options->transport);
+        }
+    }
+    SENTRY_INFO(cached ? "caching envelope due to missing user consent"
+                       : "discarding envelope due to missing user consent");
+    sentry_envelope_free(envelope);
 }
 
 void
@@ -519,7 +510,7 @@ sentry_capture_envelope(sentry_envelope_t *envelope)
         return;
     }
     SENTRY_WITH_OPTIONS (options) {
-        sentry__capture_envelope(options->transport, envelope);
+        sentry__capture_envelope(options->transport, envelope, options);
     }
 }
 
@@ -628,7 +619,7 @@ sentry__capture_event(sentry_value_t event, sentry_scope_t *local_scope)
                     SENTRY_DATA_CATEGORY_ERROR, 1);
                 sentry_envelope_free(envelope);
             } else {
-                sentry__capture_envelope(options->transport, envelope);
+                sentry__capture_envelope(options->transport, envelope, options);
                 was_sent = true;
             }
         }
@@ -1637,7 +1628,7 @@ sentry_capture_user_feedback(sentry_value_t user_report)
     SENTRY_WITH_OPTIONS (options) {
         envelope = prepare_user_report(user_report);
         if (envelope) {
-            sentry__capture_envelope(options->transport, envelope);
+            sentry__capture_envelope(options->transport, envelope, options);
         }
     }
     sentry_value_decref(user_report);
@@ -1659,7 +1650,7 @@ sentry_capture_feedback_with_hint(
     SENTRY_WITH_OPTIONS (options) {
         envelope = prepare_user_feedback(user_feedback, hint);
         if (envelope) {
-            sentry__capture_envelope(options->transport, envelope);
+            sentry__capture_envelope(options->transport, envelope, options);
         }
     }
 
@@ -1772,7 +1763,7 @@ sentry_capture_minidump_n(const char *path, size_t path_len)
                 sentry__envelope_item_set_header(item, "filename",
                     sentry_value_new_string(sentry__path_filename(dump_path)));
 
-                sentry__capture_envelope(options->transport, envelope);
+                sentry__capture_envelope(options->transport, envelope, options);
 
                 SENTRY_INFOF(
                     "Minidump has been captured: \"%s\"", dump_path->path);

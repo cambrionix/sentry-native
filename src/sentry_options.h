@@ -41,6 +41,8 @@ struct sentry_options_s {
     bool symbolize_stacktraces;
     bool system_crash_reporter_enabled;
     bool attach_screenshot;
+    sentry_before_screenshot_function_t before_screenshot_func;
+    void *before_screenshot_data;
     bool crashpad_wait_for_upload;
     bool enable_logging_when_crashed;
     bool propagate_traceparent;
@@ -86,7 +88,6 @@ struct sentry_options_s {
     struct sentry_backend_s *backend;
     sentry_session_t *session;
 
-    long user_consent;
     long refcount;
     uint64_t shutdown_timeout;
     sentry_handler_strategy_t handler_strategy;

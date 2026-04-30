@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.13.8
+
+**Features**:
+
+- Enable experimental `native` backend on Xbox. ([#1666](https://github.com/getsentry/sentry-native/pull/1666))
+- Cache consent-revoked envelopes to disk when `cache_keep` or `http_retry` is enabled, instead of discarding them. With `http_retry`, the cached envelopes are sent automatically once consent is given. ([#1542](https://github.com/getsentry/sentry-native/pull/1542))
+- Linux: support 32-bit ARM. ([#1659](https://github.com/getsentry/sentry-native/issues/1659))
+- Crashpad: capture handler process log output to `<run>/crashpad-handler.log`, matching the SDK's `debug` verbosity. ([#1658](https://github.com/getsentry/sentry-native/pull/1658))
+
+**Fixes**:
+
+- Linux: handle `ENOSYS` in `read_safely` to fix empty module list in seccomp-restricted environments. ([#1655](https://github.com/getsentry/sentry-native/pull/1655))
+- macOS: avoid stdio deadlock in breakpad exception handler. ([#1656](https://github.com/getsentry/sentry-native/pull/1656))
+- Crashpad: build for 32-bit ARM on Linux. ([#1659](https://github.com/getsentry/sentry-native/issues/1659))
+- Native: build for 32-bit ARM on Linux. ([#1659](https://github.com/getsentry/sentry-native/issues/1659))
+- Inproc: build vendored libunwind for 32-bit ARM on Linux. ([#1659](https://github.com/getsentry/sentry-native/issues/1659))
+- Native: build for 64-bit ARM on Linux with musl. ([#1665](https://github.com/getsentry/sentry-native/pull/1665))
+- Native/Linux: prevent shared memory leak on crash. ([#1664](https://github.com/getsentry/sentry-native/pull/1664))
+- Native: skip scope flush during crash handling. ([#1668](https://github.com/getsentry/sentry-native/pull/1668))
+
+## 0.13.7
+
+**Features**:
+
+- Add `before_screenshot` hook. ([#1641](https://github.com/getsentry/sentry-native/pull/1641))
+- Add error log for oversized envelopes (HTTP 413 Content Too Large). ([#1647](https://github.com/getsentry/sentry-native/pull/1647))
+
+**Fixes**:
+
+- Reset client report counters during initialization ([#1632](https://github.com/getsentry/sentry-native/pull/1632))
+- macOS: cache VM regions for FP validation in the new unwinder. ([#1634](https://github.com/getsentry/sentry-native/pull/1634))
+- Linux: remove dependency on `stdio` in the unwinder pointer validation code to reduce exposure to async-signal-unsafe functions. ([#1637](https://github.com/getsentry/sentry-native/pull/1637))
+- macOS: replace sandbox-incompatible IPC primitives (`sem_open`, `shm_open`, `fork`) with sandbox-safe alternatives (`pthread_mutex`, file-backed `mmap`, `posix_spawn`) so the native backend works inside App Sandbox. ([#1644](https://github.com/getsentry/sentry-native/pull/1644))
+- Fix minidump UUID byte order (swap GUID fields to match RSDS format) and use `int64` for image sizes to support modules larger than 2 GB. ([#1651](https://github.com/getsentry/sentry-native/pull/1651))
+
 ## 0.13.6
 
 **Features**:

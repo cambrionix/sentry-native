@@ -44,7 +44,6 @@ sentry__retry_new(const sentry_options_t *options)
     if (!retry) {
         return NULL;
     }
-    memset(retry, 0, sizeof(sentry_retry_t));
     sentry__mutex_init(&retry->sealed_lock);
     retry->run = sentry__run_incref(options->run);
     retry->cache_keep = options->cache_keep;
@@ -142,6 +141,10 @@ size_t
 sentry__retry_send(sentry_retry_t *retry, uint64_t before,
     sentry_retry_send_func_t send_cb, void *data)
 {
+    if (sentry__run_should_skip_upload(retry->run)) {
+        return 1; // keep the poll alive until consent is given
+    }
+
     sentry_pathiter_t *piter
         = sentry__path_iter_directory(retry->run->cache_path);
     if (!piter) {

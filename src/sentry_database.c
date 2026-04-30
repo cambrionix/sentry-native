@@ -74,6 +74,8 @@ sentry__run_new(const sentry_path_t *database_path)
     }
 
     run->refcount = 1;
+    run->require_user_consent = 0;
+    run->user_consent = SENTRY_USER_CONSENT_UNKNOWN;
     run->uuid = uuid;
     run->run_path = run_path;
     run->session_path = session_path;
@@ -94,6 +96,36 @@ sentry__run_new(const sentry_path_t *database_path)
 error:
     sentry__run_free(run);
     return NULL;
+}
+
+bool
+sentry__run_should_skip_upload(sentry_run_t *run)
+{
+    return sentry__atomic_fetch(&run->require_user_consent)
+        && (sentry__atomic_fetch(&run->user_consent)
+            != SENTRY_USER_CONSENT_GIVEN);
+}
+
+void
+sentry__run_load_user_consent(
+    sentry_run_t *run, const sentry_path_t *database_path)
+{
+    sentry_path_t *consent_path
+        = sentry__path_join_str(database_path, "user-consent");
+    char *contents = sentry__path_read_to_buffer(consent_path, NULL);
+    sentry__path_free(consent_path);
+    switch (contents ? contents[0] : 0) {
+    case '1':
+        sentry__atomic_store(&run->user_consent, SENTRY_USER_CONSENT_GIVEN);
+        break;
+    case '0':
+        sentry__atomic_store(&run->user_consent, SENTRY_USER_CONSENT_REVOKED);
+        break;
+    default:
+        sentry__atomic_store(&run->user_consent, SENTRY_USER_CONSENT_UNKNOWN);
+        break;
+    }
+    sentry_free(contents);
 }
 
 sentry_run_t *
@@ -419,14 +451,17 @@ sentry__process_old_runs(const sentry_options_t *options, uint64_t last_crash)
                     sentry__session_free(session);
                     if ((++session_num) >= SENTRY_MAX_ENVELOPE_SESSIONS) {
                         sentry__capture_envelope(
-                            options->transport, session_envelope);
+                            options->transport, session_envelope, options);
                         session_envelope = NULL;
                         session_num = 0;
                     }
                 }
             } else if (sentry__path_ends_with(file, ".envelope")) {
                 sentry_envelope_t *envelope = sentry__envelope_from_path(file);
-                sentry__capture_envelope(options->transport, envelope);
+                if (envelope) {
+                    sentry__capture_envelope(
+                        options->transport, envelope, options);
+                }
             }
 
             sentry__path_remove(file);
@@ -438,7 +473,9 @@ sentry__process_old_runs(const sentry_options_t *options, uint64_t last_crash)
     }
     sentry__pathiter_free(db_iter);
 
-    sentry__capture_envelope(options->transport, session_envelope);
+    if (session_envelope) {
+        sentry__capture_envelope(options->transport, session_envelope, options);
+    }
 }
 
 // Cache Pruning below is based on prune_crash_reports.cc from Crashpad
