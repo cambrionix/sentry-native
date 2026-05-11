@@ -65,6 +65,7 @@ sentry_options_new(void)
     opts->propagate_traceparent = false;
     opts->crashpad_limit_stack_capture_to_sp = false;
     opts->enable_metrics = true;
+    opts->enable_logs = true;
     opts->cache_keep = false;
     opts->cache_max_age = 0;
     opts->cache_max_size = 0;
@@ -95,6 +96,7 @@ sentry_options_new(void)
                                                             // both worlds
     opts->http_retry = false;
     opts->send_client_reports = true;
+    opts->enable_large_attachments = false;
 
     return opts;
 }
@@ -870,6 +872,19 @@ int
 sentry_options_get_enable_metrics(const sentry_options_t *opts)
 {
     return opts->enable_metrics;
+}
+
+void
+sentry_options_set_enable_large_attachments(
+    sentry_options_t *opts, int enable_large_attachments)
+{
+    opts->enable_large_attachments = !!enable_large_attachments;
+}
+
+int
+sentry_options_get_enable_large_attachments(const sentry_options_t *opts)
+{
+    return opts->enable_large_attachments;
 }
 
 void

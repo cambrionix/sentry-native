@@ -128,12 +128,12 @@ handle_result(sentry_retry_t *retry, const retry_item_t *item, int status_code)
     // cache on last attempt
     if (exhausted && retry->cache_keep && status_code < 0) {
         if (!sentry__run_move_cache(retry->run, item->path, -1)) {
-            sentry__path_remove(item->path);
+            sentry__cache_remove_envelope(item->path);
         }
         return false;
     }
 
-    sentry__path_remove(item->path);
+    sentry__cache_remove_envelope(item->path);
     return false;
 }
 
@@ -168,7 +168,8 @@ sentry__retry_send(sentry_retry_t *retry, uint64_t before,
         uint64_t ts;
         int count;
         const char *uuid;
-        if (!sentry__parse_cache_filename(fname, &ts, &count, &uuid)) {
+        if (!sentry__parse_cache_filename(fname, &ts, &count, &uuid)
+            || count < 0) {
             continue;
         }
         if (before > 0 && ts >= before) {
@@ -209,7 +210,7 @@ sentry__retry_send(sentry_retry_t *retry, uint64_t before,
     for (size_t i = 0; i < eligible; i++) {
         sentry_envelope_t *envelope = sentry__envelope_from_path(items[i].path);
         if (!envelope) {
-            sentry__path_remove(items[i].path);
+            sentry__cache_remove_envelope(items[i].path);
             total--;
         } else {
             SENTRY_DEBUGF("retrying envelope (%d/%d)", items[i].count + 1,
@@ -323,17 +324,17 @@ sentry__retry_trigger(sentry_retry_t *retry)
     sentry__bgworker_submit(retry->bgworker, retry_trigger_task, NULL, retry);
 }
 
-void
+bool
 sentry__retry_enqueue(sentry_retry_t *retry, const sentry_envelope_t *envelope)
 {
     sentry__mutex_lock(&retry->sealed_lock);
     if (sentry__atomic_fetch(&retry->state) == SENTRY_RETRY_SEALED) {
         sentry__mutex_unlock(&retry->sealed_lock);
-        return;
+        return false;
     }
     if (!sentry__run_write_cache(retry->run, envelope, 0)) {
         sentry__mutex_unlock(&retry->sealed_lock);
-        return;
+        return false;
     }
     sentry__mutex_unlock(&retry->sealed_lock);
 
@@ -344,4 +345,5 @@ sentry__retry_enqueue(sentry_retry_t *retry, const sentry_envelope_t *envelope)
         sentry__bgworker_submit_delayed(retry->bgworker, retry_poll_task, NULL,
             retry, SENTRY_RETRY_INTERVAL);
     }
+    return true;
 }

@@ -194,6 +194,8 @@ native_backend_startup(
     ctx->attach_screenshot = options->attach_screenshot;
     ctx->cache_keep = options->cache_keep;
     ctx->require_user_consent = options->require_user_consent;
+    ctx->enable_large_attachments = options->enable_large_attachments;
+    ctx->shutdown_timeout = options->shutdown_timeout;
     sentry__atomic_store(
         &ctx->user_consent, sentry__atomic_fetch(&options->run->user_consent));
 
@@ -584,12 +586,71 @@ native_backend_free(sentry_backend_t *backend)
     sentry_free(state);
 }
 
+// Writes the scope's attachment list to <run>/__sentry-attachments so the
+// crash daemon can locate and append them to the crash envelope.
+static void
+native_backend_write_attachments(const sentry_path_t *event_path)
+{
+    if (!event_path) {
+        return;
+    }
+    SENTRY_WITH_SCOPE (scope) {
+        if (!scope->attachments) {
+            continue;
+        }
+        sentry_path_t *run_path = sentry__path_dir(event_path);
+        if (!run_path) {
+            continue;
+        }
+        sentry_path_t *attach_list_path
+            = sentry__path_join_str(run_path, "__sentry-attachments");
+        if (attach_list_path) {
+            sentry_value_t attach_list = sentry_value_new_list();
+            for (sentry_attachment_t *it = scope->attachments; it;
+                it = it->next) {
+                if (!it->path) {
+                    continue;
+                }
+                sentry_value_t attach_info = sentry_value_new_object();
+                sentry_value_set_by_key(attach_info, "path",
+                    sentry_value_new_string(it->path->path));
+                const char *filename = sentry__path_filename(
+                    it->filename ? it->filename : it->path);
+                sentry_value_set_by_key(
+                    attach_info, "filename", sentry_value_new_string(filename));
+                if (it->content_type) {
+                    sentry_value_set_by_key(attach_info, "content_type",
+                        sentry_value_new_string(it->content_type));
+                }
+                sentry_value_append(attach_list, attach_info);
+            }
+            char *attach_json = sentry_value_to_json(attach_list);
+            sentry_value_decref(attach_list);
+            if (attach_json) {
+                sentry__path_write_buffer(
+                    attach_list_path, attach_json, strlen(attach_json));
+                sentry_free(attach_json);
+            }
+            sentry__path_free(attach_list_path);
+        }
+        sentry__path_free(run_path);
+    }
+}
+
 static void
 native_backend_flush_scope(
     sentry_backend_t *backend, const sentry_options_t *UNUSED(options))
 {
     native_backend_state_t *state = (native_backend_state_t *)backend->data;
-    if (!state || !state->event_path || sentry__atomic_fetch(&state->crashed)) {
+    if (!state || !state->event_path) {
+        return;
+    }
+
+    // Manifest writes must continue post-crash so attachments registered
+    // from on_crash/before_send reach the daemon
+    native_backend_write_attachments(state->event_path);
+
+    if (sentry__atomic_fetch(&state->crashed)) {
         return;
     }
 
@@ -658,50 +719,6 @@ native_backend_flush_scope(
         size_t json_len = strlen(json_str);
         sentry__path_write_buffer(state->event_path, json_str, json_len);
         sentry_free(json_str);
-    }
-
-    // Write attachment metadata (paths and filenames) so crash daemon can find
-    // them
-    SENTRY_WITH_SCOPE (scope) {
-        if (scope->attachments) {
-            sentry_path_t *run_path = sentry__path_dir(state->event_path);
-            if (run_path) {
-                sentry_path_t *attach_list_path
-                    = sentry__path_join_str(run_path, "__sentry-attachments");
-                if (attach_list_path) {
-                    // Write attachment list as JSON array
-                    sentry_value_t attach_list = sentry_value_new_list();
-                    for (sentry_attachment_t *it = scope->attachments; it;
-                        it = it->next) {
-                        if (it->path) {
-                            sentry_value_t attach_info
-                                = sentry_value_new_object();
-                            sentry_value_set_by_key(attach_info, "path",
-                                sentry_value_new_string(it->path->path));
-                            const char *filename = sentry__path_filename(
-                                it->filename ? it->filename : it->path);
-                            sentry_value_set_by_key(attach_info, "filename",
-                                sentry_value_new_string(filename));
-                            if (it->content_type) {
-                                sentry_value_set_by_key(attach_info,
-                                    "content_type",
-                                    sentry_value_new_string(it->content_type));
-                            }
-                            sentry_value_append(attach_list, attach_info);
-                        }
-                    }
-                    char *attach_json = sentry_value_to_json(attach_list);
-                    sentry_value_decref(attach_list);
-                    if (attach_json) {
-                        sentry__path_write_buffer(
-                            attach_list_path, attach_json, strlen(attach_json));
-                        sentry_free(attach_json);
-                    }
-                    sentry__path_free(attach_list_path);
-                }
-                sentry__path_free(run_path);
-            }
-        }
     }
 }
 

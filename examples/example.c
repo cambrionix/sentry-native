@@ -548,6 +548,12 @@ main(int argc, char **argv)
 
     sentry_options_set_auto_session_tracking(options, false);
     sentry_options_set_symbolize_stacktraces(options, true);
+    const char *shutdown_timeout
+        = get_arg_value(argc, argv, "shutdown-timeout");
+    if (shutdown_timeout) {
+        sentry_options_set_shutdown_timeout(
+            options, strtoull(shutdown_timeout, NULL, 10));
+    }
 
     sentry_options_set_environment(options, "development");
     // sentry defaults this to the `SENTRY_RELEASE` env variable
@@ -563,6 +569,26 @@ main(int argc, char **argv)
         // assuming the example / test is run directly from the cmake build
         // directory
         sentry_options_add_attachment(options, "./CMakeCache.txt");
+    }
+
+    if (has_arg(argc, argv, "large-attachment")) {
+        sentry_options_set_enable_large_attachments(options, 1);
+        const char *large_file = ".sentry-large-attachment";
+        FILE *f = fopen(large_file, "wb");
+        if (f) {
+            // 100 MB = TUS upload threshold
+            char zeros[4096];
+            memset(zeros, 0, sizeof(zeros));
+            size_t remaining = 100 * 1024 * 1024;
+            while (remaining > 0) {
+                size_t chunk
+                    = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
+                fwrite(zeros, 1, chunk, f);
+                remaining -= chunk;
+            }
+            fclose(f);
+            sentry_options_add_attachment(options, large_file);
+        }
     }
 
     if (has_arg(argc, argv, "stdout")) {
@@ -678,8 +704,8 @@ main(int argc, char **argv)
         sentry_options_set_logger_enabled_when_crashed(options, 1);
     }
 
-    if (has_arg(argc, argv, "enable-logs")) {
-        sentry_options_set_enable_logs(options, true);
+    if (has_arg(argc, argv, "disable-logs")) {
+        sentry_options_set_enable_logs(options, false);
     }
 
     if (has_arg(argc, argv, "crash-reporter")) {

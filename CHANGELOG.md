@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.14.0
+
+**Breaking / Important behavior changes**:
+
+- Metrics are enabled by default. This behavior first appeared in `0.13.5` and is now documented as part of the `0.14.0` behavior. Applications that do not want to send metrics must explicitly opt out with `sentry_options_set_enable_metrics(options, false)`. ([#1609](https://github.com/getsentry/sentry-native/pull/1609))
+- Structured logs are enabled by default. This behavior first appeared in `0.13.9` and is now documented as part of the `0.14.0` behavior. Applications that do not want to capture structured logs must explicitly opt out with `sentry_options_set_enable_logs(options, false)`. ([#1673](https://github.com/getsentry/sentry-native/pull/1673))
+
+## 0.13.9
+
+**Features**:
+
+- Enable structured logs by default; logs are now opt-out via `sentry_options_set_enable_logs(options, false)`. ([#1673](https://github.com/getsentry/sentry-native/pull/1673))
+- Crashpad: add macOS support for the `crashpad_wait_for_upload` flag. ([#1679](https://github.com/getsentry/sentry-native/pull/1679), [crashpad#152](https://github.com/getsentry/crashpad/pull/152))
+- Add experimental support for large attachment uploads, opt-in via `sentry_options_set_enable_large_attachments`. ([#1545](https://github.com/getsentry/sentry-native/pull/1545))
+
+**Fixes**:
+
+- Fix event ownership (potential double-decref) in sentry_capture_minidump. ([#1669](https://github.com/getsentry/sentry-native/pull/1669))
+- Guard against internal stringbuilder append and reserve size overflows. ([#1672](https://github.com/getsentry/sentry-native/pull/1672))
+- Preserve attachments added during crash handling ([#1687](https://github.com/getsentry/sentry-native/pull/1687))
+- Fix build-time warnings with C++ builds. ([#1671](https://github.com/getsentry/sentry-native/pull/1671))
+- Native: respect the `shutdown_timeout` option in the daemon. ([#1691](https://github.com/getsentry/sentry-native/pull/1691))
+
 ## 0.13.8
 
 **Features**:

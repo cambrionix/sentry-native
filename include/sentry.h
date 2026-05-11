@@ -104,7 +104,7 @@ extern "C" {
 #    endif
 #endif
 #ifndef SENTRY_SDK_VERSION
-#    define SENTRY_SDK_VERSION "0.13.8"
+#    define SENTRY_SDK_VERSION "0.14.0"
 #endif
 #define SENTRY_SDK_USER_AGENT SENTRY_SDK_NAME "/" SENTRY_SDK_VERSION
 
@@ -1840,8 +1840,8 @@ sentry_options_get_crash_reporting_mode(const sentry_options_t *opts);
  * Enables a wait for the crash report upload to be finished before shutting
  * down. This is disabled by default.
  *
- * This setting only has an effect when using the `crashpad` backend on Linux
- * and Windows.
+ * This setting only has an effect when using the `crashpad` backend on Linux,
+ * Windows and macOS.
  */
 SENTRY_API void sentry_options_set_crashpad_wait_for_upload(
     sentry_options_t *opts, int wait_for_upload);
@@ -2331,6 +2331,8 @@ SENTRY_EXPERIMENTAL_API int sentry_options_get_propagate_traceparent(
 /**
  * Enables or disables the structured logging feature.
  * When disabled, all calls to `sentry_log_X()` are no-ops.
+ *
+ * Enabled by default.
  */
 SENTRY_EXPERIMENTAL_API void sentry_options_set_enable_logs(
     sentry_options_t *opts, int enable_logs);
@@ -2347,6 +2349,25 @@ SENTRY_EXPERIMENTAL_API int sentry_options_get_enable_logs(
 SENTRY_EXPERIMENTAL_API void sentry_options_set_http_retry(
     sentry_options_t *opts, int enabled);
 SENTRY_EXPERIMENTAL_API int sentry_options_get_http_retry(
+    const sentry_options_t *opts);
+
+/**
+ * Enables or disables out-of-band upload of large attachments.
+ *
+ * When enabled, attachments above an internal size threshold are uploaded
+ * via a separate request before the envelope is sent, and referenced from
+ * the envelope by location instead of being embedded inline. When disabled,
+ * attachments are embedded in the envelope and oversized uploads are rejected
+ * by Sentry.
+ *
+ * Note: Requires the `projects:relay-upload-endpoint` server feature. See
+ * https://develop.sentry.dev/sdk/telemetry/attachments/#attachment-placeholders
+ *
+ * Disabled by default.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_enable_large_attachments(
+    sentry_options_t *opts, int enable_large_attachments);
+SENTRY_EXPERIMENTAL_API int sentry_options_get_enable_large_attachments(
     const sentry_options_t *opts);
 
 /**
