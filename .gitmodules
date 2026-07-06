@@ -3,7 +3,7 @@
 	url = https://github.com/getsentry/libunwindstack-ndk
 [submodule "external/breakpad"]
     path = external/breakpad
-    url = git@bitbucket.org:cambrionix/breakpad.git
+    url = https://github.com/cambrionix/breakpad.git
     branch = Cambrionix
 [submodule "external/third_party/lss"]
 	path = external/third_party/lss
