@@ -5,16 +5,20 @@ import sys
 import time
 
 import pytest
+from flaky import flaky
 
 from . import (
     make_dsn,
     run,
+    stage_replay,
     Envelope,
     split_log_request_cond,
     extract_request,
     is_session_envelope,
     is_logs_envelope,
     is_feedback_envelope,
+    is_replay_envelope,
+    REPLAY_ID,
 )
 from .conditions import has_crashpad, has_oom
 from .proxy import (
@@ -28,6 +32,7 @@ from .assertions import (
     assert_crashpad_upload,
     assert_meta,
     assert_minidump,
+    assert_replay_envelope,
     assert_session,
     assert_gzip_file_header,
     assert_logs,
@@ -256,6 +261,46 @@ def test_crashpad_reinstall(cmake, httpserver):
     assert len(httpserver.log) == 1
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="crashpad doesn't provide SetFirstChanceExceptionHandler on macOS",
+)
+def test_crashpad_replay_envelope(cmake, httpserver):
+    """A staged replay referenced by the crash event's `contexts.replay` is
+    consumed by the first-chance handler at crash time, persisted to the run
+    folder as its own `replay_video` envelope, and sent on the next launch,
+    while the minidump uploads same-session."""
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
+
+    replays, video = stage_replay(tmp_path)
+
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+    httpserver.expect_request("/api/123456/envelope/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            ["log", "replay-context", "crash"],
+            expect_failure=True,
+            env=env,
+        )
+    assert waiting.result
+
+    # the staged replay is consumed at crash time by the first-chance handler
+    assert not (replays / f"replay-{REPLAY_ID}.mp4").exists()
+    assert not (replays / f"replay-{REPLAY_ID}.json").exists()
+
+    run(tmp_path, "sentry_example", ["log", "no-setup"], env=env)
+
+    # minidump upload + replay envelope
+    assert len(httpserver.log) == 2
+    replay_request, _ = extract_request(httpserver.log, is_replay_envelope)
+    assert replay_request is not None, "expected a replay_video envelope"
+    assert_replay_envelope(Envelope.deserialize(replay_request.get_data()), video)
+
+
 import psutil
 import time
 
@@ -285,8 +330,8 @@ def wait_for_no_werfault(timeout=30.0, poll_interval=0.5):
     reason="Test covers Windows-specific crashes which can only be covered via the Crashpad WER module",
 )
 # this test currently can't run on CI because the Windows-image doesn't properly support WER, if you want to run the
-# test locally, invoke pytest with the --with_crashpad_wer option which is matched with this marker in the runtest setup
-@pytest.mark.with_crashpad_wer
+# test locally, invoke pytest with the --with_wer option which is matched with this marker in the runtest setup
+@pytest.mark.with_wer
 @pytest.mark.parametrize(
     "run_args",
     [
@@ -369,21 +414,14 @@ def test_crashpad_wer_crash(cmake, httpserver, run_args):
         pytest.param(
             ["attach-after-init"],
             {},
-            marks=pytest.mark.skipif(
-                sys.platform == "darwin",
-                reason="crashpad doesn't support dynamic attachments on macOS",
-            ),
         ),
         pytest.param(
             ["attachment", "attach-after-init", "clear-attachments"],
             {},
-            marks=pytest.mark.skipif(
-                sys.platform == "darwin",
-                reason="crashpad doesn't support dynamic attachments on macOS",
-            ),
         ),
     ],
 )
+@flaky(max_runs=3)
 def test_crashpad_dumping_crash(cmake, httpserver, run_args, build_args):
     build_args.update({"SENTRY_BACKEND": "crashpad"})
     tmp_path = cmake(["sentry_example"], build_args)
@@ -401,6 +439,7 @@ def test_crashpad_dumping_crash(cmake, httpserver, run_args, build_args):
                 "start-session",
                 "attach-view-hierarchy",
                 "overflow-breadcrumbs",
+                "crashpad-wait-for-upload",
                 "crash",
             ]
             + run_args,
@@ -768,6 +807,7 @@ def test_crashpad_external_crash_reporter(cmake, httpserver, run_args):
     tmp_path = cmake(
         ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "crashpad"}
     )
+    cache_dir = tmp_path.joinpath(".sentry-native/cache")
 
     env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
     httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
@@ -777,7 +817,7 @@ def test_crashpad_external_crash_reporter(cmake, httpserver, run_args):
         run(
             tmp_path,
             "sentry_example",
-            ["log", "crash-reporter"] + run_args,
+            ["log", "crash-reporter", "cache-keep"] + run_args,
             expect_failure=True,
             env=env,
         )
@@ -791,6 +831,7 @@ def test_crashpad_external_crash_reporter(cmake, httpserver, run_args):
     crash = crash_request.get_data()
 
     envelope = Envelope.deserialize(crash)
+    assert envelope.headers["cache_dir"] == str(cache_dir)
     assert_meta(envelope, integration="crashpad")
     assert_breadcrumb(envelope)
 
@@ -803,8 +844,8 @@ def test_crashpad_external_crash_reporter(cmake, httpserver, run_args):
     reason="Test covers Windows-specific crashes which can only be covered via the Crashpad WER module",
 )
 # this test currently can't run on CI because the Windows-image doesn't properly support WER, if you want to run the
-# test locally, invoke pytest with the --with_crashpad_wer option which is matched with this marker in the runtest setup
-@pytest.mark.with_crashpad_wer
+# test locally, invoke pytest with the --with_wer option which is matched with this marker in the runtest setup
+@pytest.mark.with_wer
 @pytest.mark.parametrize(
     "run_args",
     [
@@ -815,8 +856,15 @@ def test_crashpad_external_crash_reporter_wer(cmake, httpserver, run_args):
     test_crashpad_external_crash_reporter(cmake, httpserver, run_args)
 
 
-@pytest.mark.parametrize("cache_keep", [True, False])
-def test_crashpad_cache_keep(cmake, httpserver, cache_keep):
+@pytest.mark.parametrize(
+    "cache_args,expect_cache",
+    [
+        ([], False),
+        (["cache-keep"], True),
+        (["cache-keep-always"], True),
+    ],
+)
+def test_crashpad_cache_keep(cmake, httpserver, cache_args, expect_cache):
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
     cache_dir = tmp_path.joinpath(".sentry-native/cache")
 
@@ -827,7 +875,7 @@ def test_crashpad_cache_keep(cmake, httpserver, cache_keep):
         run(
             tmp_path,
             "sentry_example",
-            ["log", "crash"] + (["cache-keep"] if cache_keep else []),
+            ["log", "crash"] + cache_args,
             expect_failure=True,
             env=env,
         )
@@ -839,7 +887,7 @@ def test_crashpad_cache_keep(cmake, httpserver, cache_keep):
     run(
         tmp_path,
         "sentry_example",
-        ["log", "no-setup"] + (["cache-keep"] if cache_keep else []),
+        ["log", "no-setup"] + cache_args,
         env=env,
     )
 
@@ -847,12 +895,12 @@ def test_crashpad_cache_keep(cmake, httpserver, cache_keep):
     run(
         tmp_path,
         "sentry_example",
-        ["log", "no-setup"] + (["cache-keep"] if cache_keep else []),
+        ["log", "no-setup"] + cache_args,
         env=env,
     )
 
-    assert cache_dir.exists() or cache_keep is False
-    if cache_keep:
+    assert cache_dir.exists() or expect_cache is False
+    if expect_cache:
         cache_files = list(cache_dir.glob("*.envelope"))
         assert len(cache_files) == 1
         with open(cache_files[0], "rb") as f:
@@ -864,6 +912,8 @@ def test_crashpad_cache_keep(cmake, httpserver, cache_keep):
         dmp_files = list(cache_dir.glob("*.dmp"))
         assert len(dmp_files) == 1
         assert cache_files[0].stem == dmp_files[0].stem
+    else:
+        assert not cache_dir.exists() or len(list(cache_dir.glob("*.envelope"))) == 0
 
 
 def test_crashpad_cache_consent(cmake, httpserver):
@@ -1057,3 +1107,31 @@ def test_crashpad_cache_max_age(cmake, httpserver):
     assert len(cache_files) == 3
     for f in cache_files:
         assert time.time() - f.stat().st_mtime <= 5 * 24 * 60 * 60
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="crashpad doesn't provide SetFirstChanceExceptionHandler on macOS",
+)
+def test_crashpad_restart_on_crash(cmake, httpserver):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
+
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        # The restarted child inherits stdio, so PIPE waits for it without a sleep.
+        run(
+            tmp_path,
+            "sentry_example",
+            ["crash", "restart-on-crash"],
+            expect_failure=True,
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    assert waiting.result
+    assert len(httpserver.log) == 2
+    for req in httpserver.log:
+        assert_crashpad_upload(req[0])

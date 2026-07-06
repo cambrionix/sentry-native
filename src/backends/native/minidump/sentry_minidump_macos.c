@@ -10,6 +10,7 @@
 #    include <mach/mach.h>
 #    include <mach/mach_vm.h>
 #    include <pthread.h>
+#    include <signal.h>
 #    include <stdbool.h>
 #    include <stdio.h>
 #    include <string.h>
@@ -22,6 +23,7 @@
 #    include "sentry_logger.h"
 #    include "sentry_minidump_common.h"
 #    include "sentry_minidump_format.h"
+#    include "sentry_minidump_indirect.h"
 #    include "sentry_minidump_writer.h"
 
 // Use shared constants from crash context
@@ -65,6 +67,21 @@ typedef struct {
 
     memory_region_t regions[SENTRY_CRASH_MAX_MAPPINGS];
     size_t region_count;
+
+    // Thread-stack memory descriptors recorded as we write the ThreadList
+    // stream. We replay them into MemoryListStream so debuggers (notably
+    // LLDB's ProcessMinidump) can find stack bytes by virtual address —
+    // without this LLDB knows the stack region exists but cannot read its
+    // contents and unwinding stops after frame 0. thread_stack_tids[i]
+    // identifies the thread for the SMART-mode indirect-memory walker so
+    // it can find the matching thread context for register scanning.
+    // Stored as full 64-bit Mach thread IDs (matching
+    // sentry_thread_context_darwin_t::tid) so the lookup against
+    // platform.threads[j].tid does not silently miss on values that don't
+    // fit in MINIDUMP_THREAD::thread_id's uint32_t.
+    minidump_memory_descriptor_t thread_stacks[SENTRY_CRASH_MAX_THREADS];
+    uint64_t thread_stack_tids[SENTRY_CRASH_MAX_THREADS];
+    size_t thread_stack_count;
 } minidump_writer_t;
 
 // Use common minidump functions (cast writer to base type)
@@ -457,6 +474,36 @@ write_thread_context(
 }
 
 /**
+ * Push a thread's stack descriptor onto writer->thread_stacks so the
+ * MemoryListStream writer can replay it. We only record stacks whose
+ * write actually produced bytes — a zero-size or zero-rva descriptor
+ * would point into the minidump header and break parsers.
+ */
+static void
+record_thread_stack(
+    minidump_writer_t *writer, const minidump_thread_t *thread, uint64_t tid)
+{
+    if (thread->stack.memory.size == 0 || thread->stack.memory.rva == 0) {
+        return;
+    }
+    if (writer->thread_stack_count >= SENTRY_CRASH_MAX_THREADS) {
+        return;
+    }
+    writer->thread_stacks[writer->thread_stack_count] = thread->stack;
+    writer->thread_stack_tids[writer->thread_stack_count] = tid;
+    writer->thread_stack_count++;
+}
+
+// Forward declaration: `find_region_for_addr` is defined further down
+// with the rest of the SMART-mode indirect-capture code, but we want to
+// consult it from ``write_thread_stack`` so the read window is clamped
+// to the actual VM region containing SP. Without this clamp, a SP near
+// the top of a small thread stack causes the fixed-size read to spill
+// into the guard page and the entire `read_task_memory` call fails.
+static const memory_region_t *find_region_for_addr(
+    const minidump_writer_t *writer, uint64_t addr);
+
+/**
  * Read and write stack memory for a thread
  */
 static minidump_rva_t
@@ -469,9 +516,25 @@ write_thread_stack(minidump_writer_t *writer, uint64_t stack_pointer,
     // We need to capture from SP *upward* for stack unwinding to work.
     const size_t MAX_STACK_SIZE = SENTRY_CRASH_MAX_STACK_CAPTURE;
 
-    // Capture from SP upward (where return addresses are stored)
+    // Clamp the read window to the VM region containing SP. Without this,
+    // a SP near the top of a small thread stack causes the fixed-size
+    // read to overshoot into an unmapped guard page and the entire
+    // read_task_memory call fails with KERN_INVALID_ADDRESS, leaving the
+    // descriptor empty.
     mach_vm_address_t stack_start = stack_pointer;
     mach_vm_size_t stack_size = MAX_STACK_SIZE;
+    const memory_region_t *containing_region
+        = find_region_for_addr(writer, stack_pointer);
+    if (containing_region) {
+        uint64_t region_end
+            = containing_region->address + containing_region->size;
+        if (stack_pointer < region_end) {
+            uint64_t available = region_end - stack_pointer;
+            if (available < stack_size) {
+                stack_size = (mach_vm_size_t)available;
+            }
+        }
+    }
 
     // Allocate buffer for stack memory
     void *stack_buffer = sentry_malloc(stack_size);
@@ -491,15 +554,25 @@ write_thread_stack(minidump_writer_t *writer, uint64_t stack_pointer,
         *stack_size_out = rva ? stack_size : 0;
         *stack_start_out = rva ? stack_start : 0;
     } else {
-        // Try with smaller size if full read fails (may hit unmapped memory)
-        stack_size = MAX_STACK_SIZE / 4;
-        kr = read_task_memory(
-            writer->task, stack_start, stack_buffer, stack_size);
-        if (kr == KERN_SUCCESS) {
-            rva = write_data(writer, stack_buffer, stack_size);
-            *stack_size_out = rva ? stack_size : 0;
-            *stack_start_out = rva ? stack_start : 0;
-        } else {
+        // Defensive retry with progressively smaller reads in case the
+        // region query was stale (e.g. region was unmapped between
+        // enumerate_memory_regions and now). Halve from the clamped
+        // stack_size so we still make at least one attempt when the
+        // region is smaller than a page. Floor at 16 bytes (two 64-bit
+        // pointers — enough for at least a return address and frame
+        // pointer) so very small clamps still get a retry pass.
+        for (mach_vm_size_t retry = stack_size / 2; retry >= 16; retry /= 2) {
+            kr = read_task_memory(
+                writer->task, stack_start, stack_buffer, retry);
+            if (kr == KERN_SUCCESS) {
+                stack_size = retry;
+                rva = write_data(writer, stack_buffer, stack_size);
+                *stack_size_out = rva ? stack_size : 0;
+                *stack_start_out = rva ? stack_start : 0;
+                break;
+            }
+        }
+        if (rva == 0) {
             *stack_size_out = 0;
             *stack_start_out = 0;
         }
@@ -547,14 +620,34 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
     thread_list->count = thread_count;
 
     if (writer->thread_count > 0) {
-        // Full path: enumerate all threads from task_threads()
+        // Full path: enumerate all threads from task_threads().
+        //
+        // For *register state* and *stack capture* we MUST prefer the
+        // snapshot the signal handler took at crash time (saved into
+        // ``writer->crash_ctx->platform.threads[]``) over a fresh
+        // ``thread_get_state()`` from inside the daemon. By the time the
+        // daemon runs, the crashing thread's signal handler has moved its
+        // SP/PC deep into libsystem code (waiting on the daemon via shm
+        // IPC), so ``thread_get_state`` returns a daemon-time SP that
+        // points inside the daemon-wait frame rather than the crash site.
+        // That made every ``MINIDUMP_THREAD::stack.start_of_memory_range``
+        // for the crashing thread (and any thread whose SP advanced
+        // between signal-time and daemon-time) point at libsystem code
+        // pages instead of the real thread stack VM region. Match by
+        // ``thread_id`` against the captured snapshot and use that;
+        // ``thread_get_state`` only fills the gap if the snapshot is
+        // missing the thread for some reason.
         for (mach_msg_type_number_t i = 0; i < writer->thread_count; i++) {
             minidump_thread_t *thread = &thread_list->threads[i];
             memset(thread, 0, sizeof(*thread));
 
             thread_t mach_thread = writer->threads[i];
 
-            // Get thread ID
+            // Get thread ID. Mach's thread_identifier_info.thread_id is
+            // uint64_t; MINIDUMP_THREAD::thread_id is uint32_t. Match against
+            // the captured snapshot (whose tid is also uint64_t) using the
+            // full value, and only narrow when writing the minidump field.
+            uint64_t mach_tid = 0;
             thread_identifier_info_data_t identifier_info;
             mach_msg_type_number_t identifier_info_count
                 = THREAD_IDENTIFIER_INFO_COUNT;
@@ -562,7 +655,8 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
             if (thread_info(mach_thread, THREAD_IDENTIFIER_INFO,
                     (thread_info_t)&identifier_info, &identifier_info_count)
                 == KERN_SUCCESS) {
-                thread->thread_id = identifier_info.thread_id;
+                mach_tid = identifier_info.thread_id;
+                thread->thread_id = (uint32_t)mach_tid;
             }
 
             // Get thread priority
@@ -577,16 +671,45 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
                 thread->priority_class = extended_info.pth_priority;
             }
 
-            // Get thread state (registers)
-            // Zero-initialize to ensure float/NEON state fields are not garbage
+            // Look up the signal-handler-captured snapshot for this thread.
+            const _STRUCT_MCONTEXT *snapshot_state = NULL;
+            size_t num_captured = writer->crash_ctx
+                ? writer->crash_ctx->platform.num_threads
+                : 0;
+            if (num_captured > SENTRY_CRASH_MAX_THREADS) {
+                num_captured = SENTRY_CRASH_MAX_THREADS;
+            }
+            for (size_t j = 0; j < num_captured; j++) {
+                if (writer->crash_ctx->platform.threads[j].tid == mach_tid) {
+                    snapshot_state
+                        = &writer->crash_ctx->platform.threads[j].state;
+                    break;
+                }
+            }
+
+            // Get thread state (registers): prefer the signal-handler
+            // snapshot, fall back to a fresh thread_get_state() only when
+            // the snapshot is missing the thread.
+            // Zero-initialize so float/NEON state fields are deterministic
             // since MACHINE_THREAD_STATE only populates integer registers
-            // (__ss), we must pass &mcontext.__ss (not &mcontext)
+            // (__ss); we must pass &mcontext.__ss (not &mcontext) when
+            // calling thread_get_state.
             _STRUCT_MCONTEXT mcontext;
             memset(&mcontext, 0, sizeof(mcontext));
-            mach_msg_type_number_t state_count = MACHINE_THREAD_STATE_COUNT;
-            if (thread_get_state(mach_thread, MACHINE_THREAD_STATE,
-                    (thread_state_t)&mcontext.__ss, &state_count)
-                == KERN_SUCCESS) {
+            bool have_state = false;
+            if (snapshot_state) {
+                memcpy(&mcontext, snapshot_state, sizeof(mcontext));
+                have_state = true;
+            } else {
+                mach_msg_type_number_t state_count = MACHINE_THREAD_STATE_COUNT;
+                if (thread_get_state(mach_thread, MACHINE_THREAD_STATE,
+                        (thread_state_t)&mcontext.__ss, &state_count)
+                    == KERN_SUCCESS) {
+                    have_state = true;
+                }
+            }
+
+            if (have_state) {
 
                 // Write thread context (registers)
                 thread->thread_context.rva
@@ -607,6 +730,7 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
                     = write_thread_stack(writer, sp, &stack_size, &stack_start);
                 thread->stack.memory.size = stack_size;
                 thread->stack.start_address = stack_start;
+                record_thread_stack(writer, thread, mach_tid);
             }
         }
     } else if (writer->crash_ctx
@@ -660,6 +784,8 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
                                 : 0;
                             thread->stack.start_address
                                 = thread->stack.memory.rva ? sp : 0;
+                            record_thread_stack(writer, thread,
+                                writer->crash_ctx->platform.threads[i].tid);
                             SENTRY_DEBUGF(
                                 "Thread %zu: wrote stack from file at RVA "
                                 "0x%x, size %llu, start_addr 0x%llx",
@@ -691,6 +817,8 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
                     = write_thread_stack(writer, sp, &stack_size, &stack_start);
                 thread->stack.memory.size = stack_size;
                 thread->stack.start_address = stack_start;
+                record_thread_stack(
+                    writer, thread, writer->crash_ctx->platform.threads[i].tid);
                 SENTRY_DEBUGF(
                     "Thread %zu: wrote stack from memory at RVA 0x%x, size %zu",
                     i, thread->stack.memory.rva, stack_size);
@@ -712,6 +840,255 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
 }
 
 /**
+ * Write thread names stream (stream type 24).
+ *
+ * Matches Crashpad's ThreadNamesStream format: a list of MINIDUMP_THREAD_NAME
+ * entries, each pointing to a UTF-16LE string. Mirrors the Linux writer
+ * (sentry_minidump_linux.c:write_thread_names_stream).
+ *
+ * Names are read via thread_info(THREAD_EXTENDED_INFO), which returns the
+ * `pth_name[64]` field set by pthread_setname_np(). This works cross-process,
+ * so we can use it from the daemon as long as we have a valid task port.
+ *
+ * Fallback path (no task_for_pid): the signal-handler-captured snapshot in
+ * ``ctx->platform.threads[]`` does not currently include names, so those
+ * entries get an empty string — but the stream is still emitted with the
+ * correct tid list so consumers see a non-empty thread_names list.
+ */
+static int
+write_thread_names_stream(minidump_writer_t *writer, minidump_directory_t *dir)
+{
+    // Decide which thread set we're iterating, matching
+    // write_thread_list_stream.
+    uint32_t thread_count = writer->thread_count;
+    bool use_fallback = false;
+
+    if (thread_count == 0 && writer->crash_ctx) {
+        if (writer->crash_ctx->platform.num_threads > 0) {
+            thread_count = writer->crash_ctx->platform.num_threads;
+            if (thread_count > SENTRY_CRASH_MAX_THREADS) {
+                thread_count = SENTRY_CRASH_MAX_THREADS;
+            }
+            use_fallback = true;
+        } else {
+            // Last-resort: only the crashing thread, no name available.
+            thread_count = 1;
+            use_fallback = true;
+        }
+    }
+
+    if (thread_count == 0) {
+        // Nothing to write — leave dir zeroed so consumers skip the slot.
+        return 0;
+    }
+
+    SENTRY_DEBUGF("write_thread_names_stream: %u threads", thread_count);
+
+    minidump_rva_t *name_rvas
+        = sentry_malloc(sizeof(minidump_rva_t) * thread_count);
+    uint32_t *name_tids = sentry_malloc(sizeof(uint32_t) * thread_count);
+    if (!name_rvas || !name_tids) {
+        sentry_free(name_rvas);
+        sentry_free(name_tids);
+        return -1;
+    }
+
+    // First pass: collect (tid, name) for each thread and write each name as a
+    // UTF-16LE MINIDUMP_STRING; record the RVAs. A 0 RVA from
+    // write_minidump_string means the string write failed; emitting it into
+    // MINIDUMP_THREAD_NAME::thread_name_rva would point parsers at the
+    // header, so we abort the whole stream instead. The caller zeroes the
+    // directory slot on -1 and keeps the rest of the dump.
+    if (!use_fallback) {
+        for (mach_msg_type_number_t i = 0; i < writer->thread_count; i++) {
+            thread_t mach_thread = writer->threads[i];
+
+            uint32_t tid = 0;
+            thread_identifier_info_data_t identifier_info;
+            mach_msg_type_number_t identifier_info_count
+                = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(mach_thread, THREAD_IDENTIFIER_INFO,
+                    (thread_info_t)&identifier_info, &identifier_info_count)
+                == KERN_SUCCESS) {
+                tid = (uint32_t)identifier_info.thread_id;
+            }
+            name_tids[i] = tid;
+
+            const char *name = "";
+            thread_extended_info_data_t extended_info;
+            mach_msg_type_number_t extended_info_count
+                = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info(mach_thread, THREAD_EXTENDED_INFO,
+                    (thread_info_t)&extended_info, &extended_info_count)
+                == KERN_SUCCESS) {
+                // pth_name is a fixed-size buffer; ensure NUL-termination.
+                extended_info.pth_name[sizeof(extended_info.pth_name) - 1]
+                    = '\0';
+                name = extended_info.pth_name;
+            }
+            name_rvas[i] = write_minidump_string(writer, name);
+            if (!name_rvas[i]) {
+                sentry_free(name_rvas);
+                sentry_free(name_tids);
+                return -1;
+            }
+        }
+    } else {
+        size_t num_captured
+            = writer->crash_ctx ? writer->crash_ctx->platform.num_threads : 0;
+        if (num_captured > SENTRY_CRASH_MAX_THREADS) {
+            num_captured = SENTRY_CRASH_MAX_THREADS;
+        }
+        for (uint32_t i = 0; i < thread_count; i++) {
+            uint32_t tid = 0;
+            if (i < num_captured) {
+                tid = (uint32_t)writer->crash_ctx->platform.threads[i].tid;
+            } else if (writer->crash_ctx) {
+                // Last-resort single-thread path.
+                tid = writer->crash_ctx->crashed_tid;
+            }
+            name_tids[i] = tid;
+            // No names are captured in the signal handler on macOS today, so
+            // emit an empty string. The stream is still useful: consumers can
+            // see the tid list, and the absence of names is consistent with
+            // "we couldn't task_for_pid and didn't snapshot names".
+            name_rvas[i] = write_minidump_string(writer, "");
+            if (!name_rvas[i]) {
+                sentry_free(name_rvas);
+                sentry_free(name_tids);
+                return -1;
+            }
+        }
+    }
+
+    // Second pass: write the thread names list structure.
+    size_t list_size = sizeof(uint32_t)
+        + ((size_t)thread_count * sizeof(minidump_thread_name_t));
+    minidump_thread_name_list_t *name_list = sentry_malloc(list_size);
+    if (!name_list) {
+        sentry_free(name_rvas);
+        sentry_free(name_tids);
+        return -1;
+    }
+
+    name_list->count = thread_count;
+    for (uint32_t i = 0; i < thread_count; i++) {
+        name_list->thread_names[i].thread_id = name_tids[i];
+        name_list->thread_names[i].thread_name_rva = name_rvas[i];
+    }
+
+    // Stage rva first so a write_data failure leaves dir untouched
+    // (data_size > 0 with rva == 0 would point parsers at the header).
+    minidump_rva_t rva = write_data(writer, name_list, list_size);
+    sentry_free(name_list);
+    sentry_free(name_rvas);
+    sentry_free(name_tids);
+    if (!rva) {
+        return -1;
+    }
+    dir->stream_type = MINIDUMP_STREAM_THREAD_NAMES;
+    dir->rva = rva;
+    dir->data_size = list_size;
+    return 0;
+}
+
+// Apple's BSD ↔ Mach translation uses a set of EXC_SOFTWARE subcodes
+// that aren't in the public SDK headers — they live in xnu's
+// ``bsd/sys/ux_exception.h``. The reverse-direction mapping (BSD signal
+// → Mach exception) used by ``bsd/uxkern/ux_exception.c`` is what every
+// minidump tool's ``CrashReason`` decoder expects to see in
+// ``exception_record.exception_code`` / ``exception_flags``. The codes
+// have been stable since at least 10.5.
+//
+// Source:
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/ux_exception.h
+#    define SENTRY_EXC_UNIX_BAD_SYSCALL 0x10000u // raised by SIGSYS
+#    define SENTRY_EXC_UNIX_BAD_PIPE 0x10001u // raised by SIGPIPE
+#    define SENTRY_EXC_UNIX_ABORT 0x10002u // raised by SIGABRT
+
+/**
+ * Translate a BSD (signum, siginfo) pair into the Mach (exception_type,
+ * exception_code) pair that Breakpad / Crashpad write into a macOS
+ * minidump's MINIDUMP_EXCEPTION fields.
+ *
+ * The minidump-format convention on macOS (documented in code by
+ * Crashpad's ``ExceptionSnapshotMac::Exception()`` →
+ * ``MinidumpExceptionWriter`` and Breakpad's
+ * ``MinidumpGenerator::WriteExceptionStream``) is:
+ *
+ *     exception_record.exception_code  = Mach exception type
+ *     exception_record.exception_flags = Mach exception subtype
+ *     exception_record.exception_information[0..N] = full Mach code vector
+ *
+ * Crashpad gets these straight from a Mach exception port (the kernel
+ * delivers the Mach values directly). Breakpad's primary path does the
+ * same. sentry-native's native backend uses BSD signal handlers, so we
+ * have to mirror the kernel's BSD↔Mach mapping ourselves: this table
+ * matches what xnu's ``ux_exception.c`` does in the *other* direction
+ * when it converts a Mach exception into a BSD signal for delivery to
+ * userspace; we just run it in reverse. Apple's enum constants are
+ * used throughout — no magic numbers or bit shifts.
+ *
+ * The BSD signal stays available to consumers (lldb, custom analyzers)
+ * via ``exception_information[0]`` so the "lldb wants the signal" use
+ * case isn't regressed.
+ */
+static void
+bsd_signal_to_mach_exception(
+    int signum, const siginfo_t *info, uint32_t *out_type, uint32_t *out_code)
+{
+    (void)info;
+    switch (signum) {
+    // xnu's forward mapping (ux_exception.c) for EXC_BAD_ACCESS only emits
+    // SIGSEGV when the code is KERN_INVALID_ADDRESS; every other code
+    // (KERN_PROTECTION_FAILURE included) becomes SIGBUS. So to round-trip
+    // the signal we must pick the code purely from the signal, not from
+    // si_code — the SEGV_ACCERR/BUS_OBJERR distinction does not survive
+    // xnu's mapping in either direction anyway. Finer-grained fault info
+    // is preserved in exception_information[0] (the BSD signal itself).
+    case SIGSEGV:
+        *out_type = EXC_BAD_ACCESS;
+        *out_code = KERN_INVALID_ADDRESS;
+        return;
+    case SIGBUS:
+        *out_type = EXC_BAD_ACCESS;
+        *out_code = KERN_PROTECTION_FAILURE;
+        return;
+    case SIGILL:
+        *out_type = EXC_BAD_INSTRUCTION;
+        *out_code = 0;
+        return;
+    case SIGFPE:
+        *out_type = EXC_ARITHMETIC;
+        *out_code = 0;
+        return;
+    case SIGTRAP:
+        *out_type = EXC_BREAKPOINT;
+        *out_code = 0;
+        return;
+    case SIGABRT:
+        *out_type = EXC_SOFTWARE;
+        *out_code = SENTRY_EXC_UNIX_ABORT;
+        return;
+    case SIGSYS:
+        *out_type = EXC_SOFTWARE;
+        *out_code = SENTRY_EXC_UNIX_BAD_SYSCALL;
+        return;
+    case SIGPIPE:
+        *out_type = EXC_SOFTWARE;
+        *out_code = SENTRY_EXC_UNIX_BAD_PIPE;
+        return;
+    default:
+        // Unknown signal — emit EXC_SOFTWARE so the dump still validates
+        // and downstream tools can find the BSD signal in
+        // exception_information[0].
+        *out_type = EXC_SOFTWARE;
+        *out_code = (uint32_t)signum;
+        return;
+    }
+}
+
+/**
  * Write exception stream
  */
 static int
@@ -720,14 +1097,31 @@ write_exception_stream(minidump_writer_t *writer, minidump_directory_t *dir)
     minidump_exception_stream_t exception_stream = { 0 };
 
     exception_stream.thread_id = writer->crash_ctx->crashed_tid;
-    // Use raw signal number as exception code, matching Breakpad/Crashpad
-    // convention. Debuggers (lldb) expect the signal number directly.
-    exception_stream.exception_record.exception_code
-        = writer->crash_ctx->platform.signum;
-    exception_stream.exception_record.exception_flags = 0;
+
+    // Translate BSD (signum, siginfo) → Mach (exception_type,
+    // exception_code) for Breakpad / Crashpad minidump-format
+    // compatibility. The BSD signal is preserved in
+    // ``exception_information[0]`` so debuggers that look there still
+    // get it.
+    uint32_t mach_type = 0;
+    uint32_t mach_code = 0;
+    bsd_signal_to_mach_exception(writer->crash_ctx->platform.signum,
+        &writer->crash_ctx->platform.siginfo, &mach_type, &mach_code);
+    exception_stream.exception_record.exception_code = mach_type;
+    exception_stream.exception_record.exception_flags = mach_code;
     exception_stream.exception_record.exception_address
         = (uint64_t)writer->crash_ctx->platform.siginfo.si_addr;
-    exception_stream.exception_record.number_parameters = 0;
+    // exception_information[0..1] = (BSD signal, faulting address).
+    // Crashpad puts the Mach code vector here; for our BSD-signal-derived
+    // exception that vector is (mach_code, address) — we surface the BSD
+    // signal as #0 instead so consumers (lldb, custom analyzers) that
+    // expect a signal there don't break. number_parameters = 2 matches
+    // the number of slots actually populated.
+    exception_stream.exception_record.number_parameters = 2;
+    exception_stream.exception_record.exception_information[0]
+        = (uint64_t)writer->crash_ctx->platform.signum;
+    exception_stream.exception_record.exception_information[1]
+        = (uint64_t)writer->crash_ctx->platform.siginfo.si_addr;
 
     // Write the crashing thread's context using the dedicated mcontext field
     // (consistent with Linux which uses platform.context)
@@ -962,6 +1356,177 @@ write_module_headers_from_capture(minidump_writer_t *writer,
     return written_count;
 }
 
+// =====================================================================
+// Indirectly-referenced memory capture (SMART mode)
+// =====================================================================
+//
+// Mirrors Windows' MiniDumpWithIndirectlyReferencedMemory: walks every
+// captured thread's stack words and the crashing thread's GPRs and, for
+// each value that lands inside a writable heap mapping, captures a small
+// page-aligned chunk so debuggers can chase pointers held in struct
+// locals at crash time.
+//
+// The algorithm + accumulator + dedup live in sentry_minidump_indirect.c.
+// This block is the macOS platform shim.
+
+/**
+ * Find the VM region containing addr via binary search over writer->regions.
+ * mach_vm_region enumerates in ascending address order so the array is sorted.
+ */
+static const memory_region_t *
+find_region_for_addr(const minidump_writer_t *writer, uint64_t addr)
+{
+    size_t lo = 0;
+    size_t hi = writer->region_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const memory_region_t *r = &writer->regions[mid];
+        if (addr < r->address) {
+            hi = mid;
+        } else if (addr >= r->address + r->size) {
+            lo = mid + 1;
+        } else {
+            return r;
+        }
+    }
+    return NULL;
+}
+
+static bool
+macos_indirect_is_writable_heap(void *ctx, uint64_t addr)
+{
+    const minidump_writer_t *writer = (const minidump_writer_t *)ctx;
+    const memory_region_t *r = find_region_for_addr(writer, addr);
+    if (!r) {
+        return false;
+    }
+    // Must be readable+writable, not executable. macOS regions don't carry
+    // names, so we can't reject thread stacks here cheaply — but the
+    // accumulator's overlap-check against thread stacks already in the
+    // memory list keeps duplicate captures bounded.
+    if ((r->protection & VM_PROT_READ) == 0) {
+        return false;
+    }
+    if ((r->protection & VM_PROT_WRITE) == 0) {
+        return false;
+    }
+    if ((r->protection & VM_PROT_EXECUTE) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static ssize_t
+macos_indirect_read_memory(void *ctx, uint64_t addr, void *buf, size_t len)
+{
+    minidump_writer_t *writer = (minidump_writer_t *)ctx;
+    kern_return_t kr = read_task_memory(
+        writer->task, (mach_vm_address_t)addr, buf, (mach_vm_size_t)len);
+    return kr == KERN_SUCCESS ? (ssize_t)len : -1;
+}
+
+/**
+ * Walk the crashing thread's GPRs through sentry__indirect_consider. We
+ * only have stored mcontexts for threads captured via the signal handler
+ * (typically the crashing one); thread_get_state-derived contexts for
+ * other threads are not retained, so their registers aren't scanned here.
+ * Their stack contents still get walked.
+ */
+static void
+walk_indirect_registers_for_tid(minidump_writer_t *writer, uint64_t tid,
+    sentry_indirect_accumulator_t *acc, const sentry_indirect_ops_t *ops)
+{
+    const _STRUCT_MCONTEXT *state = NULL;
+    size_t num = writer->crash_ctx->platform.num_threads;
+    if (num > SENTRY_CRASH_MAX_THREADS) {
+        num = SENTRY_CRASH_MAX_THREADS;
+    }
+    for (size_t j = 0; j < num; j++) {
+        if (writer->crash_ctx->platform.threads[j].tid == tid) {
+            state = &writer->crash_ctx->platform.threads[j].state;
+            break;
+        }
+    }
+    if (!state) {
+        return;
+    }
+
+    minidump_writer_base_t *base = (minidump_writer_base_t *)writer;
+#    if defined(__x86_64__)
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rax, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rbx, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rcx, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rdx, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rsi, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rdi, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rbp, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__rsp, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r8, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r9, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r10, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r11, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r12, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r13, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r14, ops);
+    sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__r15, ops);
+#    elif defined(__aarch64__)
+    for (int r = 0; r <= 28; r++) {
+        sentry__indirect_consider(acc, base, (uint64_t)state->__ss.__x[r], ops);
+    }
+    sentry__indirect_consider(
+        acc, base, (uint64_t)SENTRY__ARM64_GET_FP(state->__ss), ops);
+    sentry__indirect_consider(
+        acc, base, (uint64_t)SENTRY__ARM64_GET_LR(state->__ss), ops);
+    sentry__indirect_consider(
+        acc, base, (uint64_t)SENTRY__ARM64_GET_SP(state->__ss), ops);
+#    endif
+}
+
+/**
+ * For SMART mode: scan every captured thread's stack and the crashing
+ * thread's registers for heap pointers, capturing a chunk around each.
+ * Stack bytes are pread()'d back from disk (they were written earlier
+ * when the thread list was emitted) rather than retained in memory.
+ */
+static void
+capture_indirect_memory_macos(
+    minidump_writer_t *writer, sentry_indirect_accumulator_t *acc)
+{
+    sentry_indirect_ops_t ops = {
+        .is_writable_heap = macos_indirect_is_writable_heap,
+        .read_memory = macos_indirect_read_memory,
+        .ctx = writer,
+    };
+    minidump_writer_base_t *base = (minidump_writer_base_t *)writer;
+
+    for (size_t i = 0; i < writer->thread_stack_count; i++) {
+        const minidump_memory_descriptor_t *desc = &writer->thread_stacks[i];
+        size_t stack_size = desc->memory.size;
+        if (stack_size == 0 || desc->memory.rva == 0) {
+            continue;
+        }
+        void *stack_buf = sentry_malloc(stack_size);
+        if (!stack_buf) {
+            continue;
+        }
+        ssize_t got
+            = pread(writer->fd, stack_buf, stack_size, (off_t)desc->memory.rva);
+        if (got > 0) {
+            sentry__indirect_walk_words(
+                acc, base, stack_buf, (size_t)got, &ops);
+        }
+        sentry_free(stack_buf);
+
+        walk_indirect_registers_for_tid(
+            writer, writer->thread_stack_tids[i], acc, &ops);
+
+        if (acc->total_bytes >= SENTRY_INDIRECT_MAX_TOTAL_BYTES
+            || acc->region_count >= SENTRY_INDIRECT_MAX_REGIONS) {
+            break;
+        }
+    }
+}
+
 /**
  * Write memory list stream with memory based on minidump mode.
  *
@@ -987,6 +1552,18 @@ write_memory_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
 
     // When we have VM regions (task_for_pid succeeded), use them
     if (writer->region_count > 0) {
+        // SMART mode: scan registers + stack words for pointers into
+        // writable heap regions and capture a chunk around each. Has to
+        // run before the memory_list allocation below so we know the
+        // final region count.
+        sentry_indirect_accumulator_t indirect_acc;
+        sentry__indirect_init(&indirect_acc);
+        if (mode == SENTRY_MINIDUMP_MODE_SMART) {
+            capture_indirect_memory_macos(writer, &indirect_acc);
+            SENTRY_DEBUGF("indirect memory: captured %zu regions, %zu bytes",
+                indirect_acc.region_count, indirect_acc.total_bytes);
+        }
+
         // Count regions to include
         size_t region_count = 0;
         for (size_t i = 0; i < writer->region_count; i++) {
@@ -996,17 +1573,38 @@ write_memory_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
             }
         }
 
+        size_t total_count = region_count + writer->thread_stack_count
+            + indirect_acc.region_count;
+
         size_t list_size = sizeof(uint32_t)
-            + (region_count * sizeof(minidump_memory_descriptor_t));
+            + (total_count * sizeof(minidump_memory_descriptor_t));
         minidump_memory_list_t *memory_list = sentry_malloc(list_size);
         if (!memory_list) {
             goto empty_list;
         }
 
-        memory_list->count = region_count;
+        memory_list->count = total_count;
 
         size_t mem_idx = 0;
-        for (size_t i = 0; i < writer->region_count && mem_idx < region_count;
+
+        // Replay thread stacks first — bytes are already on disk via the
+        // thread-list writer, so this just emits descriptors pointing at
+        // the same RVA. Lets debuggers resolve memory at stack addresses
+        // and walk the FP chain.
+        for (size_t s = 0; s < writer->thread_stack_count; s++) {
+            memory_list->ranges[mem_idx++] = writer->thread_stacks[s];
+        }
+
+        // Append indirectly-referenced regions. Already deduped + capped
+        // by the walker.
+        for (size_t s = 0; s < indirect_acc.region_count; s++) {
+            minidump_memory_descriptor_t *mem = &memory_list->ranges[mem_idx++];
+            mem->start_address = indirect_acc.regions[s].start;
+            mem->memory.rva = indirect_acc.regions[s].rva;
+            mem->memory.size = indirect_acc.regions[s].size;
+        }
+
+        for (size_t i = 0; i < writer->region_count && mem_idx < total_count;
             i++) {
             if (!should_include_region_macos(
                     &writer->regions[i], writer->crash_ctx, crash_addr)) {
@@ -1139,9 +1737,11 @@ sentry__write_minidump(
     minidump_writer_t writer = { 0 };
     writer.crash_ctx = ctx;
 
-    // Open output file
+    // Open output file. O_RDWR (not O_WRONLY) because SMART-mode indirect
+    // memory capture pread()'s thread-stack bytes back from the dump after
+    // they're written, so it can scan them for heap pointers.
     SENTRY_DEBUGF("write_minidump: opening file %s", output_path);
-    writer.fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    writer.fd = open(output_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (writer.fd < 0) {
         SENTRY_WARN("write_minidump: failed to open file");
         return -1;
@@ -1158,13 +1758,15 @@ sentry__write_minidump(
             kr);
         // Without task port, write minimal minidump with all required streams
         // Matching Crashpad's minimum: SystemInfo, MiscInfo, ThreadList,
-        // Exception, ModuleList, MemoryList
+        // Exception, ModuleList, MemoryList. We additionally emit ThreadNames
+        // (with empty name strings) so consumers always see the same stream
+        // shape as the full path.
         writer.task = MACH_PORT_NULL;
         writer.thread_count = 0;
 
-        // Reserve space for header and directory (6 streams), position file
+        // Reserve space for header and directory (7 streams), position file
         // after them
-        const uint32_t stream_count = 6;
+        const uint32_t stream_count = 7;
         writer.current_offset = sizeof(minidump_header_t)
             + stream_count * sizeof(minidump_directory_t);
         SENTRY_DEBUG("write_minidump: seeking to stream offset");
@@ -1175,7 +1777,7 @@ sentry__write_minidump(
 
         // Write streams in same order as Crashpad (will update directory RVAs
         // and current_offset)
-        minidump_directory_t directories[6] = { 0 };
+        minidump_directory_t directories[7] = { 0 };
         SENTRY_DEBUG("write_minidump: writing system_info stream");
         if (write_system_info_stream(&writer, &directories[0]) < 0) {
             SENTRY_WARN("write_minidump: system_info failed");
@@ -1205,6 +1807,15 @@ sentry__write_minidump(
         if (write_memory_list_stream(&writer, &directories[5]) < 0) {
             SENTRY_WARN("write_minidump: memory_list failed");
             goto fallback_error;
+        }
+        SENTRY_DEBUG("write_minidump: writing thread_names stream");
+        if (write_thread_names_stream(&writer, &directories[6]) < 0) {
+            // Non-fatal: leave the slot zeroed (consumers ignore stream_type=0)
+            // rather than failing the whole dump for a cosmetic stream.
+            SENTRY_WARN("write_minidump: thread_names failed, continuing");
+            directories[6].stream_type = 0;
+            directories[6].rva = 0;
+            directories[6].data_size = 0;
         }
         SENTRY_DEBUG("write_minidump: all streams written");
 
@@ -1261,9 +1872,9 @@ sentry__write_minidump(
     enumerate_memory_regions(&writer);
 
     // Reserve space for header and directory
-    // Write 6 streams: system_info, misc_info, threads, exception,
-    // module_list, memory_list
-    const uint32_t stream_count = 6;
+    // Write 7 streams: system_info, misc_info, threads, exception,
+    // module_list, memory_list, thread_names
+    const uint32_t stream_count = 7;
     writer.current_offset = sizeof(minidump_header_t)
         + (stream_count * sizeof(minidump_directory_t));
 
@@ -1271,8 +1882,9 @@ sentry__write_minidump(
         goto cleanup_error;
     }
 
-    // Write streams
-    minidump_directory_t directories[6];
+    // Write streams. ThreadNames is treated as non-fatal: if it fails, the
+    // slot stays zeroed and the rest of the dump is still valid.
+    minidump_directory_t directories[7] = { 0 };
     int result = 0;
 
     result |= write_system_info_stream(&writer, &directories[0]);
@@ -1284,6 +1896,13 @@ sentry__write_minidump(
 
     if (result < 0) {
         goto cleanup_error;
+    }
+
+    if (write_thread_names_stream(&writer, &directories[6]) < 0) {
+        SENTRY_WARN("write_minidump: thread_names failed, continuing");
+        directories[6].stream_type = 0;
+        directories[6].rva = 0;
+        directories[6].data_size = 0;
     }
 
     // Write header and directory

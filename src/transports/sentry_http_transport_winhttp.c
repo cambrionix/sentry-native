@@ -12,6 +12,7 @@
 #    include "sentry_transport_xbox.h"
 #endif
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <winhttp.h>
@@ -24,6 +25,7 @@ typedef struct {
     HINTERNET connect;
     HINTERNET request;
     bool debug;
+    uint64_t transfer_timeout;
     long shutdown;
 } winhttp_client_t;
 
@@ -80,12 +82,19 @@ set_proxy_credentials(winhttp_client_t *state, const char *proxy)
 }
 
 static int
+winhttp_timeout_ms(uint64_t timeout)
+{
+    return timeout > (uint64_t)INT_MAX ? INT_MAX : (int)timeout;
+}
+
+static int
 winhttp_client_start(void *_client, const sentry_options_t *opts)
 {
     winhttp_client_t *client = _client;
 
     wchar_t *user_agent = sentry__string_to_wstr(opts->user_agent);
     client->debug = opts->debug;
+    client->transfer_timeout = opts->transfer_timeout;
 
     const char *env_proxy = opts->dsn
         ? getenv(opts->dsn->is_secure ? "https_proxy" : "http_proxy")
@@ -135,8 +144,10 @@ winhttp_client_start(void *_client, const sentry_options_t *opts)
         return 1;
     }
 
-    // 15s resolve/connect, 30s send/receive (WinHTTP defaults)
-    WinHttpSetTimeouts(client->session, 15000, 15000, 30000, 30000);
+    // 15s for resolve/connect, transfer_timeout for send/receive per packet
+    int transfer_timeout = winhttp_timeout_ms(client->transfer_timeout);
+    WinHttpSetTimeouts(
+        client->session, 15000, 15000, transfer_timeout, transfer_timeout);
 
     return 0;
 }
@@ -163,6 +174,21 @@ winhttp_client_shutdown(void *_client)
     if (request) {
         WinHttpCloseHandle(request);
     }
+}
+
+static char *
+query_header(HINTERNET request, const wchar_t *header)
+{
+    // lets just assume we won't have headers > 2k
+    wchar_t buf[2048];
+    DWORD buf_size = sizeof(buf);
+
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, header, buf,
+            &buf_size, WINHTTP_NO_HEADER_INDEX)) {
+        return sentry__string_from_wstr(buf);
+    }
+
+    return NULL;
 }
 
 static bool
@@ -341,10 +367,6 @@ winhttp_send_task(void *_client, sentry_prepared_http_request_t *req,
             }
         }
 
-        // lets just assume we won't have headers > 2k
-        wchar_t buf[2048];
-        DWORD buf_size = sizeof(buf);
-
         DWORD status_code = 0;
         DWORD status_code_size = sizeof(status_code);
 
@@ -354,21 +376,13 @@ winhttp_send_task(void *_client, sentry_prepared_http_request_t *req,
             WINHTTP_NO_HEADER_INDEX);
         resp->status_code = (int)status_code;
 
-        if (WinHttpQueryHeaders(client->request, WINHTTP_QUERY_CUSTOM,
-                L"x-sentry-rate-limits", buf, &buf_size,
-                WINHTTP_NO_HEADER_INDEX)) {
-            resp->x_sentry_rate_limits = sentry__string_from_wstr(buf);
-        } else if (WinHttpQueryHeaders(client->request, WINHTTP_QUERY_CUSTOM,
-                       L"retry-after", buf, &buf_size,
-                       WINHTTP_NO_HEADER_INDEX)) {
-            resp->retry_after = sentry__string_from_wstr(buf);
+        resp->x_sentry_rate_limits
+            = query_header(client->request, L"x-sentry-rate-limits");
+        if (!resp->x_sentry_rate_limits) {
+            resp->retry_after = query_header(client->request, L"retry-after");
         }
 
-        buf_size = sizeof(buf);
-        if (WinHttpQueryHeaders(client->request, WINHTTP_QUERY_CUSTOM,
-                L"location", buf, &buf_size, WINHTTP_NO_HEADER_INDEX)) {
-            resp->location = sentry__string_from_wstr(buf);
-        }
+        resp->location = query_header(client->request, L"location");
     }
 
     uint64_t now = sentry__monotonic_time();

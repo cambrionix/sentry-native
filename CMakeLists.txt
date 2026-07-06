@@ -103,6 +103,12 @@ endif()
 
 option(SENTRY_PIC "Build sentry (and dependent) libraries as position independent libraries" ON)
 
+if(LINUX)
+	option(SENTRY_LIBUNWIND_SYSTEM "Use system libunwind library" OFF)
+else()
+	set(SENTRY_LIBUNWIND_SYSTEM OFF)
+endif()
+
 option(SENTRY_TRANSPORT_COMPRESSION "Enable transport gzip compression" OFF)
 
 option(SENTRY_BUILD_TESTS "Build sentry-native tests" "${SENTRY_MAIN_PROJECT}")
@@ -163,16 +169,16 @@ endif()
 
 if(WIN32)
 	set(SENTRY_DEFAULT_TRANSPORT "winhttp")
-	set(_SUPPORTED_TRANSPORTS "none, winhttp")
+	set(_SUPPORTED_TRANSPORTS "none, winhttp, custom")
 elseif(PROSPERO)
 	set(SENTRY_DEFAULT_TRANSPORT "pshttp")
 	set(_SUPPORTED_TRANSPORTS "none, pshttp")
 elseif((APPLE AND NOT IOS) OR LINUX OR AIX OR NX)
 	set(SENTRY_DEFAULT_TRANSPORT "curl")
-	set(_SUPPORTED_TRANSPORTS "none, curl")
+	set(_SUPPORTED_TRANSPORTS "none, curl, custom")
 else()
 	set(SENTRY_DEFAULT_TRANSPORT "none")
-	set(_SUPPORTED_TRANSPORTS "none, curl, or winhttp on Windows")
+	set(_SUPPORTED_TRANSPORTS "none, curl, winhttp on Windows, or custom")
 endif()
 
 set(SENTRY_TRANSPORT ${SENTRY_DEFAULT_TRANSPORT} CACHE STRING
@@ -192,10 +198,35 @@ elseif(SENTRY_TRANSPORT STREQUAL "pshttp")
 	if(NOT PROSPERO)
 		message(FATAL_ERROR "The pshttp transport is only supported on PlayStation.")
 	endif()
+elseif(SENTRY_TRANSPORT STREQUAL "custom")
+	set(SENTRY_TRANSPORT_CUSTOM TRUE)
 else()
 	message(FATAL_ERROR "SENTRY_TRANSPORT must be one of: ${_SUPPORTED_TRANSPORTS}")
 endif()
 
+if(WIN32 AND NOT XBOX)
+	set(SENTRY_DEFAULT_SCREENSHOT "windows")
+	set(_SUPPORTED_SCREENSHOTS "windows, none, or custom")
+else()
+	set(SENTRY_DEFAULT_SCREENSHOT "none")
+	set(_SUPPORTED_SCREENSHOTS "none or custom")
+endif()
+
+set(SENTRY_SCREENSHOT ${SENTRY_DEFAULT_SCREENSHOT} CACHE STRING
+	"The screenshot implementation that sentry uses, can be one of: ${_SUPPORTED_SCREENSHOTS}.")
+
+if(SENTRY_SCREENSHOT STREQUAL "windows")
+	if(NOT WIN32 OR XBOX)
+		message(FATAL_ERROR "The windows screenshot implementation is only supported on Windows.")
+	endif()
+	set(SENTRY_SCREENSHOT_WINDOWS TRUE)
+elseif(SENTRY_SCREENSHOT STREQUAL "custom")
+	set(SENTRY_SCREENSHOT_CUSTOM TRUE)
+elseif(SENTRY_SCREENSHOT STREQUAL "none")
+	set(SENTRY_SCREENSHOT_NONE TRUE)
+else()
+	message(FATAL_ERROR "SENTRY_SCREENSHOT must be one of: ${_SUPPORTED_SCREENSHOTS}")
+endif()
 
 if(SENTRY_BUILD_TESTS OR SENTRY_BUILD_EXAMPLES)
 	enable_testing()
@@ -599,8 +630,8 @@ elseif(WIN32)
 	# WaitOnAddress/WakeByAddressSingle require Windows 8+
 	# (Synchronization.lib). Older targets fall back to sleep-poll.
 	if(NOT (MSVC AND CMAKE_GENERATOR_TOOLSET MATCHES "_xp$")
-		AND (${CMAKE_SYSTEM_VERSION} MATCHES "^10"
-			OR ${CMAKE_SYSTEM_VERSION} MATCHES "^6\\.[23]"))
+		AND ("${CMAKE_SYSTEM_VERSION}" MATCHES "^10"
+			OR "${CMAKE_SYSTEM_VERSION}" MATCHES "^6\\.[23]"))
 		list(APPEND _SENTRY_PLATFORM_LIBS "synchronization")
 	endif()
 endif()
@@ -645,14 +676,28 @@ endif()
 
 if(SENTRY_WITH_LIBUNWIND)
 	if(LINUX)
-		# Use vendored libunwind
-		add_subdirectory(vendor/libunwind)
-		target_link_libraries(sentry PRIVATE unwind)
-		if(NOT SENTRY_BUILD_SHARED_LIBS)
-			sentry_install(TARGETS unwind EXPORT sentry
-				LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-				ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
-			)
+		if(SENTRY_LIBUNWIND_SYSTEM)
+			find_package(PkgConfig REQUIRED)
+			pkg_check_modules(LIBUNWIND REQUIRED IMPORTED_TARGET libunwind)
+			if(SENTRY_BUILD_SHARED_LIBS)
+				target_link_libraries(sentry PRIVATE PkgConfig::LIBUNWIND)
+			else()
+				target_link_libraries(sentry PUBLIC PkgConfig::LIBUNWIND)
+			endif()
+		else()
+			# Use vendored libunwind
+			if(SENTRY_BACKEND_NATIVE)
+				# Build remote unwinding support for the native backend's crash daemon
+				set(LIBUNWIND_BUILD_REMOTE TRUE)
+			endif()
+			add_subdirectory(vendor/libunwind)
+			target_link_libraries(sentry PRIVATE unwind)
+			if(NOT SENTRY_BUILD_SHARED_LIBS)
+				sentry_install(TARGETS unwind EXPORT sentry
+					LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+					ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+				)
+			endif()
 		endif()
 	endif()
 endif()
@@ -765,6 +810,25 @@ elseif(SENTRY_BACKEND_NATIVE)
 	# Native backend sources and configuration are in src/CMakeLists.txt
 	# The native backend requires C11 for atomics (set in src/CMakeLists.txt)
 
+	if(WIN32 AND NOT XBOX)
+		add_library(sentry-wer SHARED
+			src/backends/native/sentry_wer.c
+			src/backends/native/sentry_wer.def
+		)
+		target_include_directories(sentry-wer PRIVATE
+			${PROJECT_SOURCE_DIR}/include
+			${PROJECT_SOURCE_DIR}/src
+			${PROJECT_SOURCE_DIR}/src/backends/native
+		)
+		target_link_libraries(sentry-wer PRIVATE wer)
+		set_property(TARGET sentry-wer PROPERTY PREFIX "") # ensure MINGW doesn't prefix "lib" to dll name
+		set_property(TARGET sentry-wer PROPERTY DEBUG_POSTFIX "") # prevent CMAKE_DEBUG_POSTFIX from being applied
+		if(SENTRY_BUILD_RUNTIMESTATIC AND MSVC)
+			set_property(TARGET sentry-wer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+		endif()
+		sentry_add_version_resource(sentry-wer "Native WER Module")
+	endif()
+
 	# Build sentry-crash executable for native backend
 	# Get all sources that were added to sentry target
 	get_target_property(SENTRY_SOURCES sentry SOURCES)
@@ -790,6 +854,10 @@ elseif(SENTRY_BACKEND_NATIVE)
 		SENTRY_CRASH_DAEMON_STANDALONE
 		SENTRY_BUILD_STATIC
 	)
+
+	if(SENTRY_WITH_LIBUNWIND AND LINUX)
+		target_compile_definitions(sentry-crash PRIVATE SENTRY_WITH_UNWINDER_LIBUNWIND_REMOTE)
+	endif()
 
 	# Copy include directories from sentry target
 	target_include_directories(sentry-crash PRIVATE
@@ -830,16 +898,37 @@ elseif(SENTRY_BACKEND_NATIVE)
 	endif()
 
 	if(SENTRY_WITH_LIBUNWIND AND LINUX)
-		target_link_libraries(sentry-crash PRIVATE unwind)
+		if(SENTRY_LIBUNWIND_SYSTEM)
+			pkg_check_modules(LIBUNWIND_PTRACE REQUIRED IMPORTED_TARGET libunwind-ptrace)
+			target_link_libraries(sentry-crash PRIVATE PkgConfig::LIBUNWIND PkgConfig::LIBUNWIND_PTRACE)
+		else()
+			# Use unwind_remote for the daemon (includes ptrace accessors
+			# for remote DWARF unwinding of the crashed process)
+			target_link_libraries(sentry-crash PRIVATE unwind_remote)
+		endif()
 	endif()
 
 	# Make sentry library depend on crash daemon so it's always built together
 	add_dependencies(sentry sentry-crash)
+	if(WIN32 AND NOT XBOX)
+		add_dependencies(sentry sentry-wer)
+	endif()
 
 	# Install daemon
 	install(TARGETS sentry-crash
 		RUNTIME DESTINATION bin
 	)
+	if(WIN32 AND NOT XBOX)
+		install(TARGETS sentry-wer
+			RUNTIME DESTINATION bin
+			LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+			ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+		)
+		if(MSVC)
+			sentry_install(FILES $<TARGET_PDB_FILE:sentry-wer>
+				DESTINATION "${CMAKE_INSTALL_BINDIR}" OPTIONAL)
+		endif()
+	endif()
 
 	if(DEFINED SENTRY_FOLDER)
 		# Native backend doesn't have separate targets to organize
@@ -926,6 +1015,7 @@ if(SENTRY_BUILD_EXAMPLES)
 
 		# to test handling SEH by-passing exceptions we need to enable the control flow guard
 		target_compile_options(sentry_example PRIVATE $<BUILD_INTERFACE:/guard:cf>)
+		target_link_options(sentry_example PRIVATE $<BUILD_INTERFACE:/GUARD:CF>)
 	else()
 		# Disable all optimizations for the `sentry_example` in gcc/clang. This allows us to keep crash triggers simple.
 		# The effects besides reproducible code-gen across compiler versions, will be negligible for build- and runtime.

@@ -11,6 +11,8 @@
 #    if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
 #        include <sys/prctl.h>
 #    endif
+#elif defined(SENTRY_PLATFORM_WINDOWS) && !defined(SENTRY_PLATFORM_XBOX)
+#    include <werapi.h>
 #endif
 
 #include <string.h>
@@ -29,12 +31,15 @@
 #include "sentry_logs.h"
 #include "sentry_metrics.h"
 #include "sentry_options.h"
+#include "sentry_os.h"
 #include "sentry_path.h"
 
 #include "sentry_scope.h"
 #include "sentry_session.h"
 #include "sentry_sync.h"
+#include "sentry_tracing.h"
 #include "sentry_transport.h"
+#include "sentry_value.h"
 #include "transports/sentry_disk_transport.h"
 
 // Global process-wide synchronization for IPC and shared memory access
@@ -60,6 +65,108 @@ SENTRY__MUTEX_INIT_DYN(g_ipc_init_mutex)
 #    else
 static sentry_mutex_t g_ipc_init_mutex = SENTRY__MUTEX_INIT;
 #    endif
+#endif
+
+#if defined(SENTRY_PLATFORM_WINDOWS) && !defined(SENTRY_PLATFORM_XBOX)
+static sentry_wer_registration_t g_wer_registration = { 0 };
+
+static sentry_path_t *g_wer_path = NULL;
+
+static LSTATUS
+wer_set_registry_value(const sentry_path_t *wer_path, DWORD value)
+{
+    return RegSetKeyValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\Windows Error Reporting\\"
+        L"RuntimeExceptionHelperModules",
+        wer_path->path_w, REG_DWORD, &value, sizeof(value));
+}
+
+static LSTATUS
+wer_delete_registry_value(const sentry_path_t *wer_path)
+{
+    return RegDeleteKeyValueW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\Windows Error Reporting\\"
+        L"RuntimeExceptionHelperModules",
+        wer_path->path_w);
+}
+
+static sentry_path_t *
+wer_default_path(void)
+{
+    sentry_path_t *current_exe = sentry__path_current_exe();
+    if (!current_exe) {
+        return NULL;
+    }
+
+    sentry_path_t *exe_dir = sentry__path_dir(current_exe);
+    sentry__path_free(current_exe);
+    if (!exe_dir) {
+        return NULL;
+    }
+
+    sentry_path_t *wer_path = sentry__path_join_str(exe_dir, "sentry-wer.dll");
+    sentry__path_free(exe_dir);
+    return wer_path;
+}
+
+static void
+wer_unregister_module(void)
+{
+    if (!g_wer_path) {
+        return;
+    }
+
+    WerUnregisterRuntimeExceptionModule(
+        g_wer_path->path_w, &g_wer_registration);
+    wer_delete_registry_value(g_wer_path);
+    sentry__path_free(g_wer_path);
+    g_wer_path = NULL;
+    memset(&g_wer_registration, 0, sizeof(g_wer_registration));
+}
+
+static void
+wer_register_module(uint64_t app_tid)
+{
+    windows_version_t win_ver;
+    if (!sentry__get_windows_version(&win_ver) || win_ver.build < 19041) {
+        SENTRY_WARN("Native WER module not registered, because Windows "
+                    "doesn't meet version requirements (build >= 19041).");
+        return;
+    }
+
+    sentry_path_t *wer_path = wer_default_path();
+    if (!wer_path || !sentry__path_is_file(wer_path)) {
+        SENTRY_WARN("Native WER module not found");
+        sentry__path_free(wer_path);
+        return;
+    }
+
+    const DWORD one = 1;
+    LSTATUS reg_res = wer_set_registry_value(wer_path, one);
+    if (reg_res != ERROR_SUCCESS) {
+        SENTRY_WARN("registering native WER module in registry failed");
+        sentry__path_free(wer_path);
+        return;
+    }
+
+    g_wer_registration.version = 1;
+    g_wer_registration.app_pid = GetCurrentProcessId();
+    g_wer_registration.app_tid = app_tid;
+
+    HRESULT hr = WerRegisterRuntimeExceptionModule(
+        wer_path->path_w, &g_wer_registration);
+    if (FAILED(hr)) {
+        SENTRY_WARN("registering native WER module failed");
+        wer_delete_registry_value(wer_path);
+        sentry__path_free(wer_path);
+        memset(&g_wer_registration, 0, sizeof(g_wer_registration));
+        return;
+    }
+
+    SENTRY_DEBUGF("registered native WER module \"%s\"", wer_path->path);
+    g_wer_path = wer_path;
+}
+
 #endif
 
 /**
@@ -188,14 +295,21 @@ native_backend_startup(
 
     // Set crash reporting mode from options
     ctx->crash_reporting_mode = options->crash_reporting_mode;
+    ctx->system_crash_reporter_enabled = options->system_crash_reporter_enabled;
+    ctx->crash_upload_mode = options->crash_upload_mode;
 
     // Pass debug logging setting to daemon
     ctx->debug_enabled = options->debug;
     ctx->attach_screenshot = options->attach_screenshot;
-    ctx->cache_keep = options->cache_keep;
+    ctx->attach_session_replay = options->attach_session_replay;
+    ctx->session_replay_duration = options->session_replay_duration;
+    ctx->cache_keep = (int)options->cache_keep;
     ctx->require_user_consent = options->require_user_consent;
     ctx->enable_large_attachments = options->enable_large_attachments;
+    ctx->http_retry = options->http_retry;
     ctx->shutdown_timeout = options->shutdown_timeout;
+    ctx->transfer_timeout = options->transfer_timeout;
+    ctx->max_breadcrumbs = (uint32_t)options->max_breadcrumbs;
     sentry__atomic_store(
         &ctx->user_consent, sentry__atomic_fetch(&options->run->user_consent));
 
@@ -412,11 +526,18 @@ native_backend_startup(
         SENTRY_DEBUG("Daemon signaled ready");
     }
 
+#    if defined(SENTRY_PLATFORM_WINDOWS) && !defined(SENTRY_PLATFORM_XBOX)
+    wer_register_module(tid);
+#    endif
+
     if (sentry__crash_handler_init(state->ipc) < 0) {
         SENTRY_WARN("failed to initialize crash handler");
 #    if defined(SENTRY_PLATFORM_UNIX)
         kill(state->daemon_pid, SIGTERM);
 #    elif defined(SENTRY_PLATFORM_WINDOWS)
+#        if !defined(SENTRY_PLATFORM_XBOX)
+        wer_unregister_module();
+#        endif
         // On Windows, terminate the daemon process
         HANDLE hDaemon
             = OpenProcess(PROCESS_TERMINATE, FALSE, state->daemon_pid);
@@ -445,6 +566,10 @@ native_backend_shutdown(sentry_backend_t *backend)
     if (!state) {
         return;
     }
+
+#if defined(SENTRY_PLATFORM_WINDOWS) && !defined(SENTRY_PLATFORM_XBOX)
+    wer_unregister_module();
+#endif
 
     // Shutdown crash handlers (signal handlers on Linux/macOS, Mach exception
     // handler on iOS)
@@ -618,17 +743,23 @@ native_backend_write_attachments(const sentry_path_t *event_path)
                     it->filename ? it->filename : it->path);
                 sentry_value_set_by_key(
                     attach_info, "filename", sentry_value_new_string(filename));
+                if (it->type && *it->type) {
+                    sentry_value_set_by_key(attach_info, "attachment_type",
+                        sentry_value_new_string(it->type));
+                }
                 if (it->content_type) {
                     sentry_value_set_by_key(attach_info, "content_type",
                         sentry_value_new_string(it->content_type));
                 }
                 sentry_value_append(attach_list, attach_info);
             }
-            char *attach_json = sentry_value_to_json(attach_list);
+            size_t attach_json_len = 0;
+            char *attach_json
+                = sentry__value_to_json(attach_list, &attach_json_len);
             sentry_value_decref(attach_list);
             if (attach_json) {
                 sentry__path_write_buffer(
-                    attach_list_path, attach_json, strlen(attach_json));
+                    attach_list_path, attach_json, attach_json_len);
                 sentry_free(attach_json);
             }
             sentry__path_free(attach_list_path);
@@ -637,9 +768,42 @@ native_backend_write_attachments(const sentry_path_t *event_path)
     }
 }
 
+#if defined(SENTRY_PLATFORM_WINDOWS)
+// Sentry's symbolicator needs `contexts.device.arch` to process PE modules. If
+// the scope already carries a device context with arch (host SDKs like Unity
+// provide one), leave it; otherwise synthesize a minimal one so native-only
+// consumers still symbolicate.
+static void
+ensure_device_arch(sentry_value_t event)
+{
+    sentry_value_t contexts = sentry_value_get_by_key(event, "contexts");
+    if (sentry_value_is_null(contexts)) {
+        contexts = sentry_value_new_object();
+        sentry_value_set_by_key(event, "contexts", contexts);
+    }
+    sentry_value_t device = sentry_value_get_by_key(contexts, "device");
+    if (sentry_value_is_null(device)) {
+        device = sentry_value_new_object();
+        sentry_value_set_by_key(
+            device, "type", sentry_value_new_string("device"));
+        sentry_value_set_by_key(contexts, "device", device);
+    }
+    if (!sentry_value_is_null(sentry_value_get_by_key(device, "arch"))) {
+        return;
+    }
+#    if defined(_M_AMD64)
+    sentry_value_set_by_key(device, "arch", sentry_value_new_string("x86_64"));
+#    elif defined(_M_IX86)
+    sentry_value_set_by_key(device, "arch", sentry_value_new_string("x86"));
+#    elif defined(_M_ARM64)
+    sentry_value_set_by_key(device, "arch", sentry_value_new_string("arm64"));
+#    endif
+}
+#endif
+
 static void
 native_backend_flush_scope(
-    sentry_backend_t *backend, const sentry_options_t *UNUSED(options))
+    sentry_backend_t *backend, const sentry_options_t *options)
 {
     native_backend_state_t *state = (native_backend_state_t *)backend->data;
     if (!state || !state->event_path) {
@@ -659,64 +823,19 @@ native_backend_flush_scope(
     sentry_value_set_by_key(
         event, "level", sentry__value_new_level(SENTRY_LEVEL_FATAL));
 
-    // Apply scope with contexts (includes OS, device info from Sentry)
+    // Apply scope with contexts
     SENTRY_WITH_SCOPE (scope) {
-        // Get contexts from scope (includes OS info)
-        sentry_value_t os_context
-            = sentry_value_get_by_key(scope->contexts, "os");
-        if (!sentry_value_is_null(os_context)) {
-            sentry_value_t event_contexts = sentry_value_new_object();
-            sentry_value_set_by_key(event_contexts, "os", os_context);
-            sentry_value_incref(os_context);
-
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+    }
 #if defined(SENTRY_PLATFORM_WINDOWS)
-            // Add device context with arch for Windows native events
-            // This is required for Sentry's symbolicator to process PE modules
-            sentry_value_t device_context = sentry_value_new_object();
-            sentry_value_set_by_key(
-                device_context, "type", sentry_value_new_string("device"));
-#    if defined(_M_AMD64)
-            sentry_value_set_by_key(
-                device_context, "arch", sentry_value_new_string("x86_64"));
-#    elif defined(_M_IX86)
-            sentry_value_set_by_key(
-                device_context, "arch", sentry_value_new_string("x86"));
-#    elif defined(_M_ARM64)
-            sentry_value_set_by_key(
-                device_context, "arch", sentry_value_new_string("arm64"));
-#    endif
-            sentry_value_set_by_key(event_contexts, "device", device_context);
+    ensure_device_arch(event);
 #endif
 
-            sentry_value_set_by_key(event, "contexts", event_contexts);
-        }
-
-        // Also copy other scope data (user, tags, extra, etc.)
-        sentry_value_t user = scope->user;
-        if (!sentry_value_is_null(user)) {
-            sentry_value_set_by_key(event, "user", user);
-            sentry_value_incref(user);
-        }
-
-        sentry_value_t tags = scope->tags;
-        if (!sentry_value_is_null(tags)) {
-            sentry_value_set_by_key(event, "tags", tags);
-            sentry_value_incref(tags);
-        }
-
-        sentry_value_t extra = scope->extra;
-        if (!sentry_value_is_null(extra)) {
-            sentry_value_set_by_key(event, "extra", extra);
-            sentry_value_incref(extra);
-        }
-    }
-
-    // Serialize to JSON (so it can be deserialized on next start)
-    char *json_str = sentry_value_to_json(event);
+    size_t json_len = 0;
+    char *json_str = sentry__value_to_json(event, &json_len);
     sentry_value_decref(event);
 
     if (json_str) {
-        size_t json_len = strlen(json_str);
         sentry__path_write_buffer(state->event_path, json_str, json_len);
         sentry_free(json_str);
     }
@@ -749,18 +868,20 @@ native_backend_add_breadcrumb(sentry_backend_t *backend,
         return;
     }
 
-    // Serialize to JSON (so it can be deserialized on next start)
-    char *json_str = sentry_value_to_json(breadcrumb);
-    if (!json_str) {
+    // Append as msgpack, matching the crashpad backend. msgpack values are
+    // self-delimiting, so the daemon can read the concatenated ring file back
+    // into a list via `sentry__value_from_msgpack`.
+    size_t mpack_size = 0;
+    char *mpack = sentry_value_to_msgpack(breadcrumb, &mpack_size);
+    if (!mpack) {
         return;
     }
 
-    size_t json_len = strlen(json_str);
     int rv = first_breadcrumb
-        ? sentry__path_write_buffer(breadcrumb_file, json_str, json_len)
-        : sentry__path_append_buffer(breadcrumb_file, json_str, json_len);
+        ? sentry__path_write_buffer(breadcrumb_file, mpack, mpack_size)
+        : sentry__path_append_buffer(breadcrumb_file, mpack, mpack_size);
 
-    sentry_free(json_str);
+    sentry_free(mpack);
 
     if (rv != 0) {
         SENTRY_WARN("failed to write breadcrumb");
@@ -864,6 +985,9 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
         // Write crash marker
         sentry__write_crash_marker(options);
 
+        sentry_value_t transaction
+            = sentry__trace_finish(SENTRY_SPAN_STATUS_ABORTED);
+
         // Create crash event
         sentry_value_t event = sentry_value_new_event();
         sentry_value_set_by_key(
@@ -890,37 +1014,17 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
             }
 
             if (should_handle) {
-                // Apply scope to event including breadcrumbs
+                // Apply scope to the event. The daemon assembles breadcrumbs
+                // from the ring files
                 SENTRY_WITH_SCOPE (scope) {
                     sentry__scope_apply_to_event(
-                        scope, options, event, SENTRY_SCOPE_BREADCRUMBS);
+                        scope, options, event, SENTRY_SCOPE_NONE);
                 }
-
 #if defined(SENTRY_PLATFORM_WINDOWS)
-                // Add device context with arch for Windows native events
-                // This is required for Sentry's symbolicator to process PE
-                // modules
-                sentry_value_t contexts
-                    = sentry_value_get_by_key(event, "contexts");
-                if (sentry_value_is_null(contexts)) {
-                    contexts = sentry_value_new_object();
-                    sentry_value_set_by_key(event, "contexts", contexts);
-                }
-                sentry_value_t device_context = sentry_value_new_object();
-                sentry_value_set_by_key(
-                    device_context, "type", sentry_value_new_string("device"));
-#    if defined(_M_AMD64)
-                sentry_value_set_by_key(
-                    device_context, "arch", sentry_value_new_string("x86_64"));
-#    elif defined(_M_IX86)
-                sentry_value_set_by_key(
-                    device_context, "arch", sentry_value_new_string("x86"));
-#    elif defined(_M_ARM64)
-                sentry_value_set_by_key(
-                    device_context, "arch", sentry_value_new_string("arm64"));
-#    endif
-                sentry_value_set_by_key(contexts, "device", device_context);
+                ensure_device_arch(event);
+#endif
 
+#ifndef SENTRY_SCREENSHOT_NONE
                 // The screenshot is captured by the daemon out-of-process, so
                 // we invoke the hook here (in the crashing process, where
                 // user callbacks can run) and communicate the decision to the
@@ -943,10 +1047,12 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
                 // Write event as JSON file
                 // Daemon will read this and create envelope with minidump
                 if (state && state->event_path) {
-                    char *event_json = sentry_value_to_json(event);
+                    size_t event_json_len = 0;
+                    char *event_json
+                        = sentry__value_to_json(event, &event_json_len);
                     if (event_json) {
                         int rv = sentry__path_write_buffer(
-                            state->event_path, event_json, strlen(event_json));
+                            state->event_path, event_json, event_json_len);
                         sentry_free(event_json);
                         if (rv == 0) {
                             SENTRY_DEBUG("Wrote crash event JSON for daemon");
@@ -965,26 +1071,33 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
                     = sentry__end_current_session_with_status(
                         SENTRY_SESSION_STATUS_CRASHED);
 
-                if (session) {
-                    sentry_envelope_t *envelope = sentry__envelope_new();
-                    if (envelope) {
-                        sentry__envelope_add_session(envelope, session);
-
-                        // Write session envelope to disk
-                        sentry_transport_t *disk_transport
-                            = sentry_new_disk_transport(options->run);
-                        if (disk_transport) {
-                            // sentry__capture_envelope takes ownership of
-                            // envelope
-                            sentry__capture_envelope(
-                                disk_transport, envelope, options);
-                            sentry__transport_dump_queue(
-                                disk_transport, options->run);
-                            sentry_transport_free(disk_transport);
-                        } else {
-                            // Failed to create transport, free envelope
-                            sentry_envelope_free(envelope);
+                if (session || !sentry_value_is_null(transaction)) {
+                    sentry_transport_t *disk_transport
+                        = sentry_new_disk_transport(options->run);
+                    if (disk_transport) {
+                        if (!sentry_value_is_null(transaction)) {
+                            sentry_envelope_t *tx_envelope
+                                = sentry__prepare_transaction(
+                                    options, transaction, NULL);
+                            if (tx_envelope) {
+                                sentry__capture_envelope(
+                                    disk_transport, tx_envelope, options);
+                            }
                         }
+                        if (session) {
+                            sentry_envelope_t *envelope
+                                = sentry__envelope_new();
+                            if (envelope) {
+                                sentry__envelope_add_session(envelope, session);
+                                sentry__capture_envelope(
+                                    disk_transport, envelope, options);
+                            }
+                        }
+                        sentry__transport_dump_queue(
+                            disk_transport, options->run);
+                        sentry_transport_free(disk_transport);
+                    } else {
+                        sentry_value_decref(transaction);
                     }
                 }
 
@@ -993,10 +1106,13 @@ native_backend_except(sentry_backend_t *backend, const sentry_ucontext_t *uctx)
 
                 SENTRY_DEBUG("crash event and session written, daemon will "
                              "create and send minidump");
+            } else {
+                sentry_value_decref(transaction);
             }
         } else {
             SENTRY_DEBUG("event was discarded by the `on_crash` hook");
             sentry_value_decref(event);
+            sentry_value_decref(transaction);
         }
     }
 }

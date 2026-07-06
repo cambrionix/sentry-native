@@ -1,6 +1,10 @@
 sentry_target_sources_cwd(sentry
 	sentry_alloc.c
 	sentry_alloc.h
+	sentry_app_hang_latch.c
+	sentry_app_hang_latch.h
+	sentry_app_hang_monitor.c
+	sentry_app_hang_monitor.h
 	sentry_attachment.c
 	sentry_attachment.h
 	sentry_backend.c
@@ -44,6 +48,7 @@ sentry_target_sources_cwd(sentry
 	sentry_scope.c
 	sentry_scope.h
 	sentry_screenshot.h
+	sentry_session_replay.h
 	sentry_session.c
 	sentry_session.h
 	sentry_slice.c
@@ -53,6 +58,7 @@ sentry_target_sources_cwd(sentry
 	sentry_symbolizer.h
 	sentry_sync.c
 	sentry_sync.h
+	sentry_thread_stackwalk.h
 	sentry_transport.c
 	sentry_transport.h
 	sentry_utils.c
@@ -61,10 +67,13 @@ sentry_target_sources_cwd(sentry
 	sentry_uuid.h
 	sentry_value.c
 	sentry_value.h
+	sentry_writer.c
+	sentry_writer.h
 	sentry_tracing.c
 	sentry_tracing.h
 	path/sentry_path.c
 	screenshot/sentry_screenshot.c
+	session_replay/sentry_session_replay.c
 	transports/sentry_disk_transport.c
 	transports/sentry_disk_transport.h
 	transports/sentry_function_transport.c
@@ -169,15 +178,24 @@ elseif(SENTRY_BACKEND_NATIVE)
 		backends/native/minidump/sentry_minidump_writer.h
 	)
 
+	# Remote unwinding (Linux only — uses libunwind ptrace accessors)
+	if(LINUX)
+		sentry_target_sources_cwd(sentry
+			unwinder/sentry_unwinder_libunwind_remote.c
+		)
+	endif()
+
 	# Platform-specific minidump writers
 	if(LINUX OR ANDROID)
 		sentry_target_sources_cwd(sentry
 			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_indirect.c
 			backends/native/minidump/sentry_minidump_linux.c
 		)
 	elseif(APPLE)
 		sentry_target_sources_cwd(sentry
 			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_indirect.c
 			backends/native/minidump/sentry_minidump_macos.c
 		)
 	elseif(WIN32)
@@ -243,6 +261,25 @@ if(SENTRY_WITH_LIBUNWIND_MAC)
 	)
 endif()
 
+# platform thread stackwalker (suspend a thread and capture its backtrace)
+if(APPLE)
+	sentry_target_sources_cwd(sentry
+		sentry_thread_stackwalk_mach.c
+	)
+endif()
+
+if(WIN32)
+	sentry_target_sources_cwd(sentry
+		sentry_thread_stackwalk_windows.c
+	)
+endif()
+
+if(LINUX OR ANDROID)
+	sentry_target_sources_cwd(sentry
+		sentry_thread_stackwalk_posix.c
+	)
+endif()
+
 if(SENTRY_WITH_LIBUNWINDSTACK)
 	target_compile_definitions(sentry PRIVATE SENTRY_WITH_UNWINDER_LIBUNWINDSTACK)
 	sentry_target_sources_cwd(sentry
@@ -271,12 +308,23 @@ if(SENTRY_INTEGRATION_QT)
 endif()
 
 # screenshot
-if(WIN32)
+if(SENTRY_SCREENSHOT_WINDOWS)
+	target_compile_definitions(sentry PRIVATE SENTRY_SCREENSHOT_WINDOWS)
 	sentry_target_sources_cwd(sentry
 		screenshot/sentry_screenshot_windows.c
 	)
-else()
+elseif(SENTRY_SCREENSHOT_NONE)
+	target_compile_definitions(sentry PRIVATE SENTRY_SCREENSHOT_NONE)
 	sentry_target_sources_cwd(sentry
 		screenshot/sentry_screenshot_none.c
+	)
+elseif(SENTRY_SCREENSHOT_CUSTOM)
+	target_compile_definitions(sentry PRIVATE SENTRY_SCREENSHOT_CUSTOM)
+endif()
+
+# session replay
+if(NOT XBOX)
+	sentry_target_sources_cwd(sentry
+		session_replay/sentry_session_replay_none.c
 	)
 endif()

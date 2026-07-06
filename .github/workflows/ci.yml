@@ -21,14 +21,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: make style
 
   build-ios-inproc:
     name: Xcode Build for inproc on iOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: "recursive"
       - run: |
@@ -39,7 +39,7 @@ jobs:
     name: Xcode Build for breakpad on iOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: "recursive"
       - run: |
@@ -142,16 +142,18 @@ jobs:
             RUN_ANALYZER: code-checker,valgrind
           - name: Linux (GCC + musl + libunwind)
             os: ubuntu-latest
-            container: ghcr.io/getsentry/sentry-native-alpine:3.21
+            container: ghcr.io/getsentry/sentry-native-alpine:3.23
             CC: gcc
             CXX: g++
             SYSTEM_PYTHON: 1
+            CMAKE_DEFINES: -DSENTRY_LIBUNWIND_SYSTEM=ON
           - name: Linux (clang + musl + libunwind)
             os: ubuntu-latest
-            container: ghcr.io/getsentry/sentry-native-alpine:3.21
+            container: ghcr.io/getsentry/sentry-native-alpine:3.23
             CC: clang
             CXX: clang++
             SYSTEM_PYTHON: 1
+            CMAKE_DEFINES: -DSENTRY_LIBUNWIND_SYSTEM=ON
           - name: macOS 14 (xcode llvm)
             os: macos-14
             ERROR_ON_WARNINGS: 1
@@ -190,8 +192,8 @@ jobs:
           - name: Windows (latest, ninja + sccache)
             os: windows-latest
             USE_SCCACHE: 1
-          - name: Windows ClangCL (latest)
-            os: windows-latest
+          - name: Windows ClangCL (2022)
+            os: windows-2022
             VS_GENERATOR_TOOLSET: ClangCL
           - name: LLVM-Mingw
             os: windows-latest
@@ -246,7 +248,7 @@ jobs:
       SENTRY_TEST_OOM_LIMIT: "4095" # ~4GB, to speed up OOM tests
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
 
@@ -288,8 +290,9 @@ jobs:
           sudo apt-get install binutils-dev libssl-dev libelf-dev libstdc++-14-dev libdw-dev libiberty-dev
           git clone https://github.com/SimonKagstrom/kcov.git
           cd kcov
-          # pin to a known good version with the coveralls git integration and performance bottlenecks fixed
-          git checkout b370df05ccc96facfd83a9e101e35263457b8035
+          # pin to a known good version with the coveralls git integration, performance bottlenecks,
+          # and signal exit code handling fixed
+          git checkout f65e1145b7f1c42872f37d03edcc29264fccf26a
           mkdir build
           cd build
           cmake ..
@@ -327,7 +330,7 @@ jobs:
         if: ${{ contains(matrix.container, 'alpine') }}
         run: |
           apk update
-          apk add curl-dev xz-dev
+          apk add curl-dev libunwind-dev xz-dev
       # install manually until available by default (also for future .NET updates)
       - name: Install .NET 10 SDK for ARM64 runners
         if: ${{ runner.os == 'Linux' && runner.arch == 'ARM64' && !matrix.container }}
@@ -397,20 +400,18 @@ jobs:
 
       - name: Setup Java Version
         if: ${{ env['ANDROID_API'] }}
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Setup Gradle
         if: ${{ env['ANDROID_API'] }}
-        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # pin@v5.0.2
-        with:
-          gradle-home-cache-cleanup: true
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # pin@v6.2.0
 
       - name: Setup .NET for Android
         if: ${{ env['ANDROID_API'] }}
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7 # v5
+        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
         with:
           dotnet-version: '10.0.x'
 
@@ -460,6 +461,7 @@ jobs:
             adb shell cmd alarm set-time $(date +%s000) || adb shell su root date $(date -u +%m%d%H%M%Y.%S)
             pip install --upgrade --requirement tests/requirements.txt
             pytest --capture=no --verbose tests
+            (cd ndk && ./gradlew :sentry-native-ndk:connectedDebugAndroidTest --stacktrace)
 
       - name: Test
         if: ${{ !env['ANDROID_API'] }}
@@ -475,7 +477,7 @@ jobs:
 
       - name: "Upload to codecov.io"
         if: ${{ contains(env['RUN_ANALYZER'], 'cov') }}
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # pin@v6.0.0
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # pin@v7.0.0
         with:
           directory: coverage
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -490,20 +492,18 @@ jobs:
     # run on master or the release branch
     if: ${{ needs.test.result == 'success' && github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
 
       - name: Setup Java Version
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # pin@v5.0.2
-        with:
-          gradle-home-cache-cleanup: true
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # pin@v6.2.0
 
       - name: Create source archive
         run: |

@@ -17,8 +17,10 @@ extern "C" {
 #endif
 #include "sentry_path.h"
 #include "sentry_screenshot.h"
+#include "sentry_session_replay.h"
 #include "sentry_string.h"
 #include "sentry_sync.h"
+#include "sentry_tracing.h"
 #include "sentry_transport.h"
 #include "sentry_unix_pageallocator.h"
 #include "transports/sentry_disk_transport.h"
@@ -56,6 +58,14 @@ extern "C" {
 #endif
 
 #ifdef SENTRY_PLATFORM_WINDOWS
+static void
+handle_sigabrt(EXCEPTION_POINTERS *exception_pointers)
+{
+    sentry_ucontext_t uctx = {};
+    uctx.exception_ptrs = *exception_pointers;
+    sentry_handle_exception(&uctx);
+}
+
 static bool
 breakpad_backend_callback(const wchar_t *breakpad_dump_path,
     const wchar_t *minidump_id, void *UNUSED(context),
@@ -130,6 +140,9 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
     SENTRY_WITH_OPTIONS (options) {
         sentry__write_crash_marker(options);
 
+        sentry_value_t transaction
+            = sentry__trace_finish(SENTRY_SPAN_STATUS_ABORTED);
+
         bool should_handle = true;
 
         if (options->on_crash_func) {
@@ -164,7 +177,7 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
 
         if (should_handle) {
             bool capture_screenshot = options->attach_screenshot;
-#ifdef SENTRY_PLATFORM_WINDOWS
+#ifndef SENTRY_SCREENSHOT_NONE
             if (capture_screenshot && options->before_screenshot_func) {
                 SENTRY_SIGNAL_SAFE_LOG(
                     "DEBUG invoking `before_screenshot` hook");
@@ -186,14 +199,14 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
                 envelope, dump_path, "attachment");
             if (item) {
                 sentry__envelope_item_set_header(item, "attachment_type",
-                    sentry_value_new_string("event.minidump"));
+                    sentry_value_new_string(SENTRY_ATTACHMENT_TYPE_MINIDUMP));
 
                 sentry__envelope_item_set_header(item, "filename",
                     sentry_value_new_string(sentry__path_filename(dump_path)));
             } else if (options->enable_large_attachments) {
                 sentry_attachment_t tmp = {};
                 tmp.path = dump_path;
-                tmp.type = MINIDUMP;
+                tmp.type = (char *)SENTRY_ATTACHMENT_TYPE_MINIDUMP;
                 if (!sentry__cache_attachment_ref(
                         envelope, &tmp, options->run->cache_path, nullptr)) {
                     SENTRY_SIGNAL_SAFE_LOG(
@@ -219,13 +232,49 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
                 sentry__attachment_free(screenshot);
             }
 
+            if (options->attach_session_replay) {
+                sentry_attachment_t *replay = sentry__attachment_from_path(
+                    sentry__session_replay_get_path(options));
+                if (replay
+                    && sentry__session_replay_capture(
+                        replay->path, options->session_replay_duration, 0)) {
+                    sentry__envelope_add_attachment(envelope, replay);
+                }
+                sentry__attachment_free(replay);
+            }
+
+            if (envelope && sentry__session_replay_has_pending(options)) {
+                sentry_value_t crash_event
+                    = sentry_envelope_get_event(envelope);
+                sentry_transport_t *replay_transport
+                    = sentry_new_disk_transport(options->run);
+                if (replay_transport) {
+                    sentry__session_replay_flush_pending(
+                        options, replay_transport, crash_event);
+                    sentry__transport_dump_queue(
+                        replay_transport, options->run);
+                    sentry_transport_free(replay_transport);
+                }
+            }
+
             if (!sentry__launch_external_crash_reporter(options, envelope)) {
-                // capture the envelope with the disk transport
+                // capture the envelopes with the disk transport
                 sentry_transport_t *disk_transport
                     = sentry_new_disk_transport(options->run);
+                if (!sentry_value_is_null(transaction)) {
+                    sentry_envelope_t *tx_envelope
+                        = sentry__prepare_transaction(
+                            options, transaction, nullptr);
+                    if (tx_envelope) {
+                        sentry__capture_envelope(
+                            disk_transport, tx_envelope, options);
+                    }
+                }
                 sentry__capture_envelope(disk_transport, envelope, options);
                 sentry__transport_dump_queue(disk_transport, options->run);
                 sentry_transport_free(disk_transport);
+            } else {
+                sentry_value_decref(transaction);
             }
 
             // now that the envelope was written, we can remove the temporary
@@ -236,6 +285,7 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
             SENTRY_SIGNAL_SAFE_LOG(
                 "DEBUG event was discarded by the `on_crash` hook");
             sentry_value_decref(event);
+            sentry_value_decref(transaction);
         }
 
         // after capturing the crash event, try to dump all the in-flight
@@ -299,6 +349,9 @@ breakpad_backend_startup(
     backend->data = new (std::nothrow) google_breakpad::ExceptionHandler(
         current_run_folder->path_w, nullptr, breakpad_backend_callback, nullptr,
         google_breakpad::ExceptionHandler::HANDLER_EXCEPTION);
+    if (backend->data) {
+        sentry__win32_install_sigabrt_handler(handle_sigabrt);
+    }
 #elif defined(SENTRY_PLATFORM_MACOS)
     // If process is being debugged and there are breakpoints set it will cause
     // task_set_exception_ports to crash the whole process and debugger
@@ -320,6 +373,10 @@ breakpad_backend_startup(
 static void
 breakpad_backend_shutdown(sentry_backend_t *backend)
 {
+#ifdef SENTRY_PLATFORM_WINDOWS
+    sentry__win32_restore_sigabrt_handler();
+#endif
+
     const auto *eh
         = static_cast<google_breakpad::ExceptionHandler *>(backend->data);
     backend->data = nullptr;

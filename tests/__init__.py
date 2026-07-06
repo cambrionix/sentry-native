@@ -4,6 +4,7 @@ import os
 import io
 import json
 import sys
+import time
 import urllib
 import pytest
 import pprint
@@ -22,7 +23,12 @@ def adb(*args, **kwargs):
 # https://docs.pytest.org/en/latest/assert.html#assert-details
 pytest.register_assert_rewrite("tests.assertions")
 
-SENTRY_VERSION = "0.14.0"
+SENTRY_VERSION = "0.15.3"
+
+# must match the fixed id set by the example's "replay-context" arg
+REPLAY_ID = "deadbeefdeadbeefdeadbeefdeadbeef"
+
+from .assertions import wait_for_daemon as _wait_for_daemon
 
 
 def make_dsn(httpserver, auth="uiaeosnrtdy", id=123456, proxy_host=False):
@@ -73,6 +79,36 @@ def is_feedback_envelope(data):
     return b'"type":"feedback"' in data
 
 
+def is_replay_envelope(data):
+    return b'"type":"replay_video"' in data
+
+
+def stage_replay(tmp_path, replay_id=REPLAY_ID):
+    """Stage a dummy replay clip + sidecar in `<database>/replays/` the way an
+    embedder (e.g. sentry-unreal) would. The SDK treats the mp4 as opaque
+    bytes, so no valid video container is needed."""
+    replays = tmp_path / ".sentry-native" / "replays"
+    replays.mkdir(parents=True)
+    video = b"\x00\x00\x00\x1cftyp-dummy-mp4-payload-" * 64
+    (replays / f"replay-{replay_id}.mp4").write_bytes(video)
+    sidecar = {
+        "replayId": replay_id,
+        "videoFilename": f"replay-{replay_id}.mp4",
+        "replayType": "buffer",
+        "segmentId": 0,
+        "startTimestampSec": 1782892813.261,
+        "endTimestampSec": 1782892828.338,
+        "width": 3864,
+        "height": 2100,
+        "durationMs": 15077,
+        "sizeBytes": len(video),
+        "frameCount": 58,
+        "frameRate": 30,
+    }
+    (replays / f"replay-{replay_id}.json").write_text(json.dumps(sidecar))
+    return replays, video
+
+
 def split_log_request_cond(httpserver_log, cond):
     return (
         (httpserver_log[0][0], httpserver_log[1][0])
@@ -96,7 +132,13 @@ def extract_request(httpserver_log, cond):
     return (None, httpserver_log)
 
 
-def run(cwd, exe, args, expect_failure=False, env=None, **kwargs):
+def run(
+    cwd, exe, args, expect_failure=False, env=None, wait_for_daemon=False, **kwargs
+):
+    if wait_for_daemon:
+        assert (
+            "log" in args or exe != "sentry_example"
+        ), "sentry_example needs 'log' when waiting for the daemon"
     if env is None:
         env = dict(os.environ)
     if kwargs.get("check"):
@@ -105,6 +147,7 @@ def run(cwd, exe, args, expect_failure=False, env=None, **kwargs):
         )
     check = expect_failure == False
     __tracebackhide__ = True
+    started_at = time.time()
     if os.environ.get("ANDROID_API"):
         # older android emulators do not correctly pass down the returncode
         # so we basically echo the return code, and parse it manually
@@ -179,6 +222,10 @@ def run(cwd, exe, args, expect_failure=False, env=None, **kwargs):
         ]
     try:
         result = subprocess.run([*cmd, *args], cwd=cwd, env=env, check=check, **kwargs)
+        if wait_for_daemon:
+            assert _wait_for_daemon(
+                cwd, started_at
+            ), "native crash daemon did not finish within timeout"
         if expect_failure:
             assert (
                 result.returncode != 0

@@ -68,6 +68,14 @@ sentry_value_t sentry__value_new_list_with_size(size_t size);
 sentry_value_t sentry__value_new_object_with_size(size_t size);
 
 /**
+ * Iterates over the key/value pairs of an object value. The callback receives a
+ * borrowed reference for each value. Does nothing if `value` is not an object.
+ */
+void sentry__value_foreach_key_value(sentry_value_t value,
+    void (*callback)(const char *key, sentry_value_t value, void *userdata),
+    void *userdata);
+
+/**
  * This will parse the Value into a UUID, or return a `nil` UUID on error.
  * See also `sentry_uuid_from_string`.
  */
@@ -106,6 +114,11 @@ int sentry__value_merge_objects(sentry_value_t dst, sentry_value_t src);
  */
 void sentry__jsonwriter_write_value(
     sentry_jsonwriter_t *jw, sentry_value_t value);
+
+/**
+ * Serializes `value` into JSON and optionally returns the byte length.
+ */
+char *sentry__value_to_json(sentry_value_t value, size_t *len_out);
 
 /**
  * Adds a typed attribute to the attributes object.

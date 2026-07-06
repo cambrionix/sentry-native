@@ -6,6 +6,7 @@
 #include "sentry_core.h"
 #include "sentry_crash_ipc.h"
 #include "sentry_database.h"
+#include "sentry_elf.h"
 #include "sentry_envelope.h"
 #include "sentry_json.h"
 #include "sentry_logger.h"
@@ -13,6 +14,7 @@
 #include "sentry_path.h"
 #include "sentry_process.h"
 #include "sentry_screenshot.h"
+#include "sentry_session_replay.h"
 #include "sentry_string.h"
 #include "sentry_symbolizer.h"
 #include "sentry_sync.h"
@@ -46,6 +48,9 @@
 #        include <mach-o/dyld.h>
 #        include <spawn.h>
 #    endif
+#    if defined(SENTRY_PLATFORM_LINUX)
+#        include "unwinder/sentry_unwinder.h"
+#    endif
 #elif defined(SENTRY_PLATFORM_WINDOWS)
 #    include <dbghelp.h>
 #    include <fcntl.h>
@@ -55,7 +60,8 @@
 
 // Forward declaration for StackWalk64-based stack unwinding (defined later)
 static size_t walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
-    const CONTEXT *ctx_record, sentry_frame_info_t *frames, size_t max_frames);
+    const CONTEXT *ctx_record, const sentry_crash_context_t *crash_ctx,
+    sentry_frame_info_t *frames, size_t max_frames);
 #endif
 
 // Provide default ASAN options for sentry-crash daemon executable
@@ -78,7 +84,7 @@ __asan_default_options(void)
  */
 static bool
 write_attachment_to_envelope(int fd, const char *file_path,
-    const char *filename, const char *content_type)
+    const char *filename, const char *attachment_type, const char *content_type)
 {
 #if defined(SENTRY_PLATFORM_UNIX)
     int attach_fd = open(file_path, O_RDONLY);
@@ -112,24 +118,37 @@ write_attachment_to_envelope(int fd, const char *file_path,
 #endif
 
     // Write attachment item header
-    char header[SENTRY_CRASH_ENVELOPE_HEADER_SIZE];
-    int header_written;
-    if (content_type) {
-        header_written = snprintf(header, sizeof(header),
-            "{\"type\":\"attachment\",\"length\":%lld,"
-            "\"attachment_type\":\"event.attachment\","
-            "\"content_type\":\"%s\","
-            "\"filename\":\"%s\"}\n",
-            file_size, content_type, filename ? filename : "attachment");
-    } else {
-        header_written = snprintf(header, sizeof(header),
-            "{\"type\":\"attachment\",\"length\":%lld,"
-            "\"attachment_type\":\"event.attachment\","
-            "\"filename\":\"%s\"}\n",
-            file_size, filename ? filename : "attachment");
+    sentry_jsonwriter_t *jw = sentry__jsonwriter_new_sb(NULL);
+    if (!jw) {
+        SENTRY_WARN("Failed to create attachment header writer");
+#if defined(SENTRY_PLATFORM_UNIX)
+        close(attach_fd);
+#elif defined(SENTRY_PLATFORM_WINDOWS)
+        _close(attach_fd);
+#endif
+        return false;
     }
 
-    if (header_written < 0 || header_written >= (int)sizeof(header)) {
+    sentry__jsonwriter_write_object_start(jw);
+    sentry__jsonwriter_write_key(jw, "type");
+    sentry__jsonwriter_write_str(jw, "attachment");
+    sentry__jsonwriter_write_key(jw, "length");
+    sentry__jsonwriter_write_int64(jw, file_size);
+    sentry__jsonwriter_write_key(jw, "attachment_type");
+    sentry__jsonwriter_write_str(jw,
+        sentry__string_empty(attachment_type) ? SENTRY_ATTACHMENT_TYPE_GENERIC
+                                              : attachment_type);
+    if (content_type) {
+        sentry__jsonwriter_write_key(jw, "content_type");
+        sentry__jsonwriter_write_str(jw, content_type);
+    }
+    sentry__jsonwriter_write_key(jw, "filename");
+    sentry__jsonwriter_write_str(jw, filename ? filename : "attachment");
+    sentry__jsonwriter_write_object_end(jw);
+
+    size_t header_written = 0;
+    char *header = sentry__jsonwriter_into_string(jw, &header_written);
+    if (!header) {
         SENTRY_WARN("Failed to write attachment header");
 #if defined(SENTRY_PLATFORM_UNIX)
         close(attach_fd);
@@ -140,12 +159,15 @@ write_attachment_to_envelope(int fd, const char *file_path,
     }
 
 #if defined(SENTRY_PLATFORM_UNIX)
-    if (write(fd, header, header_written) != (ssize_t)header_written) {
+    if (write(fd, header, header_written) != (ssize_t)header_written
+        || write(fd, "\n", 1) != 1) {
         SENTRY_WARN("Failed to write attachment header to envelope");
     }
 #elif defined(SENTRY_PLATFORM_WINDOWS)
     _write(fd, header, (unsigned int)header_written);
+    _write(fd, "\n", 1);
 #endif
+    sentry_free(header);
 
     // Copy attachment content
     char buf[SENTRY_CRASH_FILE_BUFFER_SIZE];
@@ -203,7 +225,6 @@ attachment_is_placeholder(const sentry_options_t *options, const char *path)
     if (!attachment.path) {
         return false;
     }
-    attachment.type = ATTACHMENT;
     bool is_placeholder
         = sentry__attachment_is_placeholder(&attachment, options);
     sentry__path_free(attachment.path);
@@ -251,9 +272,11 @@ add_attachment_refs(sentry_envelope_t *envelope,
             = sentry_value_as_string(sentry_value_get_by_key(info, "path"));
         const char *filename
             = sentry_value_as_string(sentry_value_get_by_key(info, "filename"));
+        const char *attachment_type = sentry_value_as_string(
+            sentry_value_get_by_key(info, "attachment_type"));
         const char *content_type = sentry_value_as_string(
             sentry_value_get_by_key(info, "content_type"));
-        if (!path || !*path || !filename || !*filename) {
+        if (sentry__string_empty(path) || sentry__string_empty(filename)) {
             SENTRY_WARN("Skipping malformed attachment manifest entry");
             continue;
         }
@@ -266,9 +289,11 @@ add_attachment_refs(sentry_envelope_t *envelope,
             sentry__path_free(attachment.filename);
             continue;
         }
-        attachment.type = ATTACHMENT;
+        attachment.type
+            = (char *)((attachment_type && *attachment_type) ? attachment_type
+                                                             : NULL);
         attachment.content_type
-            = (char *)((content_type && *content_type) ? content_type : NULL);
+            = sentry__string_empty(content_type) ? NULL : (char *)content_type;
         if (!sentry__attachment_is_placeholder(&attachment, options)) {
             sentry__path_free(attachment.path);
             sentry__path_free(attachment.filename);
@@ -532,6 +557,24 @@ build_registers_from_ctx(const sentry_crash_context_t *ctx, size_t thread_idx)
     return registers;
 }
 
+#ifdef SENTRY_WITH_UNWINDER_LIBUNWIND_REMOTE
+static sentry_value_t
+build_registers_from_remote_registers(
+    const sentry_remote_registers_t *remote_registers)
+{
+    sentry_value_t registers = sentry_value_new_object();
+
+    for (size_t i = 0; i < remote_registers->count; i++) {
+        const sentry_remote_register_t *remote_register
+            = &remote_registers->values[i];
+        sentry_value_set_by_key(registers, remote_register->name,
+            sentry__value_new_addr(remote_register->value));
+    }
+
+    return registers;
+}
+#endif
+
 /**
  * Maximum number of frames to unwind
  */
@@ -593,7 +636,8 @@ static void
 enrich_frame_with_module_info(
     const sentry_crash_context_t *ctx, sentry_value_t frame, uint64_t addr)
 {
-    for (uint32_t i = 0; i < ctx->module_count; i++) {
+    uint32_t module_count = MIN(ctx->module_count, SENTRY_CRASH_MAX_MODULES);
+    for (uint32_t i = 0; i < module_count; i++) {
         const sentry_module_info_t *mod = &ctx->modules[i];
         if (addr >= mod->base_address && addr < mod->base_address + mod->size) {
             // Set package to full module path (matches minidump format)
@@ -608,8 +652,13 @@ enrich_frame_with_module_info(
     }
     // No matching module found - log for debugging
     SENTRY_DEBUGF("Frame 0x%llx NOT matched to any module (module_count=%u)",
-        (unsigned long long)addr, ctx->module_count);
+        (unsigned long long)addr, module_count);
 }
+
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+static void enrich_frame_with_symbol(
+    const sentry_crash_context_t *ctx, sentry_value_t frame, uint64_t addr);
+#endif
 
 /**
  * Build stacktrace frames for a specific thread using frame pointer-based
@@ -825,7 +874,7 @@ build_stacktrace_for_thread(
         // Make a copy since StackWalk64 may modify the context
         CONTEXT ctx_copy = *walk_context;
         size_t dbghelp_frame_count = walk_stack_with_dbghelp(hProcess,
-            walk_thread_id, &ctx_copy, stack_frames, MAX_STACK_FRAMES);
+            walk_thread_id, &ctx_copy, ctx, stack_frames, MAX_STACK_FRAMES);
 
         if (dbghelp_frame_count > 0) {
             // Build sentry frames from StackWalk64 results
@@ -888,10 +937,98 @@ build_stacktrace_for_thread(
     sentry_value_t temp_frames[MAX_STACK_FRAMES];
     int frame_count = 0;
 
+#if defined(SENTRY_PLATFORM_LINUX)
+    // Remote DWARF unwinding via libunwind ptrace accessors. Do not attach to
+    // the crashed thread from the daemon; use the saved fault context below.
+    {
+#    ifdef SENTRY_WITH_UNWINDER_LIBUNWIND_REMOTE
+        pid_t tid = 0;
+        if (thread_idx == SIZE_MAX) {
+            tid = ctx->crashed_tid;
+        } else if (thread_idx < ctx->platform.num_threads) {
+            tid = ctx->platform.threads[thread_idx].tid;
+        }
+
+        bool is_crashed_thread
+            = thread_idx == SIZE_MAX || tid == ctx->crashed_tid;
+
+        if (tid > 0 && !is_crashed_thread) {
+            sentry_remote_registers_t registers = { 0 };
+            sentry_remote_frame_t *remote_frames
+                = sentry_malloc(sizeof(*remote_frames) * MAX_STACK_FRAMES);
+            size_t remote_count = remote_frames
+                ? sentry__unwind_stack_from_thread(
+                      tid, remote_frames, MAX_STACK_FRAMES, &registers)
+                : 0;
+
+            if (remote_count > 0) {
+                SENTRY_DEBUGF("Remote unwound %zu frames for thread %d",
+                    remote_count, tid);
+
+                for (size_t i = 0;
+                    i < remote_count && frame_count < MAX_STACK_FRAMES; i++) {
+                    if (remote_frames[i].ip == 0
+                        || !is_valid_code_addr(remote_frames[i].ip)) {
+                        continue;
+                    }
+                    temp_frames[frame_count] = sentry_value_new_object();
+                    sentry_value_set_by_key(temp_frames[frame_count],
+                        "instruction_addr",
+                        sentry__value_new_addr(remote_frames[i].ip));
+                    // Trust describes the unwind source, not the emitted
+                    // frame index. If the initial cursor frame is filtered
+                    // out, the next emitted frame was still reached via CFI.
+                    sentry_value_set_by_key(temp_frames[frame_count], "trust",
+                        sentry_value_new_string(i == 0 ? "context" : "cfi"));
+                    enrich_frame_with_module_info(
+                        ctx, temp_frames[frame_count], remote_frames[i].ip);
+                    if (remote_frames[i].symbol[0]) {
+                        sentry_value_set_by_key(temp_frames[frame_count],
+                            "function",
+                            sentry_value_new_string(remote_frames[i].symbol));
+                        if (remote_frames[i].symbol_offset > 0
+                            && remote_frames[i].symbol_offset
+                                <= remote_frames[i].ip) {
+                            sentry_value_set_by_key(temp_frames[frame_count],
+                                "symbol_addr",
+                                sentry__value_new_addr(remote_frames[i].ip
+                                    - remote_frames[i].symbol_offset));
+                        }
+                    }
+                    frame_count++;
+                }
+
+                if (frame_count > 0) {
+                    if (stack_buf) {
+                        sentry_free(stack_buf);
+                    }
+
+                    for (int i = frame_count - 1; i >= 0; i--) {
+                        sentry_value_append(frames, temp_frames[i]);
+                    }
+                    sentry_value_set_by_key(stacktrace, "frames", frames);
+                    if (registers.count > 0) {
+                        sentry_value_set_by_key(stacktrace, "registers",
+                            build_registers_from_remote_registers(&registers));
+                    }
+                    sentry_free(remote_frames);
+                    return stacktrace;
+                }
+            }
+
+            if (remote_frames) {
+                sentry_free(remote_frames);
+            }
+        }
+#    endif
+    }
+    // Fall through to pre-captured backtrace or FP-walking if remote
+    // unwinding failed
+#endif
+
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
-    // Use pre-captured libunwind backtrace if available (DWARF-based, works
-    // without frame pointers). This is preferred over FP-based walking for
-    // the crashed thread.
+    // Fallback: use pre-captured libunwind backtrace if available
+    // (DWARF-based, works without frame pointers).
     if (ctx->platform.backtrace_count > 0
         && (thread_idx == SIZE_MAX || thread_idx == 0)) {
         SENTRY_DEBUGF("Using pre-captured libunwind backtrace (%zu frames)",
@@ -907,10 +1044,14 @@ build_stacktrace_for_thread(
             temp_frames[frame_count] = sentry_value_new_object();
             sentry_value_set_by_key(temp_frames[frame_count],
                 "instruction_addr", sentry__value_new_addr(frame_ip));
+            // Trust describes the unwind source, not the emitted frame index.
+            // If the initial cursor frame is filtered out, the next emitted
+            // frame was still reached via CFI.
             sentry_value_set_by_key(temp_frames[frame_count], "trust",
                 sentry_value_new_string(i == 0 ? "context" : "cfi"));
             enrich_frame_with_module_info(
                 ctx, temp_frames[frame_count], frame_ip);
+            enrich_frame_with_symbol(ctx, temp_frames[frame_count], frame_ip);
             frame_count++;
         }
 
@@ -945,6 +1086,9 @@ build_stacktrace_for_thread(
         sentry_value_set_by_key(temp_frames[frame_count], "trust",
             sentry_value_new_string("context"));
         enrich_frame_with_module_info(ctx, temp_frames[frame_count], ip);
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+        enrich_frame_with_symbol(ctx, temp_frames[frame_count], ip);
+#endif
         frame_count++;
     }
 
@@ -1003,6 +1147,10 @@ build_stacktrace_for_thread(
                 sentry_value_new_string("fp"));
             enrich_frame_with_module_info(
                 ctx, temp_frames[frame_count], return_addr);
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+            enrich_frame_with_symbol(
+                ctx, temp_frames[frame_count], return_addr);
+#endif
             frame_count++;
             walk_count++;
 
@@ -1054,6 +1202,7 @@ build_stacktrace_for_thread(
 }
 
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+#    include "sentry_elf.h"
 #    include <elf.h>
 
 /**
@@ -1087,8 +1236,13 @@ extract_elf_build_id_for_module(
         return 0;
     }
 
+    if (!sentry__elf_has_shdr_size(ehdr.e_ident, ehdr.e_shentsize)) {
+        close(fd);
+        return 0;
+    }
+
     // Read section headers
-    size_t shdr_size = ehdr.e_shentsize * ehdr.e_shnum;
+    size_t shdr_size = (size_t)ehdr.e_shentsize * ehdr.e_shnum;
     void *shdr_buf = sentry_malloc(shdr_size);
     if (!shdr_buf) {
         close(fd);
@@ -1111,64 +1265,426 @@ extract_elf_build_id_for_module(
     // Look for .note.gnu.build-id section
     size_t build_id_len = 0;
     for (int i = 0; i < ehdr.e_shnum; i++) {
-        if (sections[i].sh_type == SHT_NOTE) {
-            // Read note section
-            size_t note_size = sections[i].sh_size;
-            if (note_size > 4096) {
-                continue; // Sanity check
-            }
-
-            void *note_buf = sentry_malloc(note_size);
-            if (!note_buf) {
-                continue;
-            }
-
-            if (lseek(fd, sections[i].sh_offset, SEEK_SET)
-                    == (off_t)sections[i].sh_offset
-                && read(fd, note_buf, note_size) == (ssize_t)note_size) {
-
-                // Parse notes
-                uint8_t *ptr = (uint8_t *)note_buf;
-                uint8_t *end = ptr + note_size;
-
-                while (ptr + 12 <= end) {
-#    if defined(__x86_64__) || defined(__aarch64__)
-                    Elf64_Nhdr *nhdr = (Elf64_Nhdr *)ptr;
-#    else
-                    Elf32_Nhdr *nhdr = (Elf32_Nhdr *)ptr;
-#    endif
-                    ptr += sizeof(*nhdr);
-
-                    if (ptr + nhdr->n_namesz + nhdr->n_descsz > end) {
-                        break;
-                    }
-
-                    // Check if this is GNU Build ID (type 3, name "GNU\0")
-                    if (nhdr->n_type == 3 && nhdr->n_namesz == 4
-                        && memcmp(ptr, "GNU", 4) == 0) {
-
-                        ptr += ((nhdr->n_namesz + 3) & ~3); // Align to 4 bytes
-                        size_t len = nhdr->n_descsz < max_len ? nhdr->n_descsz
-                                                              : max_len;
-                        memcpy(build_id, ptr, len);
-                        build_id_len = len;
-                        sentry_free(note_buf);
-                        goto done;
-                    }
-
-                    ptr += ((nhdr->n_namesz + 3) & ~3);
-                    ptr += ((nhdr->n_descsz + 3) & ~3);
-                }
-            }
-
-            sentry_free(note_buf);
+        if (sections[i].sh_type != SHT_NOTE) {
+            continue;
         }
+
+        size_t note_size = sections[i].sh_size;
+        if (note_size > 4096) {
+            continue; // Sanity check
+        }
+
+        void *note_buf = sentry_malloc(note_size);
+        if (!note_buf) {
+            continue;
+        }
+
+        if (lseek(fd, sections[i].sh_offset, SEEK_SET)
+                != (off_t)sections[i].sh_offset
+            || read(fd, note_buf, note_size) != (ssize_t)note_size) {
+            sentry_free(note_buf);
+            continue;
+        }
+
+        size_t desc_size;
+        const void *desc = sentry__elf_find_note(
+            note_buf, note_size, 4, NT_GNU_BUILD_ID, "GNU", 4, &desc_size);
+
+        if (desc) {
+            size_t len = desc_size < max_len ? desc_size : max_len;
+            memcpy(build_id, desc, len);
+            build_id_len = len;
+            sentry_free(note_buf);
+            goto done;
+        }
+
+        sentry_free(note_buf);
     }
 
 done:
     sentry_free(shdr_buf);
     close(fd);
     return build_id_len;
+}
+
+/**
+ * A symbol-table source for a module: either the module's own ELF file or
+ * its split-debug companion located via the `.gnu_debuglink` section.
+ * Cached per module so the section-header parse and the debug-file search
+ * run once per module rather than once per frame.
+ */
+typedef struct {
+    char sym_path[SENTRY_CRASH_MAX_PATH];
+    int state; // 0 = unused, 1 = usable, -1 = no symbol table found
+    uint16_t e_type; // e_type of the loaded module (st_value semantics)
+    uint64_t symtab_off;
+    uint64_t symtab_size;
+    uint64_t strtab_off;
+    uint64_t strtab_size;
+} sym_source_t;
+
+// Upper bound on a resolved symbol name; mirrors dbghelp's MAX_SYM_NAME.
+#    define SENTRY_MAX_SYM_NAME 2000
+
+// Direct-mapped by module index; see get_sym_source. Being BSS, only the
+// slots touched during resolution are committed to physical memory.
+static sym_source_t g_sym_sources[SENTRY_CRASH_MAX_MODULES];
+
+/**
+ * Parse the ELF file at `path` and record the location of its symbol table
+ * in `src`. Prefers the full `.symtab` and only falls back to `.dynsym`
+ * when `allow_dynsym` is set: the dynamic table covers exported symbols
+ * only, so lookups against it are unreliable for binaries whose `.symtab`
+ * was stripped. When `debuglink_out` is non-NULL, also extracts the file
+ * name stored in a `.gnu_debuglink` section, if present.
+ * Returns 1 when a usable symbol table was found, 0 otherwise.
+ */
+static int
+elf_locate_symtab(const char *path, int allow_dynsym, sym_source_t *src,
+    char *debuglink_out, size_t debuglink_out_size, uint16_t *e_type_out)
+{
+    if (debuglink_out && debuglink_out_size > 0) {
+        debuglink_out[0] = '\0';
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+#    if defined(__x86_64__) || defined(__aarch64__)
+    Elf64_Ehdr ehdr;
+#    else
+    Elf32_Ehdr ehdr;
+#    endif
+    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)
+        || memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0
+        || !sentry__elf_is_native_class(ehdr.e_ident)
+        || !sentry__elf_has_shdr_size(ehdr.e_ident, ehdr.e_shentsize)) {
+        close(fd);
+        return 0;
+    }
+
+    if (e_type_out) {
+        *e_type_out = ehdr.e_type;
+    }
+
+    size_t shdr_size = (size_t)ehdr.e_shentsize * ehdr.e_shnum;
+    void *shdr_buf = sentry_malloc(shdr_size);
+    if (!shdr_buf) {
+        close(fd);
+        return 0;
+    }
+
+    if (lseek(fd, ehdr.e_shoff, SEEK_SET) != (off_t)ehdr.e_shoff
+        || read(fd, shdr_buf, shdr_size) != (ssize_t)shdr_size) {
+        sentry_free(shdr_buf);
+        close(fd);
+        return 0;
+    }
+
+#    if defined(__x86_64__) || defined(__aarch64__)
+    Elf64_Shdr *sections = (Elf64_Shdr *)shdr_buf;
+#    else
+    Elf32_Shdr *sections = (Elf32_Shdr *)shdr_buf;
+#    endif
+
+    int symtab_idx = -1;
+    int dynsym_idx = -1;
+    for (int j = 0; j < ehdr.e_shnum; j++) {
+        if (sections[j].sh_type == SHT_SYMTAB && symtab_idx < 0) {
+            symtab_idx = j;
+        } else if (sections[j].sh_type == SHT_DYNSYM && dynsym_idx < 0) {
+            dynsym_idx = j;
+        }
+    }
+
+    // Extract the .gnu_debuglink file name, identified via the section name
+    // string table (the section has no dedicated sh_type).
+    if (debuglink_out && ehdr.e_shstrndx < ehdr.e_shnum) {
+        size_t shstr_size = sections[ehdr.e_shstrndx].sh_size;
+        if (shstr_size > 0 && shstr_size <= 1024 * 1024) {
+            char *shstr_buf = sentry_malloc(shstr_size);
+            if (shstr_buf
+                && lseek(fd, sections[ehdr.e_shstrndx].sh_offset, SEEK_SET)
+                    == (off_t)sections[ehdr.e_shstrndx].sh_offset
+                && read(fd, shstr_buf, shstr_size) == (ssize_t)shstr_size) {
+                for (int j = 0; j < ehdr.e_shnum; j++) {
+                    size_t name_off = sections[j].sh_name;
+                    if (name_off >= shstr_size
+                        || strnlen(shstr_buf + name_off, shstr_size - name_off)
+                            == shstr_size - name_off
+                        || strcmp(shstr_buf + name_off, ".gnu_debuglink")
+                            != 0) {
+                        continue;
+                    }
+                    // Content: NUL-terminated file name, padding, CRC32.
+                    size_t link_size = sections[j].sh_size;
+                    if (link_size < 5 || link_size > 4096 + 4) {
+                        break;
+                    }
+                    char link_buf[4096 + 4];
+                    if (lseek(fd, sections[j].sh_offset, SEEK_SET)
+                            == (off_t)sections[j].sh_offset
+                        && read(fd, link_buf, link_size)
+                            == (ssize_t)link_size) {
+                        size_t name_max = link_size - 4;
+                        size_t name_len = strnlen(link_buf, name_max);
+                        if (name_len > 0 && name_len < name_max
+                            && name_len < debuglink_out_size) {
+                            memcpy(debuglink_out, link_buf, name_len + 1);
+                        }
+                    }
+                    break;
+                }
+            }
+            sentry_free(shstr_buf);
+        }
+    }
+
+    int chosen
+        = symtab_idx >= 0 ? symtab_idx : (allow_dynsym ? dynsym_idx : -1);
+    int found = 0;
+    if (chosen >= 0
+        && sentry__elf_has_sym_entsize(
+            ehdr.e_ident, sections[chosen].sh_entsize)) {
+        uint32_t strtab_idx = sections[chosen].sh_link;
+        if (strtab_idx > 0 && strtab_idx < ehdr.e_shnum
+            && sections[strtab_idx].sh_size > 0
+            && (size_t)snprintf(
+                   src->sym_path, sizeof(src->sym_path), "%s", path)
+                < sizeof(src->sym_path)) {
+            src->symtab_off = sections[chosen].sh_offset;
+            src->symtab_size = sections[chosen].sh_size;
+            src->strtab_off = sections[strtab_idx].sh_offset;
+            src->strtab_size = sections[strtab_idx].sh_size;
+            found = 1;
+        }
+    }
+
+    sentry_free(shdr_buf);
+    close(fd);
+    return found;
+}
+
+/**
+ * Resolve the symbol-table source for a module. If the module's own ELF was
+ * stripped of its `.symtab`, follow the GDB split-debug conventions to find
+ * the debug companion (`<dir>/<debuglink>`, `<dir>/.debug/<debuglink>`,
+ * `/usr/lib/debug/<dir>/<debuglink>`), validated by GNU build-id equality.
+ * Falls back to the module's `.dynsym` when no companion is found.
+ * Returns NULL when the module has no usable symbol table.
+ */
+static const sym_source_t *
+get_sym_source(const sentry_module_info_t *mod, uint32_t mod_idx)
+{
+    // The cache is direct-mapped by module index: within a frozen crash
+    // context each index maps to exactly one module, so a slot is resolved at
+    // most once and reused for every frame in that module. This covers all
+    // modules the context can hold, so no frame is left unsymbolicated for
+    // want of a cache slot.
+    sym_source_t *slot = &g_sym_sources[mod_idx];
+    if (slot->state != 0) {
+        return slot->state > 0 ? slot : NULL;
+    }
+    slot->state = -1;
+
+    // 1) The module's own .symtab (also picks up the .gnu_debuglink name).
+    char debuglink[4096];
+    uint16_t e_type = ET_DYN;
+    if (elf_locate_symtab(
+            mod->name, 0, slot, debuglink, sizeof(debuglink), &e_type)) {
+        slot->e_type = e_type;
+        slot->state = 1;
+        return slot;
+    }
+
+    // 2) The split-debug companion. Candidates are validated by comparing
+    // GNU build-ids; when either file lacks one, the candidate is accepted
+    // as-is (the CRC32 stored in .gnu_debuglink is not verified here).
+    if (debuglink[0]) {
+        uint8_t mod_bid[16];
+        size_t mod_bid_len = extract_elf_build_id_for_module(
+            mod->name, mod_bid, sizeof(mod_bid));
+
+        const char *slash = strrchr(mod->name, '/');
+        int dir_len = slash ? (int)(slash - mod->name) : 0;
+
+        char candidate[SENTRY_CRASH_MAX_PATH];
+        for (int c = 0; slash && c < 3; c++) {
+            int n;
+            switch (c) {
+            case 0:
+                n = snprintf(candidate, sizeof(candidate), "%.*s/%s", dir_len,
+                    mod->name, debuglink);
+                break;
+            case 1:
+                n = snprintf(candidate, sizeof(candidate), "%.*s/.debug/%s",
+                    dir_len, mod->name, debuglink);
+                break;
+            default:
+                n = snprintf(candidate, sizeof(candidate),
+                    "/usr/lib/debug%.*s/%s", dir_len, mod->name, debuglink);
+                break;
+            }
+            if (n < 0 || (size_t)n >= sizeof(candidate)) {
+                continue;
+            }
+
+            // The companion must carry a real .symtab; its .dynsym (if any)
+            // adds nothing over the module's own.
+            if (!elf_locate_symtab(candidate, 0, slot, NULL, 0, NULL)) {
+                continue;
+            }
+
+            uint8_t dbg_bid[16];
+            size_t dbg_bid_len = extract_elf_build_id_for_module(
+                candidate, dbg_bid, sizeof(dbg_bid));
+            if (mod_bid_len && dbg_bid_len
+                && (mod_bid_len != dbg_bid_len
+                    || memcmp(mod_bid, dbg_bid, mod_bid_len) != 0)) {
+                SENTRY_DEBUGF(
+                    "Split-debug candidate %s rejected: build-id mismatch",
+                    candidate);
+                continue;
+            }
+
+            SENTRY_DEBUGF("Using split-debug file %s for module %s", candidate,
+                mod->name);
+            slot->e_type = e_type;
+            slot->state = 1;
+            return slot;
+        }
+    }
+
+    // 3) Fall back to the module's .dynsym.
+    if (elf_locate_symtab(mod->name, 1, slot, NULL, 0, &e_type)) {
+        slot->e_type = e_type;
+        slot->state = 1;
+        return slot;
+    }
+
+    return NULL;
+}
+
+/**
+ * Find the symbol covering `sym_target` in the source's symbol table and
+ * copy its name into `name_out`. The table is scanned in fixed-size chunks
+ * and only the winning name is read from the string table, so large tables
+ * (debug companions of big binaries) are never loaded wholesale. A symbol
+ * only matches when the target lies within [st_value, st_value + st_size):
+ * a nearest-preceding fallback without the size bound would attribute
+ * addresses in symbol-table gaps to unrelated neighboring functions.
+ * Returns 1 when a name was resolved.
+ */
+static int
+sym_source_lookup(const sym_source_t *src, uint64_t sym_target, char *name_out,
+    size_t name_out_size)
+{
+    int fd = open(src->sym_path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+#    if defined(__x86_64__) || defined(__aarch64__)
+    Elf64_Sym chunk[256];
+#    else
+    Elf32_Sym chunk[256];
+#    endif
+
+    uint64_t best_value = 0;
+    uint64_t best_name_off = 0;
+    int have_best = 0;
+
+    uint64_t sym_count = src->symtab_size / sizeof(chunk[0]);
+    for (uint64_t idx = 1; idx < sym_count;) {
+        size_t n = sym_count - idx;
+        if (n > sizeof(chunk) / sizeof(chunk[0])) {
+            n = sizeof(chunk) / sizeof(chunk[0]);
+        }
+        ssize_t want = (ssize_t)(n * sizeof(chunk[0]));
+        if (pread(fd, chunk, (size_t)want,
+                (off_t)(src->symtab_off + idx * sizeof(chunk[0])))
+            != want) {
+            break;
+        }
+
+        for (size_t k = 0; k < n; k++) {
+#    if defined(__x86_64__) || defined(__aarch64__)
+            unsigned char sym_type = ELF64_ST_TYPE(chunk[k].st_info);
+#    else
+            unsigned char sym_type = ELF32_ST_TYPE(chunk[k].st_info);
+#    endif
+            if (sym_type != STT_FUNC && sym_type != STT_NOTYPE) {
+                continue;
+            }
+            if (chunk[k].st_value == 0 || sym_target < chunk[k].st_value
+                || sym_target - chunk[k].st_value >= chunk[k].st_size) {
+                continue;
+            }
+            if ((!have_best || chunk[k].st_value > best_value)
+                && chunk[k].st_name != 0
+                && chunk[k].st_name < src->strtab_size) {
+                best_value = chunk[k].st_value;
+                best_name_off = chunk[k].st_name;
+                have_best = 1;
+            }
+        }
+
+        idx += n;
+    }
+
+    int resolved = 0;
+    if (have_best) {
+        size_t max_read = src->strtab_size - best_name_off;
+        if (max_read > name_out_size - 1) {
+            max_read = name_out_size - 1;
+        }
+        ssize_t got = pread(
+            fd, name_out, max_read, (off_t)(src->strtab_off + best_name_off));
+        if (got > 0) {
+            name_out[got] = '\0';
+            resolved = name_out[0] != '\0';
+        }
+    }
+
+    close(fd);
+    return resolved;
+}
+
+/**
+ * Resolve the symbol name for a given instruction address from the ELF
+ * symbol table of the containing module (or its split-debug companion) and
+ * set the "function" key on the frame value.
+ */
+static void
+enrich_frame_with_symbol(
+    const sentry_crash_context_t *ctx, sentry_value_t frame, uint64_t addr)
+{
+    uint32_t module_count = MIN(ctx->module_count, SENTRY_CRASH_MAX_MODULES);
+    for (uint32_t i = 0; i < module_count; i++) {
+        const sentry_module_info_t *mod = &ctx->modules[i];
+        if (addr < mod->base_address || addr >= mod->base_address + mod->size) {
+            continue;
+        }
+
+        const sym_source_t *src = get_sym_source(mod, i);
+        if (!src) {
+            return;
+        }
+
+        // For ET_DYN (shared libs, PIE) st_value is base-relative; for
+        // ET_EXEC (non-PIE) st_value is an absolute virtual address.
+        uint64_t sym_target
+            = src->e_type == ET_EXEC ? addr : addr - mod->base_address;
+
+        char name[SENTRY_MAX_SYM_NAME];
+        if (sym_source_lookup(src, sym_target, name, sizeof(name))) {
+            sentry_value_set_by_key(
+                frame, "function", sentry_value_new_string(name));
+        }
+        return;
+    }
 }
 
 /**
@@ -1400,7 +1916,8 @@ stack_walk_read_memory(HANDLE hProcess, DWORD64 lpBaseAddress, PVOID lpBuffer,
  */
 static size_t
 walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
-    const CONTEXT *ctx_record, sentry_frame_info_t *frames, size_t max_frames)
+    const CONTEXT *ctx_record, const sentry_crash_context_t *crash_ctx,
+    sentry_frame_info_t *frames, size_t max_frames)
 {
     // Open thread handle for the crashed thread
     HANDLE hThread = OpenThread(
@@ -1414,9 +1931,58 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
     // Set up global handle for read callback
     g_stack_walk_process = hProcess;
 
-    // Initialize dbghelp for the target process
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    if (!SymInitialize(hProcess, NULL, TRUE)) {
+    // Build a dbghelp search path from every loaded module's directory so it
+    // can find each module's PDB next to its DLL and resolve symbols
+    static wchar_t *s_sym_search_path = NULL;
+    static BOOL s_sym_search_path_built = FALSE;
+    if (!s_sym_search_path_built && crash_ctx && crash_ctx->module_count > 0) {
+        s_sym_search_path_built = TRUE;
+        uint32_t module_count
+            = MIN(crash_ctx->module_count, SENTRY_CRASH_MAX_MODULES);
+        sentry_stringbuilder_t sb;
+        sentry__stringbuilder_init(&sb);
+        size_t appended = 0;
+        for (uint32_t mi = 0; mi < module_count; mi++) {
+            const char *path = crash_ctx->modules[mi].name;
+            size_t dir_len = 0;
+            for (size_t k = 0; path[k]; k++) {
+                if (path[k] == '\\' || path[k] == '/') {
+                    dir_len = k;
+                }
+            }
+            if (dir_len == 0) {
+                continue;
+            }
+            // de-duplicate the directory against earlier modules
+            BOOL dup = FALSE;
+            for (uint32_t pj = 0; pj < mi && !dup; pj++) {
+                const char *pp = crash_ctx->modules[pj].name;
+                size_t pj_len = 0;
+                for (size_t k = 0; pp[k]; k++) {
+                    if (pp[k] == '\\' || pp[k] == '/') {
+                        pj_len = k;
+                    }
+                }
+                dup = (pj_len == dir_len && _strnicmp(pp, path, dir_len) == 0);
+            }
+            if (dup) {
+                continue;
+            }
+            if (appended++) {
+                sentry__stringbuilder_append_char(&sb, ';');
+            }
+            sentry__stringbuilder_append_buf(&sb, path, dir_len);
+        }
+        char *path_utf8 = sentry__stringbuilder_into_string(&sb);
+        if (path_utf8 && path_utf8[0]) {
+            s_sym_search_path = sentry__string_to_wstr(path_utf8);
+        }
+        sentry_free(path_utf8);
+    }
+
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
+        | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+    if (!SymInitializeW(hProcess, s_sym_search_path, TRUE)) {
         SENTRY_WARNF("SymInitialize failed: %lu", GetLastError());
         CloseHandle(hThread);
         return 0;
@@ -1931,14 +2497,85 @@ build_stacktrace_from_ctx(const sentry_crash_context_t *ctx)
 }
 
 /**
- * Build native crash event with exception, mechanism, and debug_meta
- *
- * @param ctx Crash context
- * @param event_file_path Path to event file from parent process
+ * Reads one breadcrumb ring file the crashing process appended on its hot path
+ * into a breadcrumb list. Returns null if the file is absent or empty.
  */
 static sentry_value_t
-build_native_crash_event(
-    const sentry_crash_context_t *ctx, const char *event_file_path)
+read_breadcrumb_ring_file(const sentry_path_t *run_folder, const char *name)
+{
+    if (!run_folder) {
+        return sentry_value_new_null();
+    }
+    sentry_path_t *path = sentry__path_join_str(run_folder, name);
+    if (!path) {
+        return sentry_value_new_null();
+    }
+    size_t size = 0;
+    char *buf = sentry__path_read_to_buffer(path, &size);
+    sentry__path_free(path);
+    if (!buf || size == 0) {
+        sentry_free(buf);
+        return sentry_value_new_null();
+    }
+    sentry_value_t list = sentry__value_from_msgpack(buf, size);
+    sentry_free(buf);
+    // `sentry__value_from_msgpack` only builds a list when the file holds 2+
+    // concatenated values; a file with a single breadcrumb decodes to a bare
+    // object. Wrap it so the merge step (which ignores non-lists) keeps it.
+    if (sentry_value_get_type(list) == SENTRY_VALUE_TYPE_OBJECT) {
+        sentry_value_t wrapper = sentry_value_new_list();
+        sentry_value_append(wrapper, list);
+        return wrapper;
+    }
+    return list;
+}
+
+/**
+ * Assembles the crash event's breadcrumbs from the two ring files the crashing
+ * process appended one-at-a-time, merges them in timestamp order, keeps the
+ * newest `max_breadcrumbs`, and attaches them to `event`.
+ * Mirrors the crashpad backend's `report_to_envelope`.
+ */
+static void
+apply_breadcrumbs_from_ring_files(sentry_value_t event,
+    const sentry_path_t *run_folder, const sentry_crash_context_t *ctx)
+{
+    if (ctx && ctx->max_breadcrumbs == 0) {
+        return;
+    }
+
+    sentry_value_t b1
+        = read_breadcrumb_ring_file(run_folder, "__sentry-breadcrumb1");
+    sentry_value_t b2
+        = read_breadcrumb_ring_file(run_folder, "__sentry-breadcrumb2");
+    size_t max = ctx && ctx->max_breadcrumbs ? ctx->max_breadcrumbs
+                                             : SENTRY_BREADCRUMBS_MAX;
+    sentry_value_t merged = sentry__value_merge_breadcrumbs(b1, b2, max);
+    sentry_value_decref(b1);
+    sentry_value_decref(b2);
+    // Overwrite any breadcrumbs the base event may carry: the ring files are
+    // the single source of truth, so this is idempotent and never duplicates.
+    if (sentry_value_get_type(merged) == SENTRY_VALUE_TYPE_LIST) {
+        sentry_value_set_by_key(event, "breadcrumbs", merged);
+    } else {
+        sentry_value_decref(merged);
+    }
+}
+
+/**
+ * Build a native event and set the level, mechanism, and handled state
+ *
+ * @param ctx Crash context
+ * @param event_file_path Path to base event file from parent process
+ * @param run_folder Run directory holding the breadcrumb ring files
+ * @param level Event level (e.g. "fatal")
+ * @param mechanism_type Exception mechanism type (e.g. "signalhandler")
+ * @param handled Whether the mechanism was handled
+ */
+static sentry_value_t
+build_native_event(const sentry_crash_context_t *ctx,
+    const char *event_file_path, const sentry_path_t *run_folder,
+    const char *level, const char *mechanism_type, bool handled)
 {
     // Read base event from parent's file
     sentry_value_t event = sentry_value_new_null();
@@ -1958,14 +2595,17 @@ build_native_crash_event(
 
     if (sentry_value_is_null(event)) {
         event = sentry_value_new_event();
+    } else {
+        sentry__ensure_event_id(event, NULL);
     }
+
+    apply_breadcrumbs_from_ring_files(event, run_folder, ctx);
 
     // Set platform to native
     sentry_value_set_by_key(
         event, "platform", sentry_value_new_string("native"));
 
-    // Set level to fatal
-    sentry_value_set_by_key(event, "level", sentry_value_new_string("fatal"));
+    sentry_value_set_by_key(event, "level", sentry_value_new_string(level));
 
     // Build exception
     const char *signal_name = "UNKNOWN";
@@ -1987,10 +2627,11 @@ build_native_crash_event(
     // Add mechanism
     sentry_value_t mechanism = sentry_value_new_object();
     sentry_value_set_by_key(
-        mechanism, "type", sentry_value_new_string("signalhandler"));
+        mechanism, "type", sentry_value_new_string(mechanism_type));
     sentry_value_set_by_key(
         mechanism, "synthetic", sentry_value_new_bool(true));
-    sentry_value_set_by_key(mechanism, "handled", sentry_value_new_bool(false));
+    sentry_value_set_by_key(
+        mechanism, "handled", sentry_value_new_bool(handled));
 
     // Add signal metadata
     sentry_value_t meta = sentry_value_new_object();
@@ -2035,6 +2676,12 @@ build_native_crash_event(
 
             sentry_value_set_by_key(
                 thread, "id", sentry_value_new_int32((int32_t)tctx->tid));
+
+            // Set thread name if available
+            if (tctx->name[0] != '\0') {
+                sentry_value_set_by_key(
+                    thread, "name", sentry_value_new_string(tctx->name));
+            }
 
             bool is_crashed = (tctx->tid == (uint64_t)ctx->crashed_tid);
             sentry_value_set_by_key(
@@ -2146,11 +2793,12 @@ build_native_crash_event(
     // Add debug_meta with module images from crashed process
     // (ctx->modules[] was captured in the signal handler of the crashed
     // process)
-    SENTRY_DEBUGF("Module count for debug_meta: %u", ctx->module_count);
-    if (ctx->module_count > 0) {
+    uint32_t module_count = MIN(ctx->module_count, SENTRY_CRASH_MAX_MODULES);
+    SENTRY_DEBUGF("Module count for debug_meta: %u", module_count);
+    if (module_count > 0) {
         sentry_value_t images = sentry_value_new_list();
 
-        for (uint32_t i = 0; i < ctx->module_count; i++) {
+        for (uint32_t i = 0; i < module_count; i++) {
             const sentry_module_info_t *mod = &ctx->modules[i];
             sentry_value_t image = sentry_value_new_object();
 
@@ -2268,7 +2916,7 @@ build_native_crash_event(
         sentry_value_set_by_key(debug_meta, "images", images);
         sentry_value_set_by_key(event, "debug_meta", debug_meta);
         SENTRY_DEBUGF("Added %u modules from crashed process to debug_meta",
-            ctx->module_count);
+            module_count);
     } else {
         SENTRY_WARN("No modules captured - debug_meta.images will be empty!");
     }
@@ -2289,10 +2937,12 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
     // Build native crash event (always include threads with names)
     SENTRY_DEBUGF("write_envelope_with_native_stacktrace: minidump_path=%s",
         minidump_path ? minidump_path : "(null)");
-    sentry_value_t event = build_native_crash_event(ctx, event_file_path);
+    sentry_value_t event = build_native_event(
+        ctx, event_file_path, run_folder, "fatal", "signalhandler", false);
 
     // Serialize event to JSON
-    char *event_json = sentry_value_to_json(event);
+    size_t event_size = 0;
+    char *event_json = sentry__value_to_json(event, &event_size);
     char *event_id = sentry__string_clone(
         sentry_value_as_string(sentry_value_get_by_key(event, "event_id")));
     sentry_value_decref(event);
@@ -2302,8 +2952,6 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
         sentry_free(event_id);
         return false;
     }
-
-    size_t event_size = strlen(event_json);
 
     // Open envelope file for writing
 #if defined(SENTRY_PLATFORM_UNIX)
@@ -2327,13 +2975,13 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
         = options && options->dsn ? sentry_options_get_dsn(options) : NULL;
     char header_buf[SENTRY_CRASH_ENVELOPE_HEADER_SIZE];
     int header_len;
-    if (dsn && event_id && event_id[0] != '\0') {
+    if (dsn && !sentry__string_empty(event_id)) {
         header_len = snprintf(header_buf, sizeof(header_buf),
             "{\"dsn\":\"%s\",\"event_id\":\"%s\"}\n", dsn, event_id);
     } else if (dsn) {
         header_len = snprintf(
             header_buf, sizeof(header_buf), "{\"dsn\":\"%s\"}\n", dsn);
-    } else if (event_id && event_id[0] != '\0') {
+    } else if (!sentry__string_empty(event_id)) {
         header_len = snprintf(header_buf, sizeof(header_buf),
             "{\"event_id\":\"%s\"}\n", event_id);
     } else {
@@ -2471,6 +3119,9 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
                             = sentry_value_get_by_key(attach_info, "path");
                         sentry_value_t filename_val
                             = sentry_value_get_by_key(attach_info, "filename");
+                        sentry_value_t attachment_type_val
+                            = sentry_value_get_by_key(
+                                attach_info, "attachment_type");
                         sentry_value_t content_type_val
                             = sentry_value_get_by_key(
                                 attach_info, "content_type");
@@ -2478,13 +3129,15 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
                         const char *path = sentry_value_as_string(path_val);
                         const char *filename
                             = sentry_value_as_string(filename_val);
+                        const char *attachment_type
+                            = sentry_value_as_string(attachment_type_val);
                         const char *content_type
                             = sentry_value_as_string(content_type_val);
 
                         if (path && filename
                             && !attachment_is_placeholder(options, path)) {
-                            write_attachment_to_envelope(
-                                fd, path, filename, content_type);
+                            write_attachment_to_envelope(fd, path, filename,
+                                attachment_type, content_type);
                         }
                     }
                     sentry_value_decref(attach_list);
@@ -2499,8 +3152,19 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
             = sentry__path_join_str(run_folder, "screenshot.png");
         if (screenshot_path) {
             write_attachment_to_envelope(
-                fd, screenshot_path->path, "screenshot.png", "image/png");
+                fd, screenshot_path->path, "screenshot.png", NULL, "image/png");
             sentry__path_free(screenshot_path);
+        }
+    }
+
+    // Add session replay attachment if captured by the daemon
+    if (ctx->attach_session_replay && run_folder) {
+        sentry_path_t *replay_path
+            = sentry__path_join_str(run_folder, "session-replay.mp4");
+        if (replay_path) {
+            write_attachment_to_envelope(
+                fd, replay_path->path, "session-replay.mp4", NULL, "video/mp4");
+            sentry__path_free(replay_path);
         }
     }
 
@@ -2523,21 +3187,43 @@ write_envelope_with_minidump(const sentry_options_t *options,
     const char *event_msgpack_path, const char *minidump_path,
     sentry_path_t *run_folder)
 {
-    // Read event JSON data
+    // Read the base event, merge in the breadcrumbs from the ring files,
+    // re-serialize.
     size_t event_size = 0;
     char *event_json = NULL;
     char *event_id = NULL;
     sentry_path_t *ev_path = sentry__path_from_str(event_msgpack_path);
     if (ev_path) {
-        event_json = sentry__path_read_to_buffer(ev_path, &event_size);
+        size_t base_size = 0;
+        char *base_json = sentry__path_read_to_buffer(ev_path, &base_size);
         sentry__path_free(ev_path);
-        if (event_json && event_size > 0) {
+        if (base_json && base_size > 0) {
             sentry_value_t event
-                = sentry__value_from_json(event_json, event_size);
-            event_id = sentry__string_clone(sentry_value_as_string(
-                sentry_value_get_by_key(event, "event_id")));
-            sentry_value_decref(event);
+                = sentry__value_from_json(base_json, base_size);
+            if (sentry_value_is_null(event)) {
+                // Parsing the base event failed (e.g. truncated buffer or
+                // OOM). Don't serialize the null into "null" and ship an
+                // invalid payload - fall back to streaming the raw event
+                // bytes verbatim so the crash report is preserved.
+                sentry_value_decref(event);
+                event_json = sentry__string_clone_n(base_json, base_size);
+                event_size = event_json ? base_size : 0;
+            } else {
+                apply_breadcrumbs_from_ring_files(event, run_folder, ctx);
+                event_id = sentry__string_clone(sentry_value_as_string(
+                    sentry_value_get_by_key(event, "event_id")));
+                event_json = sentry__value_to_json(event, &event_size);
+                sentry_value_decref(event);
+                if (!event_json) {
+                    // Re-serialization failed (e.g. OOM). Fall back to the raw
+                    // event bytes so the crash report is preserved, losing only
+                    // the merged breadcrumbs rather than the whole event.
+                    event_json = sentry__string_clone_n(base_json, base_size);
+                    event_size = event_json ? base_size : 0;
+                }
+            }
         }
+        sentry_free(base_json);
     }
 
     // Open envelope file for writing
@@ -2563,13 +3249,13 @@ write_envelope_with_minidump(const sentry_options_t *options,
         = options && options->dsn ? sentry_options_get_dsn(options) : NULL;
     char header_buf[SENTRY_CRASH_ENVELOPE_HEADER_SIZE];
     int header_len;
-    if (dsn && event_id && event_id[0] != '\0') {
+    if (dsn && !sentry__string_empty(event_id)) {
         header_len = snprintf(header_buf, sizeof(header_buf),
             "{\"dsn\":\"%s\",\"event_id\":\"%s\"}\n", dsn, event_id);
     } else if (dsn) {
         header_len = snprintf(
             header_buf, sizeof(header_buf), "{\"dsn\":\"%s\"}\n", dsn);
-    } else if (event_id && event_id[0] != '\0') {
+    } else if (!sentry__string_empty(event_id)) {
         header_len = snprintf(header_buf, sizeof(header_buf),
             "{\"event_id\":\"%s\"}\n", event_id);
     } else {
@@ -2707,6 +3393,9 @@ write_envelope_with_minidump(const sentry_options_t *options,
                             = sentry_value_get_by_key(attach_info, "path");
                         sentry_value_t filename_val
                             = sentry_value_get_by_key(attach_info, "filename");
+                        sentry_value_t attachment_type_val
+                            = sentry_value_get_by_key(
+                                attach_info, "attachment_type");
                         sentry_value_t content_type_val
                             = sentry_value_get_by_key(
                                 attach_info, "content_type");
@@ -2714,13 +3403,15 @@ write_envelope_with_minidump(const sentry_options_t *options,
                         const char *path = sentry_value_as_string(path_val);
                         const char *filename
                             = sentry_value_as_string(filename_val);
+                        const char *attachment_type
+                            = sentry_value_as_string(attachment_type_val);
                         const char *content_type
                             = sentry_value_as_string(content_type_val);
 
                         if (path && filename
                             && !attachment_is_placeholder(options, path)) {
-                            write_attachment_to_envelope(
-                                fd, path, filename, content_type);
+                            write_attachment_to_envelope(fd, path, filename,
+                                attachment_type, content_type);
                         }
                     }
                     sentry_value_decref(attach_list);
@@ -2735,8 +3426,19 @@ write_envelope_with_minidump(const sentry_options_t *options,
             = sentry__path_join_str(run_folder, "screenshot.png");
         if (screenshot_path) {
             write_attachment_to_envelope(
-                fd, screenshot_path->path, "screenshot.png", "image/png");
+                fd, screenshot_path->path, "screenshot.png", NULL, "image/png");
             sentry__path_free(screenshot_path);
+        }
+    }
+
+    // Add session replay attachment if captured by the daemon
+    if (ctx->attach_session_replay && run_folder) {
+        sentry_path_t *replay_path
+            = sentry__path_join_str(run_folder, "session-replay.mp4");
+        if (replay_path) {
+            write_attachment_to_envelope(
+                fd, replay_path->path, "session-replay.mp4", NULL, "video/mp4");
+            sentry__path_free(replay_path);
         }
     }
 
@@ -2755,10 +3457,11 @@ write_envelope_with_minidump(const sentry_options_t *options,
  *
  * Called by the crash daemon (out-of-process on Linux/macOS).
  */
-void
+bool
 sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 {
     SENTRY_DEBUG("Processing crash - START");
+    bool crash_captured = false;
 
     sentry_crash_context_t *ctx = ipc->shmem;
 
@@ -2861,8 +3564,6 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
     SENTRY_DEBUG("Extracting run folder from event path");
     sentry_path_t *ev_path = sentry__path_from_str(event_path);
     sentry_path_t *run_folder = ev_path ? sentry__path_dir(ev_path) : NULL;
-    if (ev_path)
-        sentry__path_free(ev_path);
 
     // Acquire the run directory lock file so that process_old_runs() in a
     // new SDK run will skip this directory while the daemon is still
@@ -2890,6 +3591,7 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 
     if (path_len < 0 || path_len >= (int)sizeof(envelope_path)) {
         SENTRY_WARN("Envelope path truncated or invalid");
+        sentry__path_free(ev_path);
         if (run_folder) {
             sentry__path_free(run_folder);
         }
@@ -2905,7 +3607,7 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
     // Capture screenshot if enabled (Windows only)
     // This is done in the daemon process (out-of-process) because
     // screenshot capture is NOT signal-safe (uses LoadLibrary, GDI+, etc.)
-#if defined(SENTRY_PLATFORM_WINDOWS)
+#if !defined(SENTRY_SCREENSHOT_NONE)
     if (ctx->attach_screenshot && run_folder) {
         SENTRY_DEBUG("Capturing screenshot");
         sentry_path_t *screenshot_path
@@ -2920,6 +3622,23 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
                 SENTRY_DEBUG("Screenshot capture failed");
             }
             sentry__path_free(screenshot_path);
+        }
+    }
+
+    // Capture session replay if enabled. Like screenshot, this runs
+    // out-of-process because the underlying OS APIs are not signal-safe.
+    if (ctx->attach_session_replay && run_folder) {
+        SENTRY_DEBUG("Capturing session replay");
+        sentry_path_t *replay_path
+            = sentry__path_join_str(run_folder, "session-replay.mp4");
+        if (replay_path) {
+            if (sentry__session_replay_capture(replay_path,
+                    ctx->session_replay_duration, (uint32_t)ctx->crashed_pid)) {
+                SENTRY_DEBUG("Session replay captured successfully");
+            } else {
+                SENTRY_DEBUG("Session replay capture failed");
+            }
+            sentry__path_free(replay_path);
         }
     }
 #endif
@@ -2976,6 +3695,7 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 
     if (!envelope_written) {
         SENTRY_WARN("Failed to write envelope");
+        sentry__path_free(ev_path);
         if (run_folder) {
             sentry__path_free(run_folder);
         }
@@ -3036,6 +3756,11 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 
     SENTRY_DEBUG("Envelope loaded, capturing");
 
+    if (options->cache_keep && options->external_crash_reporter
+        && !sentry__envelope_materialize(envelope)) {
+        SENTRY_WARN("Failed to materialize envelope for external crash report");
+    }
+
     // Capture directly, or pass to external crash reporter
     if (!sentry__launch_external_crash_reporter(options, envelope)) {
         if (has_attachment_refs && options && options->run) {
@@ -3047,11 +3772,14 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
         if (options && options->transport && options->run) {
             SENTRY_DEBUG("Capturing crash envelope");
             sentry__capture_envelope(options->transport, envelope, options);
+            crash_captured = true;
             SENTRY_DEBUG("Crash envelope captured (queued)");
         } else {
             SENTRY_WARN("No transport available for sending envelope");
             sentry_envelope_free(envelope);
         }
+    } else {
+        crash_captured = true;
     }
 
     // Clean up temporary envelope file (keep minidump for
@@ -3067,6 +3795,28 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 #endif
 
 cleanup:
+    // Send the staged session-replay envelope same-session, enriched from the
+    // crash event (`<run>/__sentry-event`) so it shares the crash's
+    // tags/contexts/trace. Only flush when the crash itself was delivered:
+    // `cleanup` is also reached via `goto` on error paths where the crash was
+    // never captured, and flushing there would consume (and delete) the staged
+    // replay for a crash that never arrived.
+    if (crash_captured && options && options->transport
+        && sentry__session_replay_has_pending(options)) {
+        sentry_value_t crash_event = sentry_value_new_null();
+        if (ev_path) {
+            size_t ev_len = 0;
+            char *ev_json = sentry__path_read_to_buffer(ev_path, &ev_len);
+            if (ev_json) {
+                crash_event = sentry__value_from_json(ev_json, ev_len);
+                sentry_free(ev_json);
+            }
+        }
+        sentry__session_replay_flush_pending(
+            options, options->transport, crash_event);
+        sentry_value_decref(crash_event);
+    }
+
     // Send all other envelopes from run folder (logs, etc.) before cleanup
     if (run_folder && options && options->transport && options->run) {
         SENTRY_DEBUG("Checking for additional envelopes in run folder");
@@ -3109,6 +3859,7 @@ cleanup:
         sentry__path_remove_all(run_folder);
         sentry__path_free(run_folder);
     }
+    sentry__path_free(ev_path);
 
     // Release and clean up the lock file
     if (run_lock) {
@@ -3122,6 +3873,7 @@ cleanup:
 done:
     SENTRY_DEBUG("Processing crash - END");
     SENTRY_DEBUG("Crash processing complete");
+    return crash_captured;
 }
 
 /**
@@ -3289,10 +4041,13 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // Use debug logging and screenshot settings from parent process
     sentry_options_set_debug(options, ipc->shmem->debug_enabled);
     options->attach_screenshot = ipc->shmem->attach_screenshot;
-    options->cache_keep = ipc->shmem->cache_keep;
+    options->attach_session_replay = ipc->shmem->attach_session_replay;
+    options->session_replay_duration = ipc->shmem->session_replay_duration;
+    options->cache_keep = (sentry_cache_keep_t)ipc->shmem->cache_keep;
     options->enable_large_attachments = ipc->shmem->enable_large_attachments;
     options->http_retry = false;
     options->shutdown_timeout = ipc->shmem->shutdown_timeout;
+    options->transfer_timeout = ipc->shmem->transfer_timeout;
 
     // Set custom logger that writes to file
     if (log_file) {
@@ -3351,6 +4106,10 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     if (options->transport) {
         SENTRY_DEBUG("Starting transport");
         sentry__transport_startup(options->transport, options);
+        // Set http_retry after transport startup to keep daemon-side retry
+        // polling disabled, while letting capture cache consent-revoked
+        // envelopes in retry format for the app to send on restart.
+        options->http_retry = ipc->shmem->http_retry;
     } else {
         SENTRY_WARN("No transport available");
     }
@@ -3402,8 +4161,20 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
             long state = sentry__atomic_fetch(&ipc->shmem->state);
             if (state == SENTRY_CRASH_STATE_CRASHED && !crash_processed) {
                 SENTRY_DEBUG("Crash notification received, processing");
-                sentry__process_crash(options, ipc);
+                bool crash_captured = sentry__process_crash(options, ipc);
                 crash_processed = true;
+
+                if (crash_captured
+                    && ipc->shmem->crash_upload_mode
+                        == SENTRY_CRASH_UPLOAD_MODE_ASYNC) {
+                    // Crash data is durable after processing returns;
+                    // remaining daemon work does not require the crashed
+                    // process.
+                    SENTRY_DEBUG(
+                        "Crash captured, allowing app process to exit");
+                    sentry__atomic_store(
+                        &ipc->shmem->state, SENTRY_CRASH_STATE_CAPTURED);
+                }
 
                 // After processing crash, exit regardless of parent state
                 // (parent has likely already exited after re-raising signal)
@@ -3483,7 +4254,7 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
 
     // Resolve daemon path
     char daemon_path[SENTRY_CRASH_MAX_PATH];
-    if (handler_path && handler_path[0] != '\0') {
+    if (!sentry__string_empty(handler_path)) {
         strncpy(daemon_path, handler_path, sizeof(daemon_path) - 1);
         daemon_path[sizeof(daemon_path) - 1] = '\0';
     } else {
@@ -3592,7 +4363,7 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         char *argv[]
             = { "sentry-crash", pid_str, tid_str, notify_str, ready_str, NULL };
 
-        if (handler_path && handler_path[0] != '\0') {
+        if (!sentry__string_empty(handler_path)) {
             execv(handler_path, argv);
         } else {
             char exe_path[SENTRY_CRASH_MAX_PATH];
@@ -3630,7 +4401,7 @@ sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     wchar_t daemon_path_w[SENTRY_CRASH_MAX_PATH];
 
     // If handler_path was explicitly set via options, use it directly
-    if (handler_path && handler_path[0] != '\0') {
+    if (!sentry__string_empty(handler_path)) {
         wchar_t *wpath = sentry__string_to_wstr(handler_path);
         if (wpath) {
             wcsncpy(daemon_path_w, wpath, SENTRY_CRASH_MAX_PATH - 1);

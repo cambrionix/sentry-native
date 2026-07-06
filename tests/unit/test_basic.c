@@ -1,3 +1,5 @@
+#include "sentry_alloc.h"
+#include "sentry_backend.h"
 #include "sentry_core.h"
 #include "sentry_database.h"
 #include "sentry_options.h"
@@ -273,6 +275,32 @@ SENTRY_TEST(capture_minidump_basic)
 #endif
 }
 
+SENTRY_TEST(capture_minidump_wide)
+{
+#if !defined(SENTRY_PLATFORM_WINDOWS) || defined(SENTRY_PLATFORM_XBOX)
+    SKIP_TEST();
+#else
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_init(options);
+
+    const wchar_t *minidump_rel_path = L"../fixtures/minidump.dmp";
+    sentry_path_t *path = sentry__path_from_str(__FILE__);
+    sentry_path_t *dir = sentry__path_dir(path);
+    sentry_path_t *minidump_path
+        = sentry__path_join_wstr(dir, minidump_rel_path);
+
+    const sentry_uuid_t event_id
+        = sentry_capture_minidumpw(minidump_path->path_w);
+    TEST_CHECK(!sentry_uuid_is_nil(&event_id));
+
+    sentry__path_free(minidump_path);
+    sentry__path_free(dir);
+    sentry__path_free(path);
+
+    sentry_close();
+#endif
+}
+
 SENTRY_TEST(capture_minidump_null_path)
 {
     // a NULL path will activate the path check at the beginning of the function
@@ -378,4 +406,77 @@ SENTRY_TEST(basic_transport_thread_name)
     }
 
     sentry_close();
+}
+
+SENTRY_TEST(installation_id)
+{
+    // no DSN -> installation ID is generated
+    SENTRY_TEST_OPTIONS_NEW(opts0);
+    sentry_init(opts0);
+    SENTRY_WITH_OPTIONS (options) {
+        TEST_ASSERT(!!options->run->installation_id);
+        TEST_CHECK_INT_EQUAL(strlen(options->run->installation_id), 36);
+    }
+    sentry_close();
+
+    // DSN A -> installation ID is generated
+    SENTRY_TEST_OPTIONS_NEW(opts1);
+    sentry_options_set_dsn(opts1, "http://keya@127.0.0.1/42");
+    sentry_init(opts1);
+    char *id_a = NULL;
+    SENTRY_WITH_OPTIONS (options) {
+        TEST_ASSERT(!!options->run->installation_id);
+        TEST_CHECK_INT_EQUAL(strlen(options->run->installation_id), 36);
+        id_a = sentry__string_clone(options->run->installation_id);
+    }
+    sentry_close();
+
+    // same DSN A -> installation ID persists
+    SENTRY_TEST_OPTIONS_NEW(opts2);
+    sentry_options_set_dsn(opts2, "http://keya@127.0.0.1/42");
+    sentry_init(opts2);
+    SENTRY_WITH_OPTIONS (options) {
+        TEST_ASSERT(!!options->run->installation_id);
+        TEST_CHECK_STRING_EQUAL(options->run->installation_id, id_a);
+    }
+    sentry_close();
+
+    // different DSN B -> installation ID rotates
+    SENTRY_TEST_OPTIONS_NEW(opts3);
+    sentry_options_set_dsn(opts3, "http://keyb@127.0.0.1/42");
+    sentry_init(opts3);
+    SENTRY_WITH_OPTIONS (options) {
+        TEST_ASSERT(!!options->run->installation_id);
+        TEST_CHECK(strcmp(options->run->installation_id, id_a) != 0);
+    }
+    sentry_close();
+
+    sentry_free(id_a);
+}
+
+static void
+backend_free_options_ref(sentry_backend_t *backend)
+{
+    const sentry_options_t **options_ref = backend->data;
+    *options_ref = sentry__options_getref();
+}
+
+SENTRY_TEST(clear_options)
+{
+    const sentry_options_t *options_ref = NULL;
+
+    SENTRY_TEST_OPTIONS_NEW(options);
+
+    sentry_backend_t *backend = SENTRY_MAKE(sentry_backend_t);
+    TEST_ASSERT(!!backend);
+    backend->free_func = backend_free_options_ref;
+    backend->data = &options_ref;
+    sentry_options_set_backend(options, backend);
+
+    sentry_init(options);
+    sentry_close();
+
+    // The backend free hook runs from sentry_options_free(). At that point,
+    // sentry__options_getref() must no longer expose the options.
+    TEST_CHECK(options_ref == NULL);
 }

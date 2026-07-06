@@ -1,5 +1,6 @@
 #include "sentry_options.h"
 #include "sentry_alloc.h"
+#include "sentry_app_hang_monitor.h"
 #include "sentry_attachment.h"
 #include "sentry_backend.h"
 #include "sentry_database.h"
@@ -9,7 +10,21 @@
 #include "sentry_sync.h"
 #include "sentry_transport.h"
 #include "sentry_utils.h"
+#include <math.h>
 #include <stdlib.h>
+
+static double
+normalize_sample_rate(double sample_rate, double default_value)
+{
+    if (isnan(sample_rate)) {
+        return default_value;
+    } else if (sample_rate < 0.0) {
+        return 0.0;
+    } else if (sample_rate > 1.0) {
+        return 1.0;
+    }
+    return sample_rate;
+}
 
 sentry_options_t *
 sentry_options_new(void)
@@ -48,6 +63,8 @@ sentry_options_new(void)
     opts->auto_session_tracking = true;
     opts->system_crash_reporter_enabled = false;
     opts->attach_screenshot = false;
+    opts->attach_session_replay = false;
+    opts->session_replay_duration = 5000;
     opts->crashpad_wait_for_upload = false;
     // On macOS, breakpad suspends all other threads of the process before
     // writing the minidump and invokes our backend callback from inside
@@ -63,10 +80,11 @@ sentry_options_new(void)
     opts->enable_logging_when_crashed = true;
 #endif
     opts->propagate_traceparent = false;
+    opts->strict_trace_continuation = false;
     opts->crashpad_limit_stack_capture_to_sp = false;
     opts->enable_metrics = true;
     opts->enable_logs = true;
-    opts->cache_keep = false;
+    opts->cache_keep = SENTRY_CACHE_KEEP_NONE;
     opts->cache_max_age = 0;
     opts->cache_max_size = 0;
     opts->cache_max_items = 30;
@@ -84,6 +102,7 @@ sentry_options_new(void)
     opts->transport = sentry__transport_new_default();
     opts->refcount = 1;
     opts->shutdown_timeout = SENTRY_DEFAULT_SHUTDOWN_TIMEOUT;
+    opts->transfer_timeout = SENTRY_DEFAULT_TRANSFER_TIMEOUT;
     sentry_options_set_sample_rate(
         opts, sentry__getenv_double("SENTRY_SAMPLE_RATE", 1.0));
     sentry_options_set_traces_sample_rate(
@@ -94,6 +113,9 @@ sentry_options_new(void)
     opts->crash_reporting_mode
         = SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP; // Default: best of
                                                             // both worlds
+    opts->crash_upload_mode = SENTRY_CRASH_UPLOAD_MODE_SYNC;
+    opts->enable_app_hang_tracking = false;
+    opts->app_hang_timeout = 5000;
     opts->http_retry = false;
     opts->send_client_reports = true;
     opts->enable_large_attachments = false;
@@ -124,6 +146,7 @@ sentry_options_free(sentry_options_t *opts)
     sentry_free(opts->dist);
     sentry_free(opts->proxy);
     sentry_free(opts->ca_certs);
+    sentry_free(opts->org_id);
     sentry_free(opts->transport_thread_name);
     sentry__path_free(opts->database_path);
     sentry__path_free(opts->handler_path);
@@ -221,14 +244,36 @@ sentry_options_get_dsn(const sentry_options_t *opts)
 }
 
 void
+sentry_options_set_org_id_n(
+    sentry_options_t *opts, const char *org_id, size_t org_id_len)
+{
+    sentry_free(opts->org_id);
+    opts->org_id = sentry__string_clone_n(org_id, org_id_len);
+}
+
+void
+sentry_options_set_org_id(sentry_options_t *opts, const char *org_id)
+{
+    sentry_free(opts->org_id);
+    opts->org_id = sentry__string_clone(org_id);
+}
+
+const char *
+sentry__options_get_org_id(const sentry_options_t *opts)
+{
+    if (opts->org_id && *opts->org_id) {
+        return opts->org_id;
+    }
+    if (opts->dsn && opts->dsn->org_id && *opts->dsn->org_id) {
+        return opts->dsn->org_id;
+    }
+    return NULL;
+}
+
+void
 sentry_options_set_sample_rate(sentry_options_t *opts, double sample_rate)
 {
-    if (sample_rate < 0.0) {
-        sample_rate = 0.0;
-    } else if (sample_rate > 1.0) {
-        sample_rate = 1.0;
-    }
-    opts->sample_rate = sample_rate;
+    opts->sample_rate = normalize_sample_rate(sample_rate, 1.0);
 }
 
 double
@@ -510,9 +555,14 @@ sentry_options_get_symbolize_stacktraces(const sentry_options_t *opts)
 }
 
 void
-sentry_options_set_cache_keep(sentry_options_t *opts, int enabled)
+sentry_options_set_cache_keep(sentry_options_t *opts, int mode)
 {
-    opts->cache_keep = !!enabled;
+    if (mode < SENTRY_CACHE_KEEP_NONE) {
+        mode = SENTRY_CACHE_KEEP_OFFLINE;
+    } else if (mode > SENTRY_CACHE_KEEP_ALWAYS) {
+        mode = SENTRY_CACHE_KEEP_ALWAYS;
+    }
+    opts->cache_keep = (sentry_cache_keep_t)mode;
 }
 
 void
@@ -580,6 +630,25 @@ sentry_options_get_crash_reporting_mode(const sentry_options_t *opts)
 }
 
 void
+sentry_options_set_crash_upload_mode(
+    sentry_options_t *opts, sentry_crash_upload_mode_t mode)
+{
+    int imode = (int)mode;
+    if (imode < SENTRY_CRASH_UPLOAD_MODE_SYNC) {
+        imode = SENTRY_CRASH_UPLOAD_MODE_SYNC;
+    } else if (imode > SENTRY_CRASH_UPLOAD_MODE_ASYNC) {
+        imode = SENTRY_CRASH_UPLOAD_MODE_ASYNC;
+    }
+    opts->crash_upload_mode = imode;
+}
+
+sentry_crash_upload_mode_t
+sentry_options_get_crash_upload_mode(const sentry_options_t *opts)
+{
+    return (sentry_crash_upload_mode_t)opts->crash_upload_mode;
+}
+
+void
 sentry_options_set_crashpad_wait_for_upload(
     sentry_options_t *opts, int wait_for_upload)
 {
@@ -607,10 +676,23 @@ sentry_options_get_shutdown_timeout(sentry_options_t *opts)
 }
 
 void
+sentry_options_set_transfer_timeout(
+    sentry_options_t *opts, uint64_t transfer_timeout)
+{
+    opts->transfer_timeout = transfer_timeout;
+}
+
+uint64_t
+sentry_options_get_transfer_timeout(sentry_options_t *opts)
+{
+    return opts->transfer_timeout;
+}
+
+void
 sentry_options_add_attachment(sentry_options_t *opts, const char *path)
 {
     sentry__attachments_add_path(
-        &opts->attachments, sentry__path_from_str(path), ATTACHMENT, NULL);
+        &opts->attachments, sentry__path_from_str(path), NULL, NULL);
 }
 
 void
@@ -618,14 +700,15 @@ sentry_options_add_attachment_n(
     sentry_options_t *opts, const char *path, size_t path_len)
 {
     sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str_n(path, path_len), ATTACHMENT, NULL);
+        sentry__path_from_str_n(path, path_len), NULL, NULL);
 }
 
 void
 sentry_options_add_view_hierarchy(sentry_options_t *opts, const char *path)
 {
     sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str(path), VIEW_HIERARCHY, "application/json");
+        sentry__path_from_str(path), SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY,
+        "application/json");
 }
 
 void
@@ -633,8 +716,8 @@ sentry_options_add_view_hierarchy_n(
     sentry_options_t *opts, const char *path, size_t path_len)
 {
     sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str_n(path, path_len), VIEW_HIERARCHY,
-        "application/json");
+        sentry__path_from_str_n(path, path_len),
+        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
 }
 
 void
@@ -649,6 +732,19 @@ sentry_options_set_before_screenshot(sentry_options_t *opts,
 {
     opts->before_screenshot_func = func;
     opts->before_screenshot_data = user_data;
+}
+
+void
+sentry_options_set_attach_session_replay(sentry_options_t *opts, int val)
+{
+    opts->attach_session_replay = !!val;
+}
+
+void
+sentry_options_set_session_replay_duration(
+    sentry_options_t *opts, uint32_t duration_ms)
+{
+    opts->session_replay_duration = duration_ms;
 }
 
 void
@@ -703,7 +799,7 @@ sentry_options_add_attachmentw_n(
     sentry_options_t *opts, const wchar_t *path, size_t path_len)
 {
     sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_wstr_n(path, path_len), ATTACHMENT, NULL);
+        sentry__path_from_wstr_n(path, path_len), NULL, NULL);
 }
 
 void
@@ -717,15 +813,18 @@ void
 sentry_options_add_view_hierarchyw(sentry_options_t *opts, const wchar_t *path)
 {
     size_t path_len = path ? wcslen(path) : 0;
-    sentry_options_add_view_hierarchyw_n(opts, path, path_len);
+    sentry__attachments_add_path(&opts->attachments,
+        sentry__path_from_wstr_n(path, path_len),
+        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
 }
+
 void
 sentry_options_add_view_hierarchyw_n(
     sentry_options_t *opts, const wchar_t *path, size_t path_len)
 {
     sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_wstr_n(path, path_len), VIEW_HIERARCHY,
-        "application/json");
+        sentry__path_from_wstr_n(path, path_len),
+        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
 }
 
 void
@@ -804,13 +903,7 @@ void
 sentry_options_set_traces_sample_rate(
     sentry_options_t *opts, double sample_rate)
 {
-
-    if (sample_rate < 0.0) {
-        sample_rate = 0.0;
-    } else if (sample_rate > 1.0) {
-        sample_rate = 1.0;
-    }
-    opts->traces_sample_rate = sample_rate;
+    opts->traces_sample_rate = normalize_sample_rate(sample_rate, 0.0);
 }
 
 /**
@@ -875,6 +968,39 @@ sentry_options_get_enable_metrics(const sentry_options_t *opts)
 }
 
 void
+sentry_options_set_enable_app_hang_tracking(sentry_options_t *opts, int enable)
+{
+    opts->enable_app_hang_tracking = !!enable;
+}
+
+int
+sentry_options_get_enable_app_hang_tracking(const sentry_options_t *opts)
+{
+    return opts->enable_app_hang_tracking;
+}
+
+void
+sentry_options_set_app_hang_timeout(
+    sentry_options_t *opts, uint64_t app_hang_timeout)
+{
+    // Clamp up to the smallest timeout the watchdog can resolve (see
+    // SENTRY_APP_HANG_MIN_TIMEOUT_MS).
+    if (app_hang_timeout < SENTRY_APP_HANG_MIN_TIMEOUT_MS) {
+        SENTRY_WARNF("app-hang: `app_hang_timeout` of %" PRIu64
+                     "ms is below the minimum of %dms, clamping",
+            app_hang_timeout, SENTRY_APP_HANG_MIN_TIMEOUT_MS);
+        app_hang_timeout = SENTRY_APP_HANG_MIN_TIMEOUT_MS;
+    }
+    opts->app_hang_timeout = app_hang_timeout;
+}
+
+uint64_t
+sentry_options_get_app_hang_timeout(const sentry_options_t *opts)
+{
+    return opts->app_hang_timeout;
+}
+
+void
 sentry_options_set_enable_large_attachments(
     sentry_options_t *opts, int enable_large_attachments)
 {
@@ -935,6 +1061,19 @@ int
 sentry_options_get_propagate_traceparent(const sentry_options_t *opts)
 {
     return opts->propagate_traceparent;
+}
+
+void
+sentry_options_set_strict_trace_continuation(
+    sentry_options_t *opts, int strict_trace_continuation)
+{
+    opts->strict_trace_continuation = !!strict_trace_continuation;
+}
+
+int
+sentry_options_get_strict_trace_continuation(const sentry_options_t *opts)
+{
+    return opts->strict_trace_continuation;
 }
 
 void

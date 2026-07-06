@@ -10,9 +10,11 @@
 
 #include "sentry_random.h"
 
+#include <ctype.h>
 #include <locale.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -435,6 +437,37 @@ sentry__dsn_get_minidump_url(const sentry_dsn_t *dsn, const char *user_agent)
 }
 
 char *
+sentry__base64_encode(const char *data, size_t len)
+{
+    static const char b64[]
+        = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t output_len = 4 * ((len + 2) / 3);
+    char *out = sentry_malloc(output_len + 1);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t i, j;
+    for (i = 0, j = 0; i < len; i += 3) {
+        uint32_t triple = (uint32_t)(unsigned char)data[i] << 16;
+        if (i + 1 < len) {
+            triple |= (uint32_t)(unsigned char)data[i + 1] << 8;
+        }
+        if (i + 2 < len) {
+            triple |= (uint32_t)(unsigned char)data[i + 2];
+        }
+
+        out[j++] = b64[(triple >> 18) & 0x3F];
+        out[j++] = b64[(triple >> 12) & 0x3F];
+        out[j++] = i + 1 < len ? b64[(triple >> 6) & 0x3F] : '=';
+        out[j++] = i + 2 < len ? b64[triple & 0x3F] : '=';
+    }
+
+    out[j] = '\0';
+    return out;
+}
+
+char *
 sentry__usec_time_to_iso8601(uint64_t time)
 {
     char buf[64];
@@ -661,4 +694,59 @@ sentry__generate_sample_rand(sentry_value_t context)
     } while (sample_rand == 1.0); // re-roll when generating 1.0
     sentry_value_set_by_key(
         context, "sample_rand", sentry_value_new_double(sample_rand));
+}
+
+bool
+sentry__baggage_iter_next(
+    sentry_slice_t *remaining, sentry_slice_t *key, sentry_slice_t *value)
+{
+    while (remaining->len > 0) {
+        size_t comma = sentry__slice_find(*remaining, ',');
+        sentry_slice_t member;
+        if (comma == (size_t)-1) {
+            member = *remaining;
+            *remaining = sentry__slice_advance(*remaining, remaining->len);
+        } else {
+            member = (sentry_slice_t) { remaining->ptr, comma };
+            *remaining = sentry__slice_advance(*remaining, comma + 1);
+        }
+        member = sentry__slice_trim(member);
+
+        size_t eq = sentry__slice_find(member, '=');
+        if (eq == (size_t)-1) {
+            continue;
+        }
+        sentry_slice_t k
+            = sentry__slice_trim((sentry_slice_t) { member.ptr, eq });
+        if (k.len == 0) {
+            continue;
+        }
+        sentry_slice_t v = { member.ptr + eq + 1, member.len - eq - 1 };
+        size_t semi = sentry__slice_find(v, ';');
+        if (semi != (size_t)-1) {
+            v.len = semi;
+        }
+        *key = k;
+        *value = sentry__slice_trim(v);
+        return true;
+    }
+    return false;
+}
+
+size_t
+sentry__percent_decode_inplace(char *s, size_t len)
+{
+    size_t r = 0;
+    size_t w = 0;
+    while (r < len) {
+        if (s[r] == '%' && r + 2 < len && isxdigit((unsigned char)s[r + 1])
+            && isxdigit((unsigned char)s[r + 2])) {
+            char hex[3] = { s[r + 1], s[r + 2], '\0' };
+            s[w++] = (char)strtol(hex, NULL, 16);
+            r += 3;
+        } else {
+            s[w++] = s[r++];
+        }
+    }
+    return w;
 }

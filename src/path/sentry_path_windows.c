@@ -351,6 +351,18 @@ sentry__path_is_file(const sentry_path_t *path)
     return _wstat(path_w, &buf) == 0 && S_ISREG(buf.st_mode);
 }
 
+bool
+sentry__path_is_symlink(const sentry_path_t *path)
+{
+    wchar_t *path_w = path->path_w;
+    if (!path_w) {
+        return false;
+    }
+    const DWORD attributes = GetFileAttributesW(path_w);
+    return attributes != INVALID_FILE_ATTRIBUTES
+        && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+}
+
 size_t
 sentry__path_get_size(const sentry_path_t *path)
 {
@@ -750,6 +762,8 @@ sentry__path_append_buffer(
 struct sentry_filewriter_s {
     size_t byte_count;
     FILE *f;
+    bool failed;
+    bool closed;
 };
 
 MUST_USE sentry_filewriter_t *
@@ -772,6 +786,8 @@ sentry__filewriter_new(const sentry_path_t *path)
 
     result->f = f;
     result->byte_count = 0;
+    result->failed = false;
+    result->closed = false;
     return result;
 }
 
@@ -779,23 +795,51 @@ size_t
 sentry__filewriter_write(
     sentry_filewriter_t *filewriter, const char *buf, size_t buf_len)
 {
-    if (!filewriter) {
-        return 0;
+    if (!filewriter || filewriter->failed || filewriter->closed) {
+        return buf_len;
     }
     while (buf_len > 0) {
         size_t n = fwrite(buf, 1, buf_len, filewriter->f);
         if (n == 0 && errno == EINVAL) {
             continue;
         }
-        if (n < buf_len) {
-            break;
-        }
         filewriter->byte_count += n;
         buf += n;
         buf_len -= n;
+        if (n == 0) {
+            filewriter->failed = true;
+            break;
+        }
     }
 
     return buf_len;
+}
+
+bool
+sentry__filewriter_close(sentry_filewriter_t *filewriter)
+{
+    if (!filewriter) {
+        return false;
+    }
+    if (filewriter->closed) {
+        return !filewriter->failed;
+    }
+
+    filewriter->closed = true;
+    if (fflush(filewriter->f) != 0) {
+        filewriter->failed = true;
+    }
+    if (fclose(filewriter->f) != 0) {
+        filewriter->failed = true;
+    }
+    filewriter->f = NULL;
+    return !filewriter->failed;
+}
+
+bool
+sentry__filewriter_has_failed(const sentry_filewriter_t *filewriter)
+{
+    return !filewriter || filewriter->failed;
 }
 
 void
@@ -804,13 +848,12 @@ sentry__filewriter_free(sentry_filewriter_t *filewriter)
     if (!filewriter) {
         return;
     }
-    fflush(filewriter->f);
-    fclose(filewriter->f);
+    sentry__filewriter_close(filewriter);
     sentry_free(filewriter);
 }
 
 size_t
 sentry__filewriter_byte_count(const sentry_filewriter_t *filewriter)
 {
-    return filewriter->byte_count;
+    return filewriter ? filewriter->byte_count : 0;
 }

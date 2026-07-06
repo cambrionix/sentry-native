@@ -6,9 +6,11 @@
 #include "sentry_json.h"
 #include "sentry_options.h"
 #include "sentry_session.h"
+#include "sentry_slice.h"
 #include "sentry_sync.h"
 #include "sentry_utils.h"
 #include "sentry_uuid.h"
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,6 +132,59 @@ sentry__run_load_user_consent(
     sentry_free(contents);
 }
 
+void
+sentry__run_load_installation_id(sentry_run_t *run,
+    const sentry_path_t *database_path, const char *public_key)
+{
+    sentry_path_t *id_path
+        = sentry__path_join_str(database_path, "installation_id");
+    if (!id_path) {
+        return;
+    }
+
+    if (!public_key) {
+        public_key = "";
+    }
+    const size_t key_len = strlen(public_key);
+
+    const size_t uuid_len = 36;
+    char uuid_str[37] = { 0 };
+    size_t size = 0;
+    char *contents = sentry__path_read_to_buffer(id_path, &size);
+    if (contents && size >= uuid_len) {
+        // expect: "<uuid>(\s+<public_key>)?"
+        sentry_slice_t tail = { contents + uuid_len, size - uuid_len };
+        sentry_slice_t key = sentry__slice_trim(tail);
+        if ((tail.len == 0 || isspace((unsigned char)tail.ptr[0]))
+            && sentry__slice_eqs(key, public_key)) {
+            memcpy(uuid_str, contents, uuid_len);
+            uuid_str[uuid_len] = '\0';
+        }
+    }
+    sentry_free(contents);
+
+    if (uuid_str[0] == '\0') {
+        sentry_uuid_t uuid = sentry_uuid_new_v4();
+        sentry_uuid_as_string(&uuid, uuid_str);
+
+        const size_t buf_len = uuid_len + 1 + key_len + 1;
+        char *buf = sentry_malloc(buf_len);
+        if (buf) {
+            memcpy(buf, uuid_str, uuid_len);
+            buf[uuid_len] = '\n';
+            memcpy(buf + uuid_len + 1, public_key, key_len);
+            buf[uuid_len + 1 + key_len] = '\n';
+            if (sentry__path_write_buffer(id_path, buf, buf_len) != 0) {
+                SENTRY_WARN("failed to persist installation ID");
+            }
+            sentry_free(buf);
+        }
+    }
+
+    run->installation_id = sentry__string_clone(uuid_str);
+    sentry__path_free(id_path);
+}
+
 sentry_run_t *
 sentry__run_incref(sentry_run_t *run)
 {
@@ -161,6 +216,7 @@ sentry__run_free(sentry_run_t *run)
     sentry__path_free(run->external_path);
     sentry__path_free(run->cache_path);
     sentry__filelock_free(run->lock);
+    sentry_free(run->installation_id);
     sentry_free(run);
 }
 
@@ -234,7 +290,7 @@ static sentry_path_t *
 build_sibling_path(const sentry_path_t *cache_path, const char *uuid_str,
     const sentry_attachment_t *att)
 {
-    if (att->type == MINIDUMP) {
+    if (att->type && strcmp(att->type, SENTRY_ATTACHMENT_TYPE_MINIDUMP) == 0) {
         char buf[41];
         snprintf(buf, sizeof(buf), "%s.dmp", uuid_str);
         return sentry__path_unique(cache_path, buf);
@@ -553,7 +609,7 @@ sentry__process_old_runs(const sentry_options_t *options, uint64_t last_crash)
     while ((run_dir = sentry__pathiter_next(db_iter)) != NULL) {
         // skip over other files such as the saved consent or the last_crash
         // timestamp
-        if (!sentry__path_is_dir(run_dir)) {
+        if (!sentry__path_is_dir(run_dir) || sentry__path_is_symlink(run_dir)) {
             continue;
         }
 
@@ -576,6 +632,11 @@ sentry__process_old_runs(const sentry_options_t *options, uint64_t last_crash)
             continue;
         }
 
+        // our own run directory is protected by options->run->lock
+        if (sentry__path_eq(run_dir, options->run->run_path)) {
+            continue;
+        }
+
         sentry_path_t *lockfile = sentry__path_append_str(run_dir, ".lock");
         if (!lockfile) {
             continue;
@@ -588,10 +649,6 @@ sentry__process_old_runs(const sentry_options_t *options, uint64_t last_crash)
         // the file is locked by another process
         if (!did_lock) {
             sentry__filelock_free(lock);
-            continue;
-        }
-        // make sure we don't delete ourselves if the lock check fails
-        if (strcmp(options->run->run_path->path, run_dir->path) == 0) {
             continue;
         }
 

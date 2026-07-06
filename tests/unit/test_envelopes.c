@@ -12,10 +12,17 @@
 #include "sentry_value.h"
 #include "transports/sentry_http_transport.h"
 
+#if defined(SENTRY_PLATFORM_UNIX) && !defined(SENTRY_PLATFORM_ANDROID)         \
+    && !defined(SENTRY_PLATFORM_PS) && !defined(SENTRY_PLATFORM_NX)
+#    include <signal.h>
+#    include <sys/resource.h>
+#    include <sys/wait.h>
+#endif
+
 static char *const SERIALIZED_ENVELOPE_STR
     = "{\"dsn\":\"https://foo@sentry.invalid/42\","
       "\"event_id\":\"c993afb6-b4ac-48a6-b61b-2558e601d65d\",\"trace\":{"
-      "\"public_key\":\"foo\",\"org_id\":\"\",\"sample_rate\":0,\"sample_"
+      "\"public_key\":\"foo\",\"sample_rate\":0,\"sample_"
       "rand\":0.01006918276309107,\"release\":\"test-release\",\"environment\":"
       "\"production\",\"sampled\":\"false\"}}\n"
       "{\"type\":\"event\",\"length\":71}\n"
@@ -753,6 +760,13 @@ SENTRY_TEST(envelope_materialize)
     sentry_envelope_t *bad = sentry__envelope_from_path(path);
     TEST_ASSERT(!!bad);
     TEST_CHECK(!sentry__envelope_materialize(bad));
+    TEST_CHECK(sentry__envelope_is_raw(bad));
+    size_t serialized_len = 0;
+    char *serialized = sentry_envelope_serialize(bad, &serialized_len);
+    TEST_ASSERT(!!serialized);
+    TEST_CHECK_INT_EQUAL(serialized_len, 7);
+    TEST_CHECK_STRING_EQUAL(serialized, "garbage");
+    sentry_free(serialized);
     sentry_envelope_free(bad);
 
     sentry__path_remove(path);
@@ -915,7 +929,7 @@ SENTRY_TEST(attachment_ref_copy)
 
     sentry_attachment_t *attachment
         = sentry__attachment_from_path(sentry__path_clone(test_file_path));
-    attachment->type = MINIDUMP;
+    sentry_attachment_set_type(attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
     sentry_attachment_set_content_type(attachment, "application/x-dmp");
 
     sentry_envelope_t *envelope = sentry__envelope_new();
@@ -935,17 +949,32 @@ SENTRY_TEST(attachment_ref_copy)
     sentry_path_t *cache_dir = sentry__path_join_str(db_path, "cache");
     sentry_path_t *cached = sentry__path_join_str(
         cache_dir, "c993afb6-b4ac-48a6-b61b-2558e601d65d.dmp");
-    sentry__path_free(cache_dir);
     TEST_CHECK(sentry__path_is_file(cached));
 
     // envelope carries an attachment-ref item with the expected headers
     TEST_ASSERT(sentry__envelope_get_item_count(envelope) == 1);
     check_attachment_ref_item(envelope, 0, "sentry_test_minidump.dmp",
-        "application/x-dmp", "event.minidump", strlen("minidump_data"),
-        "c993afb6-b4ac-48a6-b61b-2558e601d65d.dmp");
+        "application/x-dmp", SENTRY_ATTACHMENT_TYPE_MINIDUMP,
+        strlen("minidump_data"), "c993afb6-b4ac-48a6-b61b-2558e601d65d.dmp");
+
+    sentry_path_t *cached_envelope = sentry__path_join_str(
+        cache_dir, "c993afb6-b4ac-48a6-b61b-2558e601d65d.envelope");
+    sentry__path_remove(cached_envelope);
+
+    TEST_CHECK_INT_EQUAL(
+        sentry__envelope_write_to_cache(envelope, cache_dir), 0);
+    size_t cached_len = 0;
+    char *cached_payload = sentry__path_read_to_buffer(cached, &cached_len);
+    TEST_ASSERT(!!cached_payload);
+    TEST_CHECK_INT_EQUAL(cached_len, strlen("minidump_data"));
+    TEST_CHECK(memcmp(cached_payload, "minidump_data", cached_len) == 0);
+    sentry_free(cached_payload);
 
     sentry_envelope_free(envelope);
+    sentry__path_remove(cached_envelope);
+    sentry__path_free(cached_envelope);
     sentry__path_remove(cached);
+    sentry__path_free(cache_dir);
     sentry__path_free(cached);
     sentry__path_free(db_path);
     sentry__attachment_free(attachment);
@@ -985,7 +1014,6 @@ SENTRY_TEST(attachment_ref_move)
 
     sentry_attachment_t *attachment
         = sentry__attachment_from_path(sentry__path_clone(src_path));
-    attachment->type = ATTACHMENT;
 
     sentry_envelope_t *envelope = sentry__envelope_new();
     sentry__envelope_set_event_id(envelope, &event_id);
@@ -1106,7 +1134,7 @@ SENTRY_TEST(attachment_ref_roundtrip)
     ref.path = "abc-crashlog.bin";
     ref.content_type = "application/octet-stream";
     sentry__envelope_add_attachment_ref(
-        envelope, &ref, "crashlog.bin", ATTACHMENT, 12345);
+        envelope, &ref, "crashlog.bin", NULL, 12345);
 
     size_t buf_len = 0;
     char *buf = sentry_envelope_serialize(envelope, &buf_len);
@@ -1185,4 +1213,79 @@ SENTRY_TEST(envelope_can_add_client_report)
     sentry__path_free(path);
     sentry__rate_limiter_free(rl);
     sentry_close();
+}
+
+#if defined(SENTRY_PLATFORM_UNIX) && !defined(SENTRY_PLATFORM_ANDROID)         \
+    && !defined(SENTRY_PLATFORM_PS) && !defined(SENTRY_PLATFORM_NX)
+static void
+sigxfsz_noop(int sig)
+{
+    (void)sig;
+}
+#endif
+
+SENTRY_TEST(write_envelope_partial_write_fails)
+{
+#if !defined(SENTRY_PLATFORM_UNIX) || defined(SENTRY_PLATFORM_ANDROID)         \
+    || defined(SENTRY_PLATFORM_PS) || defined(SENTRY_PLATFORM_NX)
+    SKIP_TEST();
+#else
+    sentry_options_t *options = sentry_options_new();
+    TEST_CHECK(options != NULL);
+    sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
+    sentry_options_set_backend(options, NULL);
+    sentry_init(options);
+
+    sentry_envelope_t *envelope = sentry__envelope_new();
+    TEST_CHECK(envelope != NULL);
+
+    size_t big_len = 40000;
+    char *big_buf = sentry_malloc(big_len);
+    TEST_CHECK(big_buf != NULL);
+    memset(big_buf, 'X', big_len);
+    sentry__envelope_add_from_buffer(envelope, big_buf, big_len, "attachment");
+    sentry_free(big_buf);
+
+    const char *test_file_str
+        = SENTRY_TEST_PATH_PREFIX "sentry_test_partial_write";
+    sentry_path_t *test_path = sentry__path_from_str(test_file_str);
+    TEST_CHECK(test_path != NULL);
+    sentry__path_remove(test_path);
+
+    // fork() isolates the RLIMIT_FSIZE setting from the test suite
+    pid_t pid = fork();
+    TEST_CHECK(pid >= 0);
+
+    if (pid == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = sigxfsz_noop;
+        sigaction(SIGXFSZ, &sa, NULL);
+
+        struct rlimit rl;
+        rl.rlim_cur = 512;
+        rl.rlim_max = 512;
+        if (setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+            _exit(2);
+        }
+
+        int rv = sentry_envelope_write_to_file(envelope, test_file_str);
+        sentry_envelope_free(envelope);
+        sentry__path_free(test_path);
+        _exit(rv != 0 ? 0 : 1);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    TEST_CHECK(WIFEXITED(status));
+    int child_exit = WEXITSTATUS(status);
+    TEST_CHECK_INT_EQUAL(child_exit, 0);
+
+    TEST_CHECK(!sentry__path_is_file(test_path));
+    sentry__path_remove(test_path);
+    sentry__path_free(test_path);
+
+    sentry_envelope_free(envelope);
+    sentry_close();
+#endif
 }

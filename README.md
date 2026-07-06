@@ -259,6 +259,16 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
 - `SENTRY_BREAKPAD_SYSTEM` (Default: `OFF`):
   This instructs the build system to use system-installed breakpad libraries instead of the in-tree version.
 
+- `SENTRY_LIBUNWIND_SYSTEM` (Default: `OFF`, only for Linux):
+  This instructs the build system to use a system-installed `libunwind` (found via `pkg-config`) instead of the
+  vendored copy in `vendor/libunwind`.
+
+  In contrast to the vendored `libunwind` which is always built as a static archive and either linked into the
+  resulting shared library or colocated with the other static artifacts, with `SENTRY_LIBUNWIND_SYSTEM=ON`, the library
+  type (shared or static) is determined by the host distribution's package. The `SENTRY_BUILD_SHARED_LIBS` option only
+  controls how the dependency is exposed to consuming CMake projects, not the library type of the system `libunwind`
+  itself. Ensure matching build and target environments when using system packages.
+
 - `SENTRY_TRANSPORT_COMPRESSION` (Default: `OFF`):
   Adds Gzip transport compression. Requires `zlib`.
 
@@ -365,14 +375,12 @@ Other important configuration options include:
   process, and can thus not properly terminate sessions or call the registered
   `before_send` or `on_crash` hook. It will also lose any events that have been queued for
   sending at the time of the crash.
-- The Crashpad backend on Windows supports fast-fail crashes, which bypass SEH (Structured
+- On Windows, the crashpad and native backends support fast-fail crashes, which bypass SEH (Structured
   Exception Handling) primarily for security reasons. `sentry-native` registers a WER (Windows Error
-  Reporting) module, which signals the `crashpad_handler` to send a minidump when a fast-fail crash occurs
+  Reporting) module, which signals the out-of-process crash handler when a fast-fail crash occurs.
   But since this process bypasses SEH, the application's local exception handler is no longer invoked, which
   also means that for these kinds of crashes, `before_send` and `on_crash` will not be invoked before
-  sending the minidump, and thus have no effect.
-- When using the crashpad backend on macOS, the list of attachments that will be sent
-  along with crashes is frozen at the time of `sentry_init`.
+  sending the crash report, and thus have no effect.
 
 ## Benchmarks
 

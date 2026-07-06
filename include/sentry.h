@@ -42,9 +42,6 @@
  * attachment paths will be resolved according to the current working directory
  * at the time of envelope creation. When adding and removing attachments, they
  * are matched according to their given `path`. No normalization is performed.
- * When using the `crashpad` backend on macOS, the list of attachments that will
- * be added at the time of a hard crash will be frozen at the time of
- * `sentry_init`, and later modifications will not be reflected.
  */
 
 #ifndef SENTRY_H_INCLUDED
@@ -104,7 +101,7 @@ extern "C" {
 #    endif
 #endif
 #ifndef SENTRY_SDK_VERSION
-#    define SENTRY_SDK_VERSION "0.14.0"
+#    define SENTRY_SDK_VERSION "0.15.3"
 #endif
 #define SENTRY_SDK_USER_AGENT SENTRY_SDK_NAME "/" SENTRY_SDK_VERSION
 
@@ -248,12 +245,14 @@ typedef union sentry_value_u sentry_value_t;
 /**
  * Increments the reference count on the value.
  */
-SENTRY_API void sentry_value_incref(sentry_value_t value);
+SENTRY_API sentry_value_t sentry_value_incref(sentry_value_t value);
 
 /**
  * Decrements the reference count on the value.
+ * Returns 0 if the value was freed or is a primitive (no tracking needed),
+ * or non-zero if it still has references.
  */
-SENTRY_API void sentry_value_decref(sentry_value_t value);
+SENTRY_API int sentry_value_decref(sentry_value_t value);
 
 /**
  * Returns the refcount of a value.
@@ -1077,6 +1076,47 @@ typedef enum {
 } sentry_crash_reporting_mode_t;
 
 /**
+ * Crash upload mode for the native backend.
+ * Controls whether the crashed application remains blocked while upload and
+ * shutdown work finishes after crash data has been captured.
+ */
+typedef enum {
+    /**
+     * Keep the crashed application blocked until the native crash daemon
+     * finishes upload and shutdown work.
+     */
+    SENTRY_CRASH_UPLOAD_MODE_SYNC = 0,
+
+    /**
+     * Allow the crashed application to terminate after crash data has been
+     * captured. The native crash daemon continues upload and shutdown work.
+     */
+    SENTRY_CRASH_UPLOAD_MODE_ASYNC = 1,
+} sentry_crash_upload_mode_t;
+
+/**
+ * Controls if and when envelopes are kept in the persistent cache.
+ */
+typedef enum {
+    /** Do not keep envelopes in the persistent cache. */
+    SENTRY_CACHE_KEEP_NONE = 0,
+
+    /**
+     * Envelopes that cannot be uploaded immediately are written to a `cache/`
+     * subdirectory within the database directory. This includes network
+     * failures and envelopes captured while user consent is revoked.
+     */
+    SENTRY_CACHE_KEEP_OFFLINE = 1,
+
+    /**
+     * Envelopes are written to the cache regardless of the upload result. Kept
+     * entries use non-retry filenames and are not picked up by the
+     * retry queue.
+     */
+    SENTRY_CACHE_KEEP_ALWAYS = 2,
+} sentry_cache_keep_t;
+
+/**
  * Creates a new options struct.
  * Can be freed with `sentry_options_free`.
  */
@@ -1135,10 +1175,10 @@ SENTRY_API void sentry_options_set_send_default_pii(
  *
  * https://develop.sentry.dev/sdk/sessions/#filter-order
  *
- * On Windows the crashpad backend can capture fast-fail crashes which bypass
- * SEH. Since the `before_send` is called by a local exception-handler, it will
- * not be invoked when such a crash happened, even though a minidump will be
- * sent.
+ * On Windows, the crashpad and native backends can capture fast-fail crashes
+ * which bypass SEH. Since the `before_send` callback is called by a local
+ * exception-handler, it will not be invoked when such a crash happened, even
+ * though a crash report will be sent.
  */
 typedef sentry_value_t (*sentry_event_function_t)(
     sentry_value_t event, void *hint, void *user_data);
@@ -1196,10 +1236,10 @@ SENTRY_API void sentry_options_set_before_send(
  *
  *  - does not work with crashpad on macOS.
  *  - for breakpad on Linux the `uctx` parameter is always NULL.
- *  - on Windows the crashpad backend can capture fast-fail crashes which
- *    bypass SEH. Since `on_crash` is called by a local exception-handler, it
- *    will not be invoked when such a crash happened, even though a minidump
- *    will be sent.
+ *  - on Windows, the crashpad and native backends can capture fast-fail crashes
+ *    which bypass SEH. Since `on_crash` is called by a local
+ *    exception-handler, it will not be invoked when such a crash happened, even
+ *    though a crash report will be sent.
  */
 typedef sentry_value_t (*sentry_crash_function_t)(
     const sentry_ucontext_t *uctx, sentry_value_t event, void *user_data);
@@ -1509,12 +1549,11 @@ SENTRY_API int sentry_options_get_symbolize_stacktraces(
     const sentry_options_t *opts);
 
 /**
- * Enables or disables storing envelopes that fail to send in a persistent
- * cache.
+ * Configures if and when envelopes are kept in a persistent cache.
  *
- * When enabled, envelopes that fail to send are written to a `cache/`
- * subdirectory within the database directory. The cache is cleared on startup
- * based on the cache_max_items, cache_max_size, and cache_max_age options.
+ * Kept envelopes are written to a `cache/` subdirectory within the database
+ * directory. The cache is cleared on startup based on the cache_max_items,
+ * cache_max_size, and cache_max_age options.
  *
  * When combined with `sentry_options_set_require_user_consent`, envelopes
  * captured while consent is revoked are also written to the cache. With
@@ -1522,10 +1561,9 @@ SENTRY_API int sentry_options_get_symbolize_stacktraces(
  *
  * Only applicable for HTTP transports.
  *
- * Disabled by default.
+ * `SENTRY_CACHE_KEEP_NONE` by default.
  */
-SENTRY_API void sentry_options_set_cache_keep(
-    sentry_options_t *opts, int enabled);
+SENTRY_API void sentry_options_set_cache_keep(sentry_options_t *opts, int mode);
 
 /**
  * Sets the maximum number of items in the cache directory.
@@ -1586,8 +1624,12 @@ SENTRY_API void sentry_options_add_attachment_n(
  * API Users on windows are encouraged to use
  * `sentry_options_add_view_hierarchyw` instead.
  */
+SENTRY_DEPRECATED("Use `sentry_attach_*` with `sentry_attachment_set_type` and "
+                  "`SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY` instead")
 SENTRY_API void sentry_options_add_view_hierarchy(
     sentry_options_t *opts, const char *path);
+SENTRY_DEPRECATED("Use `sentry_attach_*` with `sentry_attachment_set_type` and "
+                  "`SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY` instead")
 SENTRY_API void sentry_options_add_view_hierarchy_n(
     sentry_options_t *opts, const char *path, size_t path_len);
 
@@ -1597,8 +1639,8 @@ SENTRY_API void sentry_options_add_view_hierarchy_n(
  *
  * This feature is currently supported by all backends on Windows. The
  * `crashpad` and `native` backends capture screenshots from an out-of-process
- * handler. Only the `crashpad` backend can capture screenshots of fast-fail
- * crashes that bypass SEH (structured exception handling).
+ * handler. Only the `crashpad` and `native` backends can capture screenshots of
+ * fast-fail crashes that bypass SEH (structured exception handling).
  *
  * To decide per-event whether a screenshot should be captured, set a
  * `before_screenshot` callback via `sentry_options_set_before_screenshot`.
@@ -1635,6 +1677,27 @@ typedef int (*sentry_before_screenshot_function_t)(
 SENTRY_EXPERIMENTAL_API void sentry_options_set_before_screenshot(
     sentry_options_t *opts, sentry_before_screenshot_function_t func,
     void *user_data);
+
+/**
+ * Enables capturing a short retroactive video replay on crash. Currently only
+ * supported on Xbox via the OS-managed game recording ring. The replay is
+ * attached to the crash envelope as `session-replay.mp4`.
+ *
+ * Set the duration via `sentry_options_set_session_replay_duration`
+ * (default 5000 ms). Disabled by default. Must be set before `sentry_init`.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_attach_session_replay(
+    sentry_options_t *opts, int val);
+
+/**
+ * Sets the requested duration of the retroactive session replay in
+ * milliseconds.
+ *
+ * The resulting replay can be shorter than the requested duration if it hasn't
+ * accumulated enough buffered frames yet. Defaults to 5000 ms.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_session_replay_duration(
+    sentry_options_t *opts, uint32_t duration_ms);
 
 /**
  * Sets the path to the crashpad handler if the crashpad backend is used.
@@ -1733,8 +1796,12 @@ SENTRY_API void sentry_options_add_attachmentw_n(
 /**
  * Wide char version of `sentry_options_add_view_hierarchy`.
  */
+SENTRY_DEPRECATED("Use `sentry_attach_*` with `sentry_attachment_set_type` and "
+                  "`SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY` instead")
 SENTRY_API void sentry_options_add_view_hierarchyw(
     sentry_options_t *opts, const wchar_t *path);
+SENTRY_DEPRECATED("Use `sentry_attach_*` with `sentry_attachment_set_type` and "
+                  "`SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY` instead")
 SENTRY_API void sentry_options_add_view_hierarchyw_n(
     sentry_options_t *opts, const wchar_t *path, size_t path_len);
 
@@ -1790,10 +1857,10 @@ SENTRY_EXPERIMENTAL_API int sentry_set_thread_stack_guarantee(
 /**
  * Enables forwarding to the system crash reporter. Disabled by default.
  *
- * This setting only has an effect when using Crashpad on macOS. If enabled,
- * Crashpad forwards crashes to the macOS system crash reporter. Depending
- * on the crash, this may impact the crash time. Even if enabled, Crashpad
- * may choose not to forward certain crashes.
+ * This setting only has an effect when using the crashpad or native backend on
+ * macOS. If enabled, the crash handler forwards crashes to the macOS system
+ * crash reporter. Depending on the crash, this may impact the crash time. Even
+ * if enabled, the crash handler may choose not to forward certain crashes.
  */
 SENTRY_API void sentry_options_set_system_crash_reporter_enabled(
     sentry_options_t *opts, int enabled);
@@ -1837,6 +1904,27 @@ SENTRY_API sentry_crash_reporting_mode_t
 sentry_options_get_crash_reporting_mode(const sentry_options_t *opts);
 
 /**
+ * Sets the crash upload mode for the native backend.
+ *
+ * This setting controls what happens after crash data has been captured. In
+ * sync mode, the crashed application remains blocked while the native crash
+ * daemon finishes upload and shutdown work. In async mode, the crashed
+ * application can terminate after crash data has been captured while the daemon
+ * continues upload and shutdown work.
+ *
+ * This setting only has an effect when using the `native` backend.
+ * Default is `SENTRY_CRASH_UPLOAD_MODE_SYNC`.
+ */
+SENTRY_API void sentry_options_set_crash_upload_mode(
+    sentry_options_t *opts, sentry_crash_upload_mode_t mode);
+
+/**
+ * Gets the crash upload mode for the native backend.
+ */
+SENTRY_API sentry_crash_upload_mode_t sentry_options_get_crash_upload_mode(
+    const sentry_options_t *opts);
+
+/**
  * Enables a wait for the crash report upload to be finished before shutting
  * down. This is disabled by default.
  *
@@ -1874,6 +1962,26 @@ SENTRY_API void sentry_options_set_shutdown_timeout(
  * end on shutdown before attempting a forced termination.
  */
 SENTRY_API uint64_t sentry_options_get_shutdown_timeout(sentry_options_t *opts);
+
+/**
+ * Sets the timeout (in milliseconds) for HTTP transfer operations.
+ *
+ * On curl, this limits the total time an HTTP request is allowed to take. On
+ * WinHTTP, this is applied to send and receive operations, which WinHTTP
+ * applies to individual packets.
+ *
+ * This setting applies to the SDK-managed HTTP transports. It is not supported
+ * by Crashpad's crash report upload.
+ *
+ * The default value is 0, which disables the transfer timeout.
+ */
+SENTRY_API void sentry_options_set_transfer_timeout(
+    sentry_options_t *opts, uint64_t transfer_timeout);
+
+/**
+ * Gets the timeout (in milliseconds) for HTTP transfer operations.
+ */
+SENTRY_API uint64_t sentry_options_get_transfer_timeout(sentry_options_t *opts);
 
 /**
  * Sets a user-defined backend.
@@ -2050,6 +2158,16 @@ SENTRY_API sentry_uuid_t sentry_capture_minidump(const char *path);
 SENTRY_API sentry_uuid_t sentry_capture_minidump_n(
     const char *path, size_t path_len);
 
+#ifdef SENTRY_PLATFORM_WINDOWS
+/**
+ * Wide char versions of `sentry_capture_minidump` and
+ * `sentry_capture_minidump_n`.
+ */
+SENTRY_API sentry_uuid_t sentry_capture_minidumpw(const wchar_t *path);
+SENTRY_API sentry_uuid_t sentry_capture_minidumpw_n(
+    const wchar_t *path, size_t path_len);
+#endif
+
 /**
  * Captures a system-native exception that you retrieve when you manually handle
  * `POSIX` signals or `SEH` exceptions and want to keep using that handling
@@ -2182,6 +2300,19 @@ SENTRY_API void sentry_scope_set_context(
     sentry_scope_t *scope, const char *key, sentry_value_t value);
 SENTRY_API void sentry_scope_set_context_n(sentry_scope_t *scope,
     const char *key, size_t key_len, sentry_value_t value);
+/**
+ * Updates a context object by merging the provided values into it.
+ * Keys in `value` take precedence over keys in the context, updating the
+ * existing values. Keys in the existing context that are not present in `value`
+ * are preserved. If the context object does not exist yet, it will be created.
+ */
+SENTRY_API void sentry_update_context(const char *key, sentry_value_t value);
+SENTRY_API void sentry_update_context_n(
+    const char *key, size_t key_len, sentry_value_t value);
+SENTRY_API void sentry_scope_update_context(
+    sentry_scope_t *scope, const char *key, sentry_value_t value);
+SENTRY_API void sentry_scope_update_context_n(sentry_scope_t *scope,
+    const char *key, size_t key_len, sentry_value_t value);
 
 /**
  * Removes the context object with the specified key.
@@ -2193,7 +2324,8 @@ SENTRY_API void sentry_remove_context_n(const char *key, size_t key_len);
  * Sets the event fingerprint.
  *
  * This accepts a variable number of arguments and needs to be terminated by a
- * trailing `NULL`.
+ * trailing `NULL`. Each string argument in the `_n` variants must be followed
+ * by its length.
  */
 SENTRY_API void sentry_set_fingerprint(const char *fingerprint, ...);
 SENTRY_API void sentry_set_fingerprint_n(
@@ -2326,6 +2458,41 @@ SENTRY_EXPERIMENTAL_API void sentry_options_set_propagate_traceparent(
  * enabled.
  */
 SENTRY_EXPERIMENTAL_API int sentry_options_get_propagate_traceparent(
+    const sentry_options_t *opts);
+
+/**
+ * Overrides the organization ID derived from the DSN host
+ * (e.g. `o123456.ingest.sentry.io` → `123456`). Typically only required for
+ * self-hosted setups where the DSN host does not encode the organization ID.
+ *
+ * The value is passed through as a string; no validation is performed.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_org_id(
+    sentry_options_t *opts, const char *org_id);
+SENTRY_EXPERIMENTAL_API void sentry_options_set_org_id_n(
+    sentry_options_t *opts, const char *org_id, size_t org_id_len);
+
+/**
+ * Enables or disables strict trace continuation.
+ *
+ * Controls whether to continue an incoming trace when either the trace or the
+ * SDK has an organization ID (derived from the DSN), but not both. When set
+ * to true, a new trace is started in that case; when false, the incoming
+ * trace is continued. If both organization IDs are present and differ, the
+ * trace is never continued regardless of this setting.
+ *
+ * See
+ * https://develop.sentry.dev/sdk/foundations/trace-propagation/#strict-trace-continuation
+ *
+ * This is disabled by default.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_strict_trace_continuation(
+    sentry_options_t *opts, int strict_trace_continuation);
+
+/**
+ * Returns whether strict trace continuation is enabled.
+ */
+SENTRY_EXPERIMENTAL_API int sentry_options_get_strict_trace_continuation(
     const sentry_options_t *opts);
 
 /**
@@ -2506,6 +2673,53 @@ SENTRY_EXPERIMENTAL_API void sentry_options_set_enable_metrics(
     sentry_options_t *opts, int enable_metrics);
 SENTRY_EXPERIMENTAL_API int sentry_options_get_enable_metrics(
     const sentry_options_t *opts);
+
+/**
+ * Enables or disables in-process app-hang detection. When enabled, a
+ * background watchdog thread monitors heartbeats from the watched thread. If
+ * no heartbeat is received within the configured timeout, an app-hang event is
+ * captured and sent to Sentry.
+ *
+ * Disabled by default. Must be combined with regular calls to
+ * `sentry_app_hang_heartbeat()` from the thread you want monitored.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_enable_app_hang_tracking(
+    sentry_options_t *opts, int enable);
+SENTRY_EXPERIMENTAL_API int sentry_options_get_enable_app_hang_tracking(
+    const sentry_options_t *opts);
+
+/**
+ * Sets the app-hang detection timeout (in milliseconds). Defaults to 5000 ms.
+ * If `enable_app_hang_tracking` is true and no heartbeat is received within
+ * this window, an app-hang event is captured. Detection is enabled/disabled via
+ * `enable_app_hang_tracking`, not via this timeout.
+ *
+ * The watchdog samples the heartbeat on a fixed internal interval, so timeouts
+ * shorter than 1000 ms cannot be resolved reliably. Values below that minimum
+ * are clamped up to it (with a warning).
+ */
+SENTRY_EXPERIMENTAL_API void sentry_options_set_app_hang_timeout(
+    sentry_options_t *opts, uint64_t app_hang_timeout);
+SENTRY_EXPERIMENTAL_API uint64_t sentry_options_get_app_hang_timeout(
+    const sentry_options_t *opts);
+
+/**
+ * Records a heartbeat from the calling thread.
+ *
+ * The first call latches the calling thread as the monitored thread.
+ * Call this regularly from the thread you want watched for hangs. If the
+ * watchdog does not receive a heartbeat within the configured timeout, it
+ * captures an app-hang event.
+ *
+ * Only a single thread is monitored: the watchdog tracks exactly the one
+ * thread latched by the first heartbeat. Calls from any other thread are
+ * ignored. To watch the thread most representative of responsiveness (e.g.
+ * a UI or main loop), call this from that thread first.
+ *
+ * This function is a no-op unless app-hang detection is enabled via
+ * `sentry_options_set_enable_app_hang_tracking`.
+ */
+SENTRY_EXPERIMENTAL_API void sentry_app_hang_heartbeat(void);
 
 /**
  * Type of the `before_send_metric` callback.
@@ -2719,6 +2933,26 @@ SENTRY_API sentry_attachment_t *sentry_scope_attach_bytesw_n(
     const wchar_t *filename, size_t filename_len);
 #endif
 
+#define SENTRY_ATTACHMENT_TYPE_GENERIC "event.attachment"
+#define SENTRY_ATTACHMENT_TYPE_MINIDUMP "event.minidump"
+#define SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY "event.view_hierarchy"
+
+/**
+ * Sets the attachment type.
+ *
+ * Well-known attachment types are exposed as `SENTRY_ATTACHMENT_TYPE_*`
+ * macros. Pass `NULL` or an empty string to clear the attachment type.
+ *
+ * Also sets the content type for known attachment types unless explicitly set.
+ *
+ * See:
+ * https://develop.sentry.dev/sdk/telemetry/attachments/#attachment-types
+ */
+SENTRY_API void sentry_attachment_set_type(
+    sentry_attachment_t *attachment, const char *type);
+SENTRY_API void sentry_attachment_set_type_n(
+    sentry_attachment_t *attachment, const char *type, size_t type_len);
+
 /**
  * Sets the content type of attachment.
  */
@@ -2789,6 +3023,12 @@ typedef struct sentry_transaction_s sentry_transaction_t;
  * that same transaction. In case the transaction should be discarded, the
  * callback needs to call `sentry_value_decref` on the provided transaction and
  * return a `sentry_value_new_null()` instead.
+ *
+ * This function may be invoked inside a signal handler and must be safe for
+ * that purpose, see https://man7.org/linux/man-pages/man7/signal-safety.7.html.
+ * On Windows, it may be called from inside a `UnhandledExceptionFilter`, see
+ * the documentation on SEH (structured exception handling) for more information
+ * https://docs.microsoft.com/en-us/windows/win32/debug/structured-exception-handling
  */
 typedef sentry_value_t (*sentry_transaction_function_t)(
     sentry_value_t transaction, void *user_data);
@@ -2904,6 +3144,10 @@ SENTRY_EXPERIMENTAL_API void sentry_transaction_context_remove_sampled(
  * services. Therefore, the headers of incoming requests should be fed into this
  * function so that sentry is able to continue a trace that was started by an
  * upstream service.
+ *
+ * Recognized header keys are `sentry-trace` and `baggage` (case-insensitive);
+ * other keys are ignored. Feed both when available so that strict trace
+ * continuation can consult the incoming `sentry-org_id`.
  */
 SENTRY_EXPERIMENTAL_API void sentry_transaction_context_update_from_header(
     sentry_transaction_context_t *tx_ctx, const char *key, const char *value);

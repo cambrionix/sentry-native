@@ -9,6 +9,7 @@
 #include "sentry_alloc.h"
 #include "sentry_core.h"
 #include "sentry_logger.h"
+#include "sentry_os.h"
 #include "sentry_sync.h"
 
 #include <string.h>
@@ -98,6 +99,47 @@ static const size_t g_crash_signal_count
 static sentry_crash_ipc_t *g_crash_ipc = NULL;
 static struct sigaction g_previous_handlers[16];
 static stack_t g_signal_stack = { 0 };
+
+static void
+reset_signal_handlers(void)
+{
+    for (size_t i = 0; i < g_crash_signal_count; i++) {
+        sigaction(g_crash_signals[i], &g_previous_handlers[i], NULL);
+    }
+}
+
+static void
+reraise_signal(int signum)
+{
+    signal(signum, SIG_DFL);
+    raise(signum);
+}
+
+static void
+invoke_previous_signal_handler(int signum, siginfo_t *info, void *context)
+{
+    // Re-enable previous signal handlers before re-raising to prevent loops
+    reset_signal_handlers();
+
+    for (size_t i = 0; i < g_crash_signal_count; i++) {
+        if (g_crash_signals[i] != signum) {
+            continue;
+        }
+
+        struct sigaction *handler = &g_previous_handlers[i];
+        if (handler->sa_handler == SIG_DFL || handler->sa_handler == SIG_IGN) {
+            return;
+        }
+
+        if (handler->sa_flags & SA_SIGINFO) {
+            handler->sa_sigaction(signum, info, context);
+        } else {
+            handler->sa_handler(signum);
+        }
+
+        return;
+    }
+}
 
 /**
  * Get current thread ID (signal-safe)
@@ -250,21 +292,20 @@ safe_build_stack_path(
 static void
 crash_signal_handler(int signum, siginfo_t *info, void *context)
 {
+    sentry_crash_ipc_t *ipc = g_crash_ipc;
+    if (!ipc || !ipc->shmem) {
+        // No IPC available, forward to the previous handler
+        invoke_previous_signal_handler(signum, info, context);
+        // The previous handler returned, fall back to default termination
+        reraise_signal(signum);
+        return;
+    }
+
     // Only handle crash once - check if already processing
     static volatile long handling_crash = 0;
     if (!sentry__atomic_compare_swap(&handling_crash, 0, 1)) {
         // Already handling a crash, just exit immediately
         _exit(1);
-    }
-
-    // Re-enable signal to prevent loops
-    signal(signum, SIG_DFL);
-
-    sentry_crash_ipc_t *ipc = g_crash_ipc;
-    if (!ipc || !ipc->shmem) {
-        // No IPC available, just re-raise
-        raise(signum);
-        return;
     }
 
     sentry_crash_context_t *ctx = ipc->shmem;
@@ -360,6 +401,25 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
                 ctx->platform.threads[i].tid = 0;
             }
 
+            // Get thread name from THREAD_EXTENDED_INFO
+            ctx->platform.threads[i].name[0] = '\0';
+            {
+                thread_extended_info_data_t extended_info;
+                mach_msg_type_number_t ext_count = THREAD_EXTENDED_INFO_COUNT;
+                if (thread_info(threads[i], THREAD_EXTENDED_INFO,
+                        (thread_info_t)&extended_info, &ext_count)
+                    == KERN_SUCCESS) {
+                    extended_info.pth_name[sizeof(extended_info.pth_name) - 1]
+                        = '\0';
+                    signal_safe_memcpy(ctx->platform.threads[i].name,
+                        extended_info.pth_name,
+                        sizeof(ctx->platform.threads[i].name));
+                    ctx->platform.threads[i]
+                        .name[sizeof(ctx->platform.threads[i].name) - 1]
+                        = '\0';
+                }
+            }
+
             // For the crashing thread, use the context from the signal handler
             // For other threads, use thread_get_state()
             bool is_crashing_thread = (threads[i] == crashing_thread);
@@ -417,10 +477,22 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
             } else {
                 // Capture thread state from thread_get_state for other threads
                 // Note: thread_get_state writes to thread_state_t, which is
-                // __ss (not the full mcontext), so we must pass &state.__ss
+                // __ss (not the full mcontext), so we must pass &state.__ss.
+                // Use the explicit 64-bit flavor; MACHINE_THREAD_STATE is the
+                // unified flavor whose 8-byte header would shift every
+                // register.
+#        if defined(__aarch64__)
+                const thread_state_flavor_t state_flavor = ARM_THREAD_STATE64;
+                mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+#        elif defined(__x86_64__)
+                const thread_state_flavor_t state_flavor = x86_THREAD_STATE64;
+                mach_msg_type_number_t state_count = x86_THREAD_STATE64_COUNT;
+#        else
+                const thread_state_flavor_t state_flavor = MACHINE_THREAD_STATE;
                 mach_msg_type_number_t state_count = MACHINE_THREAD_STATE_COUNT;
+#        endif
                 kern_return_t state_kr
-                    = thread_get_state(threads[i], MACHINE_THREAD_STATE,
+                    = thread_get_state(threads[i], state_flavor,
                         (thread_state_t)&ctx->platform.threads[i].state.__ss,
                         &state_count);
                 if (state_kr != KERN_SUCCESS) {
@@ -561,31 +633,30 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
             const struct mach_header_64 *header64
                 = (const struct mach_header_64 *)header;
             const uint8_t *cmds = (const uint8_t *)(header64 + 1);
+            bool has_size = false;
+            bool has_uuid = false;
 
-            for (uint32_t j = 0; j < header64->ncmds && j < 256; j++) {
+            for (uint32_t j = 0;
+                j < header64->ncmds && j < 256 && (!has_size || !has_uuid);
+                j++) {
                 const struct load_command *cmd
                     = (const struct load_command *)cmds;
 
                 if (cmd->cmd == LC_SEGMENT_64) {
                     const struct segment_command_64 *seg
                         = (const struct segment_command_64 *)cmd;
-                    // Skip __PAGEZERO which has vmsize=4GB on 64-bit and
-                    // would vastly inflate the module size
-                    if (seg->initprot == 0 && seg->maxprot == 0) {
-                        cmds += cmd->cmdsize;
-                        if (cmd->cmdsize == 0)
-                            break;
-                        continue;
-                    }
-                    uint64_t seg_end = seg->vmaddr + seg->vmsize;
-                    if (seg_end > size) {
-                        size = seg_end;
+                    // image_size on macOS is the __TEXT segment's vmsize:
+                    // https://github.com/getsentry/sentry-native/blob/82dec4b8518de32586c4a761a3a9df4aed9d7b8d/src/modulefinder/sentry_modulefinder_apple.c#L65-L69
+                    if (memcmp(seg->segname, "__TEXT", 7) == 0) {
+                        size = seg->vmsize;
+                        has_size = true;
                     }
                 } else if (cmd->cmd == LC_UUID) {
                     // Extract UUID for symbolication
                     const struct uuid_command *uuid_cmd
                         = (const struct uuid_command *)cmd;
                     signal_safe_memcpy(module->uuid, uuid_cmd->uuid, 16);
+                    has_uuid = true;
                 }
 
                 cmds += cmd->cmdsize;
@@ -670,8 +741,8 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
             if (state == SENTRY_CRASH_STATE_PROCESSING && !processing_started) {
                 // Daemon started processing (no logging - signal-safe)
                 processing_started = true;
-            } else if (state == SENTRY_CRASH_STATE_DONE) {
-                // Daemon finished processing (no logging - signal-safe)
+            } else if (state >= SENTRY_CRASH_STATE_CAPTURED) {
+                // Daemon captured crash data (no logging - signal-safe)
                 goto daemon_handling;
             }
 
@@ -762,7 +833,18 @@ daemon_handling:
         }
     }
 
-    raise(signum);
+    invoke_previous_signal_handler(signum, info, context);
+
+#    if defined(SENTRY_PLATFORM_MACOS)
+    if (!ctx->system_crash_reporter_enabled) {
+        // By convention, use the 128 + signal exit code without re-raising
+        // and invoking the macOS system crash reporter
+        _exit(128 + signum);
+    }
+#    endif
+
+    // The previous handler returned, fall back to default termination
+    reraise_signal(signum);
 }
 
 int
@@ -855,9 +937,7 @@ void
 sentry__crash_handler_shutdown(void)
 {
     // Restore previous signal handlers
-    for (size_t i = 0; i < g_crash_signal_count; i++) {
-        sigaction(g_crash_signals[i], &g_previous_handlers[i], NULL);
-    }
+    reset_signal_handlers();
 
     // Clean up signal stack
     if (g_signal_stack.ss_sp) {
@@ -877,6 +957,14 @@ sentry__crash_handler_shutdown(void)
 // Global state for Windows exception handling
 static sentry_crash_ipc_t *g_crash_ipc = NULL;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = NULL;
+
+static LONG WINAPI crash_exception_filter(EXCEPTION_POINTERS *exception_info);
+
+static void
+crash_sigabrt_handler(EXCEPTION_POINTERS *exception_pointers)
+{
+    crash_exception_filter(exception_pointers);
+}
 
 /**
  * Windows exception filter (crash handler)
@@ -946,8 +1034,8 @@ crash_exception_filter(EXCEPTION_POINTERS *exception_info)
                 // Daemon started processing (no logging - exception filter
                 // context)
                 processing_started = true;
-            } else if (state == SENTRY_CRASH_STATE_DONE) {
-                // Daemon finished processing (no logging - exception filter
+            } else if (state >= SENTRY_CRASH_STATE_CAPTURED) {
+                // Daemon captured crash data (no logging - exception filter
                 // context)
                 break;
             }
@@ -973,6 +1061,7 @@ sentry__crash_handler_init(sentry_crash_ipc_t *ipc)
 
     // Install exception filter
     g_previous_filter = SetUnhandledExceptionFilter(crash_exception_filter);
+    sentry__win32_install_sigabrt_handler(crash_sigabrt_handler);
 
     SENTRY_DEBUG("crash handler initialized (Windows SEH)");
     return 0;
@@ -986,6 +1075,8 @@ sentry__crash_handler_shutdown(void)
         SetUnhandledExceptionFilter(g_previous_filter);
         g_previous_filter = NULL;
     }
+
+    sentry__win32_restore_sigabrt_handler();
 
     g_crash_ipc = NULL;
 

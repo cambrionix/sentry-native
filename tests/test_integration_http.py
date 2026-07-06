@@ -1,6 +1,7 @@
 import itertools
 import json
 import os
+import subprocess
 import time
 
 import pytest
@@ -9,9 +10,13 @@ from flaky import flaky
 from . import (
     make_dsn,
     run,
+    stage_replay,
     Envelope,
     split_log_request_cond,
+    extract_request,
     is_feedback_envelope,
+    is_replay_envelope,
+    REPLAY_ID,
     SENTRY_VERSION,
 )
 from .assertions import (
@@ -22,6 +27,7 @@ from .assertions import (
     assert_event,
     assert_exception,
     assert_inproc_crash,
+    assert_replay_envelope,
     assert_session,
     assert_user_feedback,
     assert_user_report,
@@ -38,7 +44,6 @@ from .conditions import (
     has_breakpad,
     has_native,
     has_files,
-    is_kcov,
     is_asan,
     is_qemu,
 )
@@ -299,7 +304,6 @@ def test_user_report_http(cmake, httpserver):
     assert_user_report(envelope)
 
 
-@pytest.mark.skipif(is_kcov, reason="kcov exits with 0 even when the process crashes")
 @pytest.mark.parametrize(
     "build_args",
     [
@@ -314,6 +318,7 @@ def test_user_report_http(cmake, httpserver):
 )
 def test_external_crash_reporter_http(cmake, httpserver, build_args):
     tmp_path = cmake(["sentry_example", "sentry_crash_reporter"], build_args)
+    cache_dir = tmp_path.joinpath(".sentry-native/cache")
 
     httpserver.expect_oneshot_request(
         "/api/123456/envelope/",
@@ -329,7 +334,7 @@ def test_external_crash_reporter_http(cmake, httpserver, build_args):
         run(
             tmp_path,
             "sentry_example",
-            ["log", "crash-reporter", "crash"],
+            ["log", "crash-reporter", "cache-keep", "crash"],
             expect_failure=True,
             env=env,
         )
@@ -354,6 +359,7 @@ def test_external_crash_reporter_http(cmake, httpserver, build_args):
     crash = crash_request.get_data()
 
     envelope = Envelope.deserialize(crash)
+    assert envelope.headers["cache_dir"] == str(cache_dir)
     assert_meta(envelope, integration=build_args.get("SENTRY_BACKEND", ""))
 
     envelope = Envelope.deserialize(feedback)
@@ -407,7 +413,7 @@ def test_abnormal_session(cmake, httpserver):
     session = json.dumps(
         {
             "sid": "00000000-0000-0000-0000-000000000000",
-            "did": "42",
+            "did": "11111111-1111-1111-1111-111111111111",
             "status": "started",
             "errors": 0,
             "started": "2020-06-02T10:04:53.680Z",
@@ -597,6 +603,59 @@ def test_breakpad_crash_http(cmake, httpserver, build_args):
 
     assert_breakpad_crash(envelope)
     assert_minidump(envelope)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "inproc",
+        pytest.param(
+            "breakpad",
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+    ],
+)
+def test_crash_replay_envelope_http(cmake, httpserver, backend):
+    """A staged replay referenced by the crash event's `contexts.replay` is
+    consumed at crash time, persisted to the run folder as its own
+    `replay_video` envelope, and sent on the next launch."""
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": backend})
+
+    replays, video = stage_replay(tmp_path)
+
+    httpserver.expect_request("/api/123456/envelope/").respond_with_data("OK")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        ["log", "replay-context", "crash"],
+        expect_failure=True,
+        env=env,
+    )
+
+    # the staged replay is consumed at crash time
+    assert not (replays / f"replay-{REPLAY_ID}.mp4").exists()
+    assert not (replays / f"replay-{REPLAY_ID}.json").exists()
+
+    run(
+        tmp_path,
+        "sentry_example",
+        ["log", "no-setup"],
+        env=env,
+    )
+
+    # crash envelope + replay envelope
+    assert len(httpserver.log) == 2
+    replay_request, others = extract_request(httpserver.log, is_replay_envelope)
+    assert replay_request is not None, "expected a replay_video envelope"
+    assert_replay_envelope(Envelope.deserialize(replay_request.get_data()), video)
+
+    crash_envelope = Envelope.deserialize(others[0][0].get_data())
+    event = crash_envelope.get_event()
+    assert event["contexts"]["replay"]["replay_id"] == REPLAY_ID
 
 
 @pytest.mark.skipif(not has_breakpad or is_qemu, reason="test needs breakpad backend")
@@ -810,7 +869,6 @@ def test_discarding_before_breadcrumb_http(cmake, httpserver):
     assert_no_breadcrumbs(envelope)
 
 
-@pytest.mark.skipif(is_kcov, reason="kcov exits with 0 even when the process crashes")
 @pytest.mark.skipif(not has_native or is_qemu, reason="test needs native backend")
 def test_native_crash_http(cmake, httpserver):
     """Test native backend crash handling with HTTP transport"""
@@ -850,6 +908,114 @@ def test_native_crash_http(cmake, httpserver):
     assert_minidump(envelope)
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "inproc",
+        pytest.param(
+            "breakpad",
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+        pytest.param(
+            "native",
+            marks=pytest.mark.skipif(
+                not has_native or is_qemu,
+                reason="test needs native backend",
+            ),
+        ),
+    ],
+)
+def test_trace_finish_on_crash(cmake, httpserver, backend):
+    """The backend's crash handler calls `sentry__trace_finish`, so an
+    unfinished transaction on the scope ships alongside the crash."""
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": backend})
+
+    httpserver.expect_oneshot_request(
+        "/api/123456/envelope/",
+        headers={"x-sentry-auth": auth_header},
+    ).respond_with_data("OK")
+    httpserver.expect_oneshot_request(
+        "/api/123456/envelope/",
+        headers={"x-sentry-auth": auth_header},
+    ).respond_with_data("OK")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            ["log", "open-transaction", "crash"],
+            expect_failure=True,
+            env=env,
+        )
+        if backend != "native":
+            # inproc/breakpad cache to disk; the next launch ships them.
+            run(tmp_path, "sentry_example", ["log", "no-setup"], env=env)
+    assert waiting.result
+
+    envelopes = [Envelope.deserialize(req.get_data()) for req, _ in httpserver.log]
+    for envelope in envelopes:
+        item_types = [item.headers.get("type") for item in envelope.items]
+        assert not ("event" in item_types and "transaction" in item_types)
+
+    tx_envelopes = [
+        envelope
+        for envelope in envelopes
+        if any(item.headers.get("type") == "transaction" for item in envelope.items)
+    ]
+    assert tx_envelopes
+    tx_envelope = tx_envelopes[0]
+    tx_items = [
+        item for item in tx_envelope.items if item.headers.get("type") == "transaction"
+    ]
+    assert tx_items
+
+    tx = tx_items[0].payload.json
+    assert tx_envelope.headers["event_id"] == tx["event_id"]
+    tx_trace = tx["contexts"]["trace"]
+    assert tx_trace["status"] == "aborted"
+    assert "parent_span_id" not in tx_trace
+    tx_trace_header = tx_envelope.headers["trace"]
+    assert tx_trace_header["trace_id"] == tx_trace["trace_id"]
+    assert tx_trace_header["sampled"] == "true"
+    assert tx_trace_header["transaction"] == tx["transaction"]
+    spans = tx.get("spans", [])
+    child = next(s for s in spans if s.get("op") == "open.span")
+    grand = next(s for s in spans if s.get("op") == "open.grand.span")
+    assert child["parent_span_id"] == tx_trace["span_id"]
+    assert grand["parent_span_id"] == child["span_id"]
+    # Every in-flight child is finished, not just the deepest.
+    for op in ("open.span", "open.grand.span"):
+        span = next((s for s in spans if s.get("op") == op), None)
+        assert span is not None, f"missing {op} in {[s.get('op') for s in spans]}"
+        assert span.get("status") == "aborted"
+        assert span.get("timestamp")
+
+    # The crash event nests under the deepest active span via matching
+    # trace_id + span_id.
+    event_envelopes = [
+        envelope
+        for envelope in envelopes
+        if any(item.headers.get("type") == "event" for item in envelope.items)
+    ]
+    assert event_envelopes
+    event_envelope = event_envelopes[0]
+    event_items = [
+        item for item in event_envelope.items if item.headers.get("type") == "event"
+    ]
+    assert event_items
+    if backend != "native":
+        event_trace_header = event_envelope.headers["trace"]
+        assert event_trace_header["trace_id"] == tx_trace["trace_id"]
+        assert event_trace_header["sampled"] == "true"
+    event = event_items[0].payload.json
+    assert event["contexts"]["trace"]["trace_id"] == tx_trace["trace_id"]
+    assert event["contexts"]["trace"]["span_id"] == grand["span_id"]
+    assert event.get("level") == "fatal"
 
 
 @pytest.mark.skipif(not has_files, reason="test needs a local filesystem")
@@ -1210,3 +1376,58 @@ def test_http_retry_session_on_network_error(cmake, httpserver, unreachable_dsn)
 
     cache_files = list(cache_dir.glob("*.envelope"))
     assert len(cache_files) == 0
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "inproc",
+        pytest.param(
+            "breakpad",
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+    ],
+)
+@pytest.mark.skipif(is_qemu, reason="unreliable under qemu-user")
+def test_restart_on_crash(cmake, httpserver, backend):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": backend})
+
+    httpserver.expect_oneshot_request(
+        "/api/123456/envelope/",
+        headers={"x-sentry-auth": auth_header},
+    ).respond_with_data("OK")
+    httpserver.expect_oneshot_request(
+        "/api/123456/envelope/",
+        headers={"x-sentry-auth": auth_header},
+    ).respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        # The restarted child inherits stdio, so PIPE waits for it without a sleep.
+        run(
+            tmp_path,
+            "sentry_example",
+            ["crash", "restart-on-crash"],
+            expect_failure=True,
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        run(
+            tmp_path,
+            "sentry_example",
+            ["log", "no-setup"],
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+        )
+
+    assert waiting.result
+    assert len(httpserver.log) == 2
+    for req in httpserver.log:
+        envelope = Envelope.deserialize(req[0].get_data())
+        if backend == "inproc":
+            assert_inproc_crash(envelope)
+        elif backend == "breakpad":
+            assert_breakpad_crash(envelope)
+        else:
+            assert False

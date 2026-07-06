@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #ifdef NDEBUG
 #    undef NDEBUG
@@ -20,6 +21,7 @@
 
 #ifdef SENTRY_PLATFORM_WINDOWS
 #    include <malloc.h>
+#    include <process.h>
 #    include <synchapi.h>
 #    define sleep_s(SECONDS) Sleep((SECONDS) * 1000)
 #else
@@ -135,6 +137,83 @@ on_crash_callback(
 
     // tell the backend to retain the event
     return event;
+}
+
+static sentry_value_t
+restart_on_crash(
+    const sentry_ucontext_t *uctx, sentry_value_t event, void *user_data)
+{
+    (void)uctx;
+
+#ifdef SENTRY_PLATFORM_WINDOWS
+    wchar_t **argv = user_data;
+    if (argv && argv[0]) {
+        _wspawnv(_P_NOWAIT, argv[0], (const wchar_t *const *)argv);
+    }
+#else
+    char **argv = user_data;
+    if (!argv || !argv[0]) {
+        return event;
+    }
+    if (fork() == 0) {
+        // The crashing signal is blocked while the crash handler runs. Do not
+        // let the restarted child inherit that mask.
+        sigset_t set;
+        sigfillset(&set);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+
+        execv(argv[0], argv);
+        _exit(127);
+    }
+#endif
+
+    return event;
+}
+
+// Forward all original arguments except "restart-on-crash"
+static void *
+restart_args(int argc, char **argv)
+{
+#ifdef SENTRY_PLATFORM_WINDOWS
+    wchar_t **child_argv = calloc((size_t)argc + 1, sizeof(wchar_t *));
+    if (!child_argv) {
+        return NULL;
+    }
+
+    child_argv[0] = calloc(MAX_PATH, sizeof(wchar_t));
+    if (!child_argv[0]
+        || GetModuleFileNameW(NULL, child_argv[0], MAX_PATH) == 0) {
+        return child_argv;
+    }
+
+    int child_argc = 1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "restart-on-crash") == 0) {
+            continue;
+        }
+
+        size_t len = strlen(argv[i]) + 1;
+        child_argv[child_argc] = calloc(len, sizeof(wchar_t));
+        if (!child_argv[child_argc]) {
+            return child_argv;
+        }
+        mbstowcs(child_argv[child_argc++], argv[i], len);
+    }
+    return child_argv;
+#else
+    char **child_argv = calloc((size_t)argc + 1, sizeof(char *));
+    if (!child_argv) {
+        return NULL;
+    }
+
+    int child_argc = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "restart-on-crash") != 0) {
+            child_argv[child_argc++] = argv[i];
+        }
+    }
+    return child_argv;
+#endif
 }
 
 static sentry_value_t
@@ -337,9 +416,9 @@ trigger_stack_buffer_overrun()
 static void
 trigger_fastfail_crash()
 {
-    // this bypasses WINDOWS SEH and will only be caught with the crashpad WER
-    // module enabled
-    __fastfail(77);
+    // this bypasses WINDOWS SEH and will only be caught with the
+    // crashpad/native WER module enabled
+    RaiseFailFastException(NULL, NULL, 0);
 }
 
 #endif
@@ -554,6 +633,12 @@ main(int argc, char **argv)
         sentry_options_set_shutdown_timeout(
             options, strtoull(shutdown_timeout, NULL, 10));
     }
+    const char *transfer_timeout
+        = get_arg_value(argc, argv, "transfer-timeout");
+    if (transfer_timeout) {
+        sentry_options_set_transfer_timeout(
+            options, strtoull(transfer_timeout, NULL, 10));
+    }
 
     sentry_options_set_environment(options, "development");
     // sentry defaults this to the `SENTRY_RELEASE` env variable
@@ -573,22 +658,11 @@ main(int argc, char **argv)
 
     if (has_arg(argc, argv, "large-attachment")) {
         sentry_options_set_enable_large_attachments(options, 1);
-        const char *large_file = ".sentry-large-attachment";
-        FILE *f = fopen(large_file, "wb");
-        if (f) {
-            // 100 MB = TUS upload threshold
-            char zeros[4096];
-            memset(zeros, 0, sizeof(zeros));
-            size_t remaining = 100 * 1024 * 1024;
-            while (remaining > 0) {
-                size_t chunk
-                    = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
-                fwrite(zeros, 1, chunk, f);
-                remaining -= chunk;
-            }
-            fclose(f);
-            sentry_options_add_attachment(options, large_file);
-        }
+    }
+
+    if (has_arg(argc, argv, "app-hang")) {
+        sentry_options_set_enable_app_hang_tracking(options, 1);
+        sentry_options_set_app_hang_timeout(options, 1000);
     }
 
     if (has_arg(argc, argv, "stdout")) {
@@ -596,8 +670,17 @@ main(int argc, char **argv)
             options, sentry_transport_new(print_envelope));
     }
 
-    if (has_arg(argc, argv, "capture-transaction")) {
+    if (has_arg(argc, argv, "capture-transaction")
+        || has_arg(argc, argv, "open-transaction")) {
         sentry_options_set_traces_sample_rate(options, 1.0);
+    }
+
+    if (has_arg(argc, argv, "org-id")) {
+        sentry_options_set_org_id(options, "123456");
+    }
+
+    if (has_arg(argc, argv, "strict-trace-continuation")) {
+        sentry_options_set_strict_trace_continuation(options, 1);
     }
 
     if (has_arg(argc, argv, "child-spans")) {
@@ -620,6 +703,11 @@ main(int argc, char **argv)
     if (has_arg(argc, argv, "discarding-on-crash")) {
         sentry_options_set_on_crash(
             options, discarding_on_crash_callback, NULL);
+    }
+
+    if (has_arg(argc, argv, "restart-on-crash")) {
+        sentry_options_set_on_crash(
+            options, restart_on_crash, restart_args(argc, argv));
     }
 
     if (has_arg(argc, argv, "before-transaction")) {
@@ -683,12 +771,6 @@ main(int argc, char **argv)
         sentry_options_set_crashpad_wait_for_upload(options, true);
     }
 
-    if (has_arg(argc, argv, "attach-view-hierarchy")) {
-        // assuming the example / test is run directly from the cmake build
-        // directory
-        sentry_options_add_view_hierarchy(options, "./view-hierarchy.json");
-    }
-
     if (has_arg(argc, argv, "test-logger")) {
         // Set up the test logger for integration tests
         sentry_options_set_logger(options, test_logger_callback, NULL);
@@ -723,11 +805,17 @@ main(int argc, char **argv)
     if (has_arg(argc, argv, "require-user-consent")) {
         sentry_options_set_require_user_consent(options, true);
     }
-    if (has_arg(argc, argv, "cache-keep")) {
+    if (has_arg(argc, argv, "cache-keep")
+        || has_arg(argc, argv, "cache-keep-always")) {
+        // true corresponds to SENTRY_CACHE_KEEP_OFFLINE for backwards
+        // compatibility with older SDK versions that don't have the enum
         sentry_options_set_cache_keep(options, true);
         sentry_options_set_cache_max_size(options, 16 * 1024 * 1024); // 16 MB
         sentry_options_set_cache_max_age(options, 5 * 24 * 60 * 60); // 5 days
         sentry_options_set_cache_max_items(options, 5);
+    }
+    if (has_arg(argc, argv, "cache-keep-always")) {
+        sentry_options_set_cache_keep(options, SENTRY_CACHE_KEEP_ALWAYS);
     }
     if (has_arg(argc, argv, "http-retry")) {
         sentry_options_set_http_retry(options, true);
@@ -774,6 +862,10 @@ main(int argc, char **argv)
                     options, SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP);
             }
         }
+    }
+    if (has_arg(argc, argv, "async-crash-upload")) {
+        sentry_options_set_crash_upload_mode(
+            options, SENTRY_CRASH_UPLOAD_MODE_ASYNC);
     }
 
     // E2E test mode: generate unique test ID for event correlation
@@ -856,6 +948,37 @@ main(int argc, char **argv)
             = sentry_attach_bytes("\xc0\xff\xee", 3, "bytes.bin");
         sentry_attachment_set_content_type(bytes, "application/octet-stream");
     }
+    if (has_arg(argc, argv, "attach-view-hierarchy")) {
+        // assuming the example / test is run directly from the cmake build
+        // directory
+        sentry_attachment_t *view_hierarchy
+            = sentry_attach_file("./view-hierarchy.json");
+        sentry_attachment_set_type(
+            view_hierarchy, SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY);
+    }
+
+    if (has_arg(argc, argv, "large-attachment")) {
+        const char *large_file = ".sentry-large-attachment";
+        FILE *f = fopen(large_file, "wb");
+        if (f) {
+            // 100 MB = TUS upload threshold
+            char zeros[4096];
+            memset(zeros, 0, sizeof(zeros));
+            size_t remaining = 100 * 1024 * 1024;
+            while (remaining > 0) {
+                size_t chunk
+                    = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
+                fwrite(zeros, 1, chunk, f);
+                remaining -= chunk;
+            }
+            fclose(f);
+            sentry_attachment_t *attachment = sentry_attach_file(large_file);
+            if (attachment) {
+                sentry_attachment_set_type(
+                    attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
+            }
+        }
+    }
 
     if (sentry_options_get_enable_logs(options)) {
         if (has_arg(argc, argv, "capture-log")) {
@@ -925,9 +1048,7 @@ main(int argc, char **argv)
             context, "name", sentry_value_new_string("testing-runtime"));
         sentry_set_context("runtime", context);
 
-        sentry_value_t user
-            = sentry_value_new_user("42", "some_name", NULL, NULL);
-        sentry_set_user(user);
+        sentry_set_user(sentry_value_new_user(NULL, "some_name", NULL, NULL));
 
         sentry_value_t default_crumb
             = sentry_value_new_breadcrumb(NULL, "default level is info");
@@ -947,6 +1068,15 @@ main(int argc, char **argv)
         const char *direct_trace_id = "aaaabbbbccccddddeeeeffff00001111";
         const char *direct_parent_span_id = "f0f0f0f0f0f0f0f0";
         sentry_set_trace(direct_trace_id, direct_parent_span_id);
+    }
+
+    if (has_arg(argc, argv, "replay-context")) {
+        // mimics an embedder (e.g. sentry-unreal) that stages replay clips in
+        // `<database>/replays/` and announces the active replay on the scope
+        sentry_value_t replay = sentry_value_new_object();
+        sentry_value_set_by_key(replay, "replay_id",
+            sentry_value_new_string("deadbeefdeadbeefdeadbeefdeadbeef"));
+        sentry_set_context("replay", replay);
     }
 
     if (has_arg(argc, argv, "attach-after-init")) {
@@ -1028,10 +1158,46 @@ main(int argc, char **argv)
         sleep_s(10);
     }
 
+    if (has_arg(argc, argv, "app-hang")) {
+        printf("app-hang: start\n");
+        fflush(stdout);
+
+        // A couple of heartbeats to latch this (main) thread as the monitored
+        // thread and keep it fresh.
+        for (int i = 0; i < 3; i++) {
+            sentry_app_hang_heartbeat();
+            sleep_ms(100);
+        }
+
+        printf("app-hang: doing some heavy work now (going to sleep)\n");
+        fflush(stdout);
+
+        // Block the monitored thread past the configured timeout so the
+        // watchdog samples this hung thread and captures an AppHang event.
+        sleep_s(3);
+
+        printf("app-hang: finishing\n");
+        fflush(stdout);
+    }
+
     if (has_arg(argc, argv, "test-logger-before-crash")) {
         // Output marker directly using printf for test parsing
         printf("pre-crash-log-message\n");
         fflush(stdout);
+    }
+
+    if (has_arg(argc, argv, "open-transaction")) {
+        // Leave a transaction + nested children unfinished; the crash
+        // auto-finalize should close them all.
+        sentry_transaction_context_t *otx_ctx
+            = sentry_transaction_context_new("open.tx", "op");
+        sentry_transaction_t *otx
+            = sentry_transaction_start(otx_ctx, sentry_value_new_null());
+        sentry_set_transaction_object(otx);
+        sentry_span_t *ospan
+            = sentry_transaction_start_child(otx, "open.span", NULL);
+        sentry_set_span(
+            sentry_span_start_child(ospan, "open.grand.span", NULL));
     }
 
     if (has_arg(argc, argv, "crash")) {
@@ -1164,6 +1330,20 @@ main(int argc, char **argv)
             sentry_transaction_context_update_from_header(
                 tx_ctx, "sentry-trace", trace_header);
         }
+        if (has_arg(argc, argv, "incoming-trace")) {
+            sentry_transaction_context_update_from_header(tx_ctx,
+                "sentry-trace",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-1");
+        }
+        if (has_arg(argc, argv, "incoming-baggage")) {
+            sentry_transaction_context_update_from_header(tx_ctx, "baggage",
+                "sentry-org_id=123456,sentry-environment=upstream,"
+                "sentry-release=upstream-app%401.0");
+        }
+        if (has_arg(argc, argv, "incoming-baggage-mismatch")) {
+            sentry_transaction_context_update_from_header(tx_ctx, "baggage",
+                "sentry-org_id=99999,sentry-environment=upstream");
+        }
 
         sentry_transaction_t *tx
             = sentry_transaction_start(tx_ctx, custom_sampling_ctx);
@@ -1223,7 +1403,7 @@ main(int argc, char **argv)
     sentry_close();
 
     if (has_arg(argc, argv, "sleep-after-shutdown")) {
-        sleep_s(1);
+        sleep_s(5);
     }
 
     if (has_arg(argc, argv, "crash-after-shutdown")) {

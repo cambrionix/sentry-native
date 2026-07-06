@@ -89,6 +89,9 @@ sentry_uuid_t sentry__capture_event(
 sentry_envelope_t *sentry__prepare_transaction(const sentry_options_t *options,
     sentry_value_t transaction, sentry_uuid_t *event_id);
 
+sentry_value_t sentry__transaction_finish_value(
+    sentry_transaction_t *opaque_tx, uint64_t timestamp);
+
 /**
  * This function will submit the `envelope` to the given `transport`, first
  * checking for consent.
@@ -146,7 +149,8 @@ bool sentry__should_send_transaction(
     sentry_value_t tx_ctx, sentry_sampling_context_t *sampling_ctx);
 #endif
 
-#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)
+#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)                 \
+    || defined(SENTRY_PLATFORM_XBOX)
 int sentry__native_init(sentry_options_t *options);
 #endif
 

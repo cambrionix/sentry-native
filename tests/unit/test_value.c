@@ -15,6 +15,41 @@ breadcrumb_with_ts(const char *message, const char *timestamp)
     return breadcrumb;
 }
 
+typedef struct {
+    const char *keys[4];
+    sentry_value_t values[4];
+    size_t count;
+} value_foreach_key_value_collector_t;
+
+static void
+collect_value_pair(const char *key, sentry_value_t value, void *userdata)
+{
+    value_foreach_key_value_collector_t *collector
+        = (value_foreach_key_value_collector_t *)userdata;
+    if (collector->count >= 4) {
+        return;
+    }
+    collector->keys[collector->count] = key;
+    collector->values[collector->count] = value;
+    collector->count++;
+}
+
+static void
+write_nested_msgpack_arrays(char *buf, size_t depth)
+{
+    memset(buf, 0x91, depth); // fixarray[1]
+    buf[depth] = (char)0xc0; // nil
+}
+
+static void
+write_nested_json_arrays(char *buf, size_t depth)
+{
+    memset(buf, '[', depth);
+    memcpy(buf + depth, "null", 4);
+    memset(buf + depth + 4, ']', depth);
+    buf[depth * 2 + 4] = '\0';
+}
+
 SENTRY_TEST(value_null)
 {
     sentry_value_t val = sentry_value_new_null();
@@ -438,8 +473,17 @@ SENTRY_TEST(value_user)
     TEST_CHECK(sentry_value_is_null(user_null));
     sentry_value_decref(user_null);
 
+    // Test that empty ID is respected
     sentry_value_t user_empty_str = sentry_value_new_user("", "", "", "");
-    TEST_CHECK(sentry_value_is_null(user_empty_str));
+    TEST_CHECK_STRING_EQUAL(
+        sentry_value_as_string(sentry_value_get_by_key(user_empty_str, "id")),
+        "");
+    TEST_CHECK(sentry_value_is_null(
+        sentry_value_get_by_key(user_empty_str, "username")));
+    TEST_CHECK(
+        sentry_value_is_null(sentry_value_get_by_key(user_empty_str, "email")));
+    TEST_CHECK(sentry_value_is_null(
+        sentry_value_get_by_key(user_empty_str, "ip_address")));
     sentry_value_decref(user_empty_str);
 }
 
@@ -647,6 +691,33 @@ SENTRY_TEST(value_freezing)
     sentry_value_decref(val);
 }
 
+SENTRY_TEST(value_foreach_key_value)
+{
+    sentry_value_t value = sentry_value_new_object();
+    sentry_value_set_by_key(value, "first", sentry_value_new_string("one"));
+    sentry_value_set_by_key(value, "second", sentry_value_new_int32(2));
+    sentry_value_set_by_key(value, "third", sentry_value_new_bool(true));
+
+    value_foreach_key_value_collector_t collector = { 0 };
+    sentry__value_foreach_key_value(value, collect_value_pair, &collector);
+
+    TEST_CHECK_INT_EQUAL(collector.count, 3);
+    TEST_CHECK_STRING_EQUAL(collector.keys[0], "first");
+    TEST_CHECK_STRING_EQUAL(sentry_value_as_string(collector.values[0]), "one");
+    TEST_CHECK_STRING_EQUAL(collector.keys[1], "second");
+    TEST_CHECK_INT_EQUAL(sentry_value_as_int32(collector.values[1]), 2);
+    TEST_CHECK_STRING_EQUAL(collector.keys[2], "third");
+    TEST_CHECK(sentry_value_is_true(collector.values[2]));
+
+    value_foreach_key_value_collector_t ignored = { 0 };
+    sentry_value_t not_object = sentry_value_new_string("not-object");
+    sentry__value_foreach_key_value(not_object, collect_value_pair, &ignored);
+    TEST_CHECK_INT_EQUAL(ignored.count, 0);
+    sentry_value_decref(not_object);
+
+    sentry_value_decref(value);
+}
+
 SENTRY_TEST(value_stringify)
 {
 #define STRINGIFY_AND_CHECK(Val, Expected)                                     \
@@ -817,6 +888,39 @@ SENTRY_TEST(value_json_deeply_nested)
 
     TEST_CHECK(!sentry_value_is_null(parsed));
     sentry_value_decref(parsed);
+}
+
+SENTRY_TEST(value_json_max_depth)
+{
+    char accepted[64 * 2 + sizeof("null")]; // SENTRY_JSON_MAX_DEPTH
+    write_nested_json_arrays(accepted, 64);
+    sentry_value_t value = sentry__value_from_json(accepted, strlen(accepted));
+    TEST_CHECK(sentry_value_get_type(value) == SENTRY_VALUE_TYPE_LIST);
+    sentry_value_decref(value);
+
+    char too_deep[65 * 2 + sizeof("null")]; // SENTRY_JSON_MAX_DEPTH + 1
+    write_nested_json_arrays(too_deep, 65);
+    value = sentry__value_from_json(too_deep, strlen(too_deep));
+    TEST_CHECK(sentry_value_is_null(value));
+    sentry_value_decref(value);
+}
+
+SENTRY_TEST(value_json_len_out)
+{
+    const char expected[] = "{\"message\":\"escaped\\nvalue\"}";
+    sentry_value_t value = sentry_value_new_object();
+    sentry_value_set_by_key(
+        value, "message", sentry_value_new_string("escaped\nvalue"));
+
+    size_t json_len = 0;
+    char *json = sentry__value_to_json(value, &json_len);
+    sentry_value_decref(value);
+
+    TEST_ASSERT(!!json);
+    TEST_CHECK_STRING_EQUAL(json, expected);
+    TEST_CHECK_INT_EQUAL(json_len, sizeof(expected) - 1);
+
+    sentry_free(json);
 }
 
 SENTRY_TEST(value_json_escaping)
@@ -1494,6 +1598,22 @@ SENTRY_TEST(value_from_msgpack_list)
     sentry_value_decref(deserialized);
 }
 
+SENTRY_TEST(value_from_msgpack_deeply_nested)
+{
+    char accepted[64 + 1]; // SENTRY_MPACK_MAX_DEPTH + 1
+    write_nested_msgpack_arrays(accepted, sizeof(accepted) - 1);
+    sentry_value_t value
+        = sentry__value_from_msgpack(accepted, sizeof(accepted));
+    TEST_CHECK(sentry_value_get_type(value) == SENTRY_VALUE_TYPE_LIST);
+    sentry_value_decref(value);
+
+    char too_deep[64 + 2]; // SENTRY_MPACK_MAX_DEPTH + 2
+    write_nested_msgpack_arrays(too_deep, sizeof(too_deep) - 1);
+    value = sentry__value_from_msgpack(too_deep, sizeof(too_deep));
+    TEST_CHECK(sentry_value_is_null(value));
+    sentry_value_decref(value);
+}
+
 SENTRY_TEST(value_from_msgpack_object)
 {
     sentry_value_t inner = sentry_value_new_object();
@@ -1683,4 +1803,34 @@ SENTRY_TEST(value_merge_breadcrumbs_max_limit)
 
     sentry_value_decref(list_a);
     sentry_value_decref(list_b);
+}
+
+SENTRY_TEST(value_refcount)
+{
+    // primitive values always report refcount 1, and decref is a no-op
+    sentry_value_t null_val = sentry_value_new_null();
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(null_val));
+    TEST_CHECK(!sentry_value_decref(null_val));
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(null_val));
+
+    sentry_value_t bool_val = sentry_value_new_bool(true);
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(bool_val));
+    TEST_CHECK(!sentry_value_decref(bool_val));
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(bool_val));
+
+    sentry_value_t int_val = sentry_value_new_int32(42);
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(int_val));
+    TEST_CHECK(!sentry_value_decref(int_val));
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(int_val));
+
+    // thing-allocated values track refcount through incref/decref
+    sentry_value_t obj = sentry_value_new_object();
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(obj));
+    TEST_CHECK_INT_EQUAL(2, sentry_value_refcount(sentry_value_incref(obj)));
+    TEST_CHECK_INT_EQUAL(3, sentry_value_refcount(sentry_value_incref(obj)));
+    TEST_CHECK(!!sentry_value_decref(obj));
+    TEST_CHECK_INT_EQUAL(2, sentry_value_refcount(obj));
+    TEST_CHECK(!!sentry_value_decref(obj));
+    TEST_CHECK_INT_EQUAL(1, sentry_value_refcount(obj));
+    TEST_CHECK(!sentry_value_decref(obj));
 }

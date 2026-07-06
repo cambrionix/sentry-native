@@ -1,4 +1,6 @@
 #include "sentry.h"
+#include "sentry_database.h"
+#include "sentry_options.h"
 #include "sentry_scope.h"
 #include "sentry_testsupport.h"
 #include "sentry_utils.h"
@@ -94,6 +96,90 @@ SENTRY_TEST(scope_contexts)
     }
 
 #undef TEST_CHECK_CONTEXT_EQUAL
+
+    sentry_close();
+}
+
+SENTRY_TEST(scope_update_context)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_init(options);
+
+    // update into empty: context does not exist yet
+    {
+        sentry_value_t device = sentry_value_new_object();
+        sentry_value_set_by_key(
+            device, "model", sentry_value_new_string("Xbox Series X"));
+        sentry_value_set_by_key(
+            device, "family", sentry_value_new_string("Xbox"));
+        sentry_update_context("device", device);
+
+        SENTRY_WITH_SCOPE (scope) {
+            sentry_value_t ctx
+                = sentry_value_get_by_key(scope->contexts, "device");
+            TEST_CHECK_STRING_EQUAL(
+                sentry_value_as_string(sentry_value_get_by_key(ctx, "model")),
+                "Xbox Series X");
+            TEST_CHECK_STRING_EQUAL(
+                sentry_value_as_string(sentry_value_get_by_key(ctx, "family")),
+                "Xbox");
+        }
+    }
+
+    // update should overwrite existing keys
+    {
+        sentry_value_t extra = sentry_value_new_object();
+        sentry_value_set_by_key(extra, "model", sentry_value_new_string("PC"));
+        sentry_value_set_by_key(
+            extra, "cpu_description", sentry_value_new_string("some cpu"));
+        sentry_update_context("device", extra);
+
+        SENTRY_WITH_SCOPE (scope) {
+            sentry_value_t ctx
+                = sentry_value_get_by_key(scope->contexts, "device");
+            TEST_CHECK_STRING_EQUAL(
+                sentry_value_as_string(sentry_value_get_by_key(ctx, "model")),
+                "PC");
+            TEST_CHECK_STRING_EQUAL(
+                sentry_value_as_string(sentry_value_get_by_key(ctx, "family")),
+                "Xbox");
+            TEST_CHECK_STRING_EQUAL(
+                sentry_value_as_string(
+                    sentry_value_get_by_key(ctx, "cpu_description")),
+                "some cpu");
+        }
+    }
+
+    // scoped update into empty
+    {
+        sentry_scope_t *local_scope = sentry_local_scope_new();
+
+        sentry_value_t os = sentry_value_new_object();
+        sentry_value_set_by_key(os, "name", sentry_value_new_string("SteamOS"));
+        sentry_scope_update_context(local_scope, "os", os);
+
+        sentry_value_t ctx
+            = sentry_value_get_by_key(local_scope->contexts, "os");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(ctx, "name")),
+            "SteamOS");
+
+        // scoped update overwrites existing keys
+        sentry_value_t os2 = sentry_value_new_object();
+        sentry_value_set_by_key(os2, "name", sentry_value_new_string("Linux"));
+        sentry_value_set_by_key(os2, "version", sentry_value_new_string("6.1"));
+        sentry_scope_update_context(local_scope, "os", os2);
+
+        ctx = sentry_value_get_by_key(local_scope->contexts, "os");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(ctx, "name")),
+            "Linux");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(ctx, "version")),
+            "6.1");
+
+        sentry__scope_free(local_scope);
+    }
 
     sentry_close();
 }
@@ -275,6 +361,27 @@ SENTRY_TEST(scope_fingerprint)
     sentry_close();
 }
 
+SENTRY_TEST(scope_fingerprint_n)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_init(options);
+
+    sentry_set_fingerprint_n(
+        "alphabet", (size_t)5, "0123456789", (size_t)8, "xyz", (size_t)1, NULL);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t event = sentry_value_new_object();
+
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+        TEST_CHECK_JSON_VALUE(sentry_value_get_by_key(event, "fingerprint"),
+            "[\"alpha\",\"01234567\",\"x\"]");
+
+        sentry_value_decref(event);
+    }
+
+    sentry_close();
+}
+
 SENTRY_TEST(scope_tags)
 {
     SENTRY_TEST_OPTIONS_NEW(options);
@@ -414,6 +521,88 @@ SENTRY_TEST(scope_user)
             "{\"id\":\"3\",\"username\":\"event\"}");
 
         sentry__scope_free(local_scope);
+        sentry_value_decref(event);
+    }
+
+    sentry_close();
+}
+
+SENTRY_TEST(scope_user_id)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_dsn(options, "http://keya@127.0.0.1/42");
+    sentry_init(options);
+
+    // null user ID -> installation ID
+    TEST_ASSERT(!!options->run->installation_id);
+    TEST_CHECK_INT_EQUAL(strlen(options->run->installation_id), 36);
+    sentry_set_user(sentry_value_new_user(NULL, "alice", NULL, NULL));
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t event = sentry_value_new_object();
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+        sentry_value_t user = sentry_value_get_by_key(event, "user");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "id")),
+            options->run->installation_id);
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "username")),
+            "alice");
+        sentry_value_decref(event);
+    }
+
+    // empty user ID
+    sentry_set_user(sentry_value_new_user("", "bob", NULL, NULL));
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t event = sentry_value_new_object();
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+        sentry_value_t user = sentry_value_get_by_key(event, "user");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "id")), "");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "username")),
+            "bob");
+        sentry_value_decref(event);
+    }
+
+    // non-empty user ID
+    sentry_set_user(sentry_value_new_user("42", "carol", NULL, NULL));
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t event = sentry_value_new_object();
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+        sentry_value_t user = sentry_value_get_by_key(event, "user");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "id")), "42");
+        TEST_CHECK_STRING_EQUAL(
+            sentry_value_as_string(sentry_value_get_by_key(user, "username")),
+            "carol");
+        sentry_value_decref(event);
+    }
+
+    // empty local scope does not shadow global user ID
+    sentry_set_user(sentry_value_new_user("12345", "dave", NULL, NULL));
+    sentry_value_t event = sentry_value_new_object();
+    sentry_scope_t *local_scope = sentry_local_scope_new();
+    sentry__scope_apply_to_event(
+        local_scope, options, event, SENTRY_SCOPE_BREADCRUMBS);
+    sentry__scope_free(local_scope);
+    SENTRY_WITH_SCOPE (scope) {
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_ALL);
+    }
+    sentry_value_t user = sentry_value_get_by_key(event, "user");
+    TEST_CHECK_STRING_EQUAL(
+        sentry_value_as_string(sentry_value_get_by_key(user, "id")), "12345");
+    TEST_CHECK_STRING_EQUAL(
+        sentry_value_as_string(sentry_value_get_by_key(user, "username")),
+        "dave");
+    sentry_value_decref(event);
+
+    // remove_user -> no user on event (installation ID suppressed)
+    sentry_remove_user();
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t event = sentry_value_new_object();
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
+        TEST_CHECK(
+            sentry_value_is_null(sentry_value_get_by_key(event, "user")));
         sentry_value_decref(event);
     }
 

@@ -13,11 +13,12 @@
 #include "sentry_options.h"
 #if defined(SENTRY_PLATFORM_WINDOWS)
 #    include "sentry_os.h"
-#    include <signal.h>
 #endif
 #include "sentry_scope.h"
 #include "sentry_screenshot.h"
+#include "sentry_session_replay.h"
 #include "sentry_sync.h"
+#include "sentry_tracing.h"
 #include "sentry_transport.h"
 #include "sentry_unix_pageallocator.h"
 #include "transports/sentry_disk_transport.h"
@@ -585,47 +586,10 @@ static const struct signal_slot SIGNAL_DEFINITIONS[SIGNAL_COUNT] = {
 
 static LONG WINAPI handle_exception(EXCEPTION_POINTERS *);
 
-// SIGABRT handling on Windows: abort() calls the signal handler but doesn't
-// go through the unhandled exception filter. We register a SIGABRT handler
-// that captures context and calls into our exception handler.
-static void (*g_previous_sigabrt_handler)(int) = NULL;
-
 static void
-handle_sigabrt(int signum)
+handle_sigabrt(EXCEPTION_POINTERS *exception_pointers)
 {
-    (void)signum;
-
-    // Capture the current CPU context
-    CONTEXT context;
-    RtlCaptureContext(&context);
-
-    // Create a synthetic exception record for abort
-    EXCEPTION_RECORD record;
-    memset(&record, 0, sizeof(record));
-    record.ExceptionCode = STATUS_FATAL_APP_EXIT;
-    record.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
-#    if defined(_M_AMD64)
-    record.ExceptionAddress = (PVOID)context.Rip;
-#    elif defined(_M_IX86)
-    record.ExceptionAddress = (PVOID)context.Eip;
-#    elif defined(_M_ARM64)
-    record.ExceptionAddress = (PVOID)context.Pc;
-#    endif
-
-    EXCEPTION_POINTERS exception_pointers;
-    exception_pointers.ContextRecord = &context;
-    exception_pointers.ExceptionRecord = &record;
-
-    handle_exception(&exception_pointers);
-
-    // If we get here, call the previous handler or terminate
-    if (g_previous_sigabrt_handler && g_previous_sigabrt_handler != SIG_DFL
-        && g_previous_sigabrt_handler != SIG_IGN) {
-        g_previous_sigabrt_handler(signum);
-    }
-
-    // Terminate the process - abort() must not return
-    TerminateProcess(GetCurrentProcess(), 3);
+    handle_exception(exception_pointers);
 }
 
 static int
@@ -649,8 +613,7 @@ startup_inproc_backend(
     g_previous_handler = SetUnhandledExceptionFilter(&handle_exception);
     SetErrorMode(SEM_FAILCRITICALERRORS);
 
-    // Register SIGABRT handler - abort() doesn't go through the UEF
-    g_previous_sigabrt_handler = signal(SIGABRT, handle_sigabrt);
+    sentry__win32_install_sigabrt_handler(handle_sigabrt);
 
     return 0;
 }
@@ -666,10 +629,7 @@ shutdown_inproc_backend(sentry_backend_t *backend)
         SetUnhandledExceptionFilter(current_handler);
     }
 
-    // Restore previous SIGABRT handler (unconditionally, since SIG_DFL is
-    // typically NULL on MSVC and a conditional check would skip restoration)
-    signal(SIGABRT, g_previous_sigabrt_handler);
-    g_previous_sigabrt_handler = NULL;
+    sentry__win32_restore_sigabrt_handler();
 
     if (backend) {
         backend->data = NULL;
@@ -1156,6 +1116,9 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
         bool should_handle = true;
         sentry__write_crash_marker(options);
 
+        sentry_value_t transaction
+            = sentry__trace_finish(SENTRY_SPAN_STATUS_ABORTED);
+
         if (options->on_crash_func && !skip_hooks) {
             SENTRY_DEBUG("invoking `on_crash` hook");
             event = options->on_crash_func(uctx, event, options->on_crash_data);
@@ -1174,7 +1137,7 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
         TEST_CRASH_POINT("before_capture");
         if (should_handle) {
             bool capture_screenshot = options->attach_screenshot;
-#ifdef SENTRY_PLATFORM_WINDOWS
+#ifndef SENTRY_SCREENSHOT_NONE
             if (capture_screenshot && options->before_screenshot_func) {
                 SENTRY_DEBUG("invoking `before_screenshot` hook");
                 capture_screenshot = options->before_screenshot_func(
@@ -1185,9 +1148,6 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
 
             sentry_envelope_t *envelope = sentry__prepare_event(options, event,
                 NULL, !options->on_crash_func && !skip_hooks, NULL);
-            // TODO(tracing): Revisit when investigating transaction flushing
-            //                during hard crashes.
-
             sentry_session_t *session = sentry__end_current_session_with_status(
                 SENTRY_SESSION_STATUS_CRASHED);
             sentry__envelope_add_session(envelope, session);
@@ -1202,17 +1162,54 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
                 sentry__attachment_free(screenshot);
             }
 
+            if (options->attach_session_replay) {
+                sentry_attachment_t *replay = sentry__attachment_from_path(
+                    sentry__session_replay_get_path(options));
+                if (replay
+                    && sentry__session_replay_capture(
+                        replay->path, options->session_replay_duration, 0)) {
+                    sentry__envelope_add_attachment(envelope, replay);
+                }
+                sentry__attachment_free(replay);
+            }
+
+            if (envelope && sentry__session_replay_has_pending(options)) {
+                sentry_value_t crash_event
+                    = sentry_envelope_get_event(envelope);
+                sentry_transport_t *replay_transport
+                    = sentry_new_disk_transport(options->run);
+                if (replay_transport) {
+                    sentry__session_replay_flush_pending(
+                        options, replay_transport, crash_event);
+                    sentry__transport_dump_queue(
+                        replay_transport, options->run);
+                    sentry_transport_free(replay_transport);
+                }
+            }
+
             if (!sentry__launch_external_crash_reporter(options, envelope)) {
-                // capture the envelope with the disk transport
+                // capture the envelopes with the disk transport
                 sentry_transport_t *disk_transport
                     = sentry_new_disk_transport(options->run);
+                if (!sentry_value_is_null(transaction)) {
+                    sentry_envelope_t *tx_envelope
+                        = sentry__prepare_transaction(
+                            options, transaction, NULL);
+                    if (tx_envelope) {
+                        sentry__capture_envelope(
+                            disk_transport, tx_envelope, options);
+                    }
+                }
                 sentry__capture_envelope(disk_transport, envelope, options);
                 sentry__transport_dump_queue(disk_transport, options->run);
                 sentry_transport_free(disk_transport);
+            } else {
+                sentry_value_decref(transaction);
             }
         } else {
             SENTRY_DEBUG("event was discarded by the `on_crash` hook");
             sentry_value_decref(event);
+            sentry_value_decref(transaction);
         }
 
         // after capturing the crash event, dump all the envelopes to disk
