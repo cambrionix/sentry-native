@@ -1,4 +1,9 @@
+#include "sentry_core.h"
+#include "sentry_envelope.h"
+#include "sentry_options.h"
+#include "sentry_sync.h"
 #include "sentry_testsupport.h"
+#include "sentry_transport.h"
 
 SENTRY_TEST(uninitialized)
 {
@@ -10,6 +15,10 @@ SENTRY_TEST(uninitialized)
     sentry_user_consent_reset();
     TEST_CHECK(sentry_user_consent_get() == SENTRY_USER_CONSENT_UNKNOWN);
     sentry_uuid_t uuid = sentry_capture_event(sentry_value_new_event());
+    TEST_CHECK(sentry_uuid_is_nil(&uuid));
+    uuid = sentry_get_last_event_id();
+    TEST_CHECK(sentry_uuid_is_nil(&uuid));
+    uuid = sentry_scope_get_last_event_id(NULL);
     TEST_CHECK(sentry_uuid_is_nil(&uuid));
     sentry_handle_exception(NULL);
     sentry_add_breadcrumb(sentry_value_new_breadcrumb("foo", "bar"));
@@ -33,6 +42,25 @@ SENTRY_TEST(uninitialized)
     sentry_close();
 }
 
+SENTRY_TEST(is_enabled)
+{
+    TEST_CHECK(!sentry_is_enabled());
+
+    SENTRY_TEST_OPTIONS_NEW(options);
+    TEST_CHECK(sentry_init(options) == 0);
+    TEST_CHECK(sentry_is_enabled());
+
+    sentry_close();
+    TEST_CHECK(!sentry_is_enabled());
+
+    SENTRY_TEST_OPTIONS_NEW(reinit_options);
+    TEST_CHECK(sentry_init(reinit_options) == 0);
+    TEST_CHECK(sentry_is_enabled());
+
+    sentry_close();
+    TEST_CHECK(!sentry_is_enabled());
+}
+
 SENTRY_TEST(empty_transport)
 {
     SENTRY_TEST_OPTIONS_NEW(options);
@@ -44,6 +72,14 @@ SENTRY_TEST(empty_transport)
         SENTRY_LEVEL_WARNING, NULL, "some message");
     sentry_uuid_t id = sentry_capture_event(event);
     TEST_CHECK(!sentry_uuid_is_nil(&id));
+
+    SENTRY_WITH_OPTIONS (runtime_options) {
+        TEST_ASSERT(!!runtime_options->transport);
+        sentry__transport_suspend(runtime_options->transport);
+        sentry__transport_send_envelope(
+            runtime_options->transport, sentry__envelope_new());
+        TEST_CHECK(sentry__atomic_fetch(&runtime_options->run->retain));
+    }
 
     sentry_close();
 }

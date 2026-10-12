@@ -7,7 +7,7 @@
  * Converts a sentry UUID to a string representation used for internal
  * sentry UUIDs such as event IDs.
  */
-void sentry__internal_uuid_as_string(const sentry_uuid_t *uuid, char str[37]);
+void sentry__internal_uuid_as_string(const sentry_uuid_t *uuid, char str[33]);
 
 /**
  * Converts a sentry UUID to a string representation used for span IDs.
@@ -26,5 +26,12 @@ char *sentry__uuid_as_filename(const sentry_uuid_t *uuid, const char *suffix);
  */
 sentry_uuid_t sentry__uuid_from_native(const GUID *guid);
 #endif
+
+/**
+ * Checks for 32 hex digits, either compact or hyphenated as 8-4-4-4-12.
+ * The buffer need not be null-terminated. UUID version and variant bits are
+ * not checked.
+ */
+bool sentry__uuid_is_valid(const char *id, size_t len);
 
 #endif

@@ -97,6 +97,8 @@ static const size_t g_crash_signal_count
 
 // Global state (signal-safe)
 static sentry_crash_ipc_t *g_crash_ipc = NULL;
+static sentry_handler_strategy_t g_handler_strategy
+    = SENTRY_HANDLER_STRATEGY_DEFAULT;
 static struct sigaction g_previous_handlers[16];
 static stack_t g_signal_stack = { 0 };
 
@@ -118,9 +120,6 @@ reraise_signal(int signum)
 static void
 invoke_previous_signal_handler(int signum, siginfo_t *info, void *context)
 {
-    // Re-enable previous signal handlers before re-raising to prevent loops
-    reset_signal_handlers();
-
     for (size_t i = 0; i < g_crash_signal_count; i++) {
         if (g_crash_signals[i] != signum) {
             continue;
@@ -161,6 +160,8 @@ get_tid(void)
 #    endif
 }
 
+// safe_strxxx are only used on macOS (for stack path and module names)
+#    if defined(SENTRY_PLATFORM_MACOS)
 /**
  * Safe string length (signal-safe)
  */
@@ -174,8 +175,6 @@ safe_strlen(const char *s)
     return len;
 }
 
-// safe_strncpy is only used on macOS (for stack path and module names)
-#    if defined(SENTRY_PLATFORM_MACOS)
 /**
  * Safe string copy (signal-safe)
  */
@@ -238,26 +237,26 @@ safe_uint_to_str(char *buf, size_t buf_size, unsigned int value)
 }
 
 /**
- * Build stack path signal-safely: "{database_path}/__sentry-stack{index}"
+ * Build stack path signal-safely: "{run_path}/__sentry-stack{index}"
  * Returns total length or 0 on error/truncation
  */
 static size_t
 safe_build_stack_path(
-    char *dest, size_t dest_size, const char *database_path, unsigned int index)
+    char *dest, size_t dest_size, const char *run_path, unsigned int index)
 {
     if (!dest || dest_size == 0) {
         return 0;
     }
 
-    // Copy database path
+    // Copy run path
     size_t pos = 0;
-    size_t db_len = safe_strlen(database_path);
-    if (db_len >= dest_size) {
+    size_t run_len = safe_strlen(run_path);
+    if (run_len >= dest_size) {
         dest[0] = '\0';
         return 0; // Would truncate
     }
-    safe_strncpy(dest, database_path, dest_size);
-    pos = db_len;
+    safe_strncpy(dest, run_path, dest_size);
+    pos = run_len;
 
     // Append "/__sentry-stack"
     const char *suffix = "/__sentry-stack";
@@ -292,11 +291,39 @@ safe_build_stack_path(
 static void
 crash_signal_handler(int signum, siginfo_t *info, void *context)
 {
+    sentry__enter_crash_handler();
+    ucontext_t *uctx = (ucontext_t *)context;
+
+#    if defined(SENTRY_PLATFORM_LINUX) && !defined(SENTRY_PLATFORM_ANDROID)
+    if (g_handler_strategy == SENTRY_HANDLER_STRATEGY_CHAIN_AT_START
+        && signum != SIGABRT && uctx) {
+        uintptr_t ip = sentry__ucontext_get_ip(uctx);
+        uintptr_t sp = sentry__ucontext_get_sp(uctx);
+
+        invoke_previous_signal_handler(signum, info, context);
+
+        // If the previous handler changed the instruction or stack pointer,
+        // it converted the signal into a runtime-level exception and
+        // transferred execution away from the faulting instruction. In that
+        // case this was not a native crash for Sentry to capture.
+        if (ip != sentry__ucontext_get_ip(uctx)
+            || sp != sentry__ucontext_get_sp(uctx)) {
+            sentry__exit_crash_handler();
+            return;
+        }
+    }
+#    endif
+
     sentry_crash_ipc_t *ipc = g_crash_ipc;
     if (!ipc || !ipc->shmem) {
         // No IPC available, forward to the previous handler
-        invoke_previous_signal_handler(signum, info, context);
+        // Re-enable previous signal handlers before re-raising to prevent loops
+        reset_signal_handlers();
+        if (g_handler_strategy != SENTRY_HANDLER_STRATEGY_CHAIN_AT_START) {
+            invoke_previous_signal_handler(signum, info, context);
+        }
         // The previous handler returned, fall back to default termination
+        sentry__exit_crash_handler();
         reraise_signal(signum);
         return;
     }
@@ -305,11 +332,11 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
     static volatile long handling_crash = 0;
     if (!sentry__atomic_compare_swap(&handling_crash, 0, 1)) {
         // Already handling a crash, just exit immediately
+        sentry__exit_crash_handler();
         _exit(1);
     }
 
     sentry_crash_context_t *ctx = ipc->shmem;
-    ucontext_t *uctx = (ucontext_t *)context;
 
     // Fill crash context
     ctx->crashed_pid = getpid();
@@ -505,7 +532,17 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
                 }
             }
 
-            // Capture stack memory for this thread
+            // Capture stack memory for this thread. In crashed-only
+            // stackwalk mode the daemon never walks the other threads, so
+            // their stack copies would go unused.
+            if (!is_crashing_thread
+                && ctx->thread_stackwalk_mode
+                    == SENTRY_THREAD_STACKWALK_MODE_CRASHED_ONLY) {
+                ctx->platform.threads[i].stack_path[0] = '\0';
+                ctx->platform.threads[i].stack_size = 0;
+                continue;
+            }
+
             uint64_t sp;
 #        if defined(__x86_64__)
             sp = ctx->platform.threads[i].state.__ss.__rsp;
@@ -545,11 +582,11 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
                 }
 
                 if (actual_stack_size > 0) {
-                    // Create stack file path in database directory
+                    // Create stack file path in run directory
                     // (signal-safe)
                     char stack_path[SENTRY_CRASH_MAX_PATH];
                     size_t len = safe_build_stack_path(
-                        stack_path, sizeof(stack_path), ctx->database_path, i);
+                        stack_path, sizeof(stack_path), ctx->run_path, i);
 
                     // Check for failure/truncation
                     if (len == 0) {
@@ -677,9 +714,9 @@ crash_signal_handler(int signum, siginfo_t *info, void *context)
     // File format: module[0] header (4096 bytes) || module[1] header || ...
     {
         char hdr_path[SENTRY_CRASH_MAX_PATH];
-        size_t pos = safe_strlen(ctx->database_path);
+        size_t pos = safe_strlen(ctx->run_path);
         if (pos + 22 < sizeof(hdr_path)) { // "/__sentry-modheaders\0"
-            safe_strncpy(hdr_path, ctx->database_path, sizeof(hdr_path));
+            safe_strncpy(hdr_path, ctx->run_path, sizeof(hdr_path));
             const char *suffix = "/__sentry-modheaders";
             for (size_t si = 0; suffix[si] != '\0'; si++) {
                 hdr_path[pos++] = suffix[si];
@@ -762,78 +799,51 @@ daemon_handling:
 
     // Dump daemon log for debugging (uses stdio, safe after page allocator
     // enabled)
-    // Extract the shm identifier for log path construction
-    // macOS: shm_path = "{tmpdir}/.sentry-shm-{id}", Linux: shm_name =
-    // "/s-{id}"
-#    if defined(SENTRY_PLATFORM_MACOS)
-    const char *shm_id_src = ipc ? ipc->shm_path : "";
-#    else
-    const char *shm_id_src = ipc ? ipc->shm_name : "";
-#    endif
-    if (shm_id_src[0] != '\0' && ctx && ctx->database_path[0] != '\0') {
-        // Extract hex ID after last '-' in shm name/path
-        const char *shm_id = NULL;
-        for (const char *p = shm_id_src; *p; p++) {
-            if (*p == '-') {
-                shm_id = p + 1;
-            }
+    if (ctx && ctx->run_path[0] != '\0') {
+        char log_path[SENTRY_CRASH_MAX_PATH];
+        const char suffix[] = "/sentry-daemon.log";
+        int len = 0;
+        // Manually build path string (signal-safe)
+        for (const char *p = ctx->run_path;
+            *p && len < (int)(sizeof(log_path) - sizeof(suffix)); p++) {
+            log_path[len++] = *p;
         }
+        for (const char *p = suffix; *p && len < (int)sizeof(log_path) - 1;
+            p++) {
+            log_path[len++] = *p;
+        }
+        log_path[len] = '\0';
 
-        if (shm_id) {
-            char log_path[SENTRY_CRASH_MAX_PATH];
-            int len = 0;
-            // Manually build path string (signal-safe)
-            for (const char *p = ctx->database_path;
-                *p && len < (int)sizeof(log_path) - 30; p++) {
-                log_path[len++] = *p;
-            }
-            const char *suffix = "/sentry-daemon-";
-            for (const char *p = suffix; *p && len < (int)sizeof(log_path) - 15;
-                p++) {
-                log_path[len++] = *p;
-            }
-            for (const char *p = shm_id; *p && len < (int)sizeof(log_path) - 5;
-                p++) {
-                log_path[len++] = *p;
-            }
-            const char *ext = ".log";
-            for (const char *p = ext; *p && len < (int)sizeof(log_path) - 1;
-                p++) {
-                log_path[len++] = *p;
-            }
-            log_path[len] = '\0';
+        // Try to open and dump log file
+        int fd = open(log_path, O_RDONLY);
+        if (fd >= 0) {
+            // Use sizeof()-1 for string literals (signal-safe)
+            ssize_t rv
+                = write(STDERR_FILENO, "\n========== Daemon Log ==========\n",
+                    sizeof("\n========== Daemon Log ==========\n") - 1);
+            (void)rv; // Ignore write errors in signal handler
 
-            // Try to open and dump log file
-            int fd = open(log_path, O_RDONLY);
-            if (fd >= 0) {
-                // Use sizeof()-1 for string literals (signal-safe)
-                ssize_t rv = write(STDERR_FILENO, "\n========== Daemon Log (",
-                    sizeof("\n========== Daemon Log (") - 1);
-                (void)rv; // Ignore write errors in signal handler
-                rv = write(STDERR_FILENO, shm_id, safe_strlen(shm_id));
+            char buf[1024];
+            ssize_t n;
+            while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                rv = write(STDERR_FILENO, buf, n);
                 (void)rv;
-                rv = write(STDERR_FILENO, ") ==========\n",
-                    sizeof(") ==========\n") - 1);
-                (void)rv;
-
-                char buf[1024];
-                ssize_t n;
-                while ((n = read(fd, buf, sizeof(buf))) > 0) {
-                    rv = write(STDERR_FILENO, buf, n);
-                    (void)rv;
-                }
-
-                rv = write(STDERR_FILENO,
-                    "=========================================\n\n",
-                    sizeof("=========================================\n\n")
-                        - 1);
-                (void)rv;
-                close(fd);
             }
+
+            rv = write(STDERR_FILENO, "================================\n\n",
+                sizeof("================================\n\n") - 1);
+            (void)rv;
+            close(fd);
         }
     }
 
-    invoke_previous_signal_handler(signum, info, context);
+    // Re-enable previous signal handlers before re-raising to prevent loops
+    sentry__exit_crash_handler();
+    reset_signal_handlers();
+
+    if (g_handler_strategy != SENTRY_HANDLER_STRATEGY_CHAIN_AT_START) {
+        invoke_previous_signal_handler(signum, info, context);
+    }
 
 #    if defined(SENTRY_PLATFORM_MACOS)
     if (!ctx->system_crash_reporter_enabled) {
@@ -848,13 +858,15 @@ daemon_handling:
 }
 
 int
-sentry__crash_handler_init(sentry_crash_ipc_t *ipc)
+sentry__crash_handler_init(
+    sentry_crash_ipc_t *ipc, sentry_handler_strategy_t strategy)
 {
     if (!ipc) {
         return -1;
     }
 
     g_crash_ipc = ipc;
+    g_handler_strategy = strategy;
 
     // Set up signal stack
     g_signal_stack.ss_sp = sentry_malloc(SENTRY_CRASH_SIGNAL_STACK_SIZE);
@@ -933,6 +945,35 @@ sentry__crash_handler_init(sentry_crash_ipc_t *ipc)
     return 0;
 }
 
+int
+sentry__crash_handler_reinstall(void)
+{
+    if (!g_crash_ipc) {
+        return -1;
+    }
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = crash_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+
+    for (size_t i = 0; i < g_crash_signal_count; i++) {
+        struct sigaction previous;
+        int sig = g_crash_signals[i];
+        if (sigaction(sig, &sa, &previous) < 0) {
+            SENTRY_WARNF("failed to reinstall handler for signal %d: %s", sig,
+                strerror(errno));
+            return -1;
+        }
+        if (!(previous.sa_flags & SA_SIGINFO)
+            || previous.sa_sigaction != crash_signal_handler) {
+            g_previous_handlers[i] = previous;
+        }
+    }
+    return 0;
+}
+
 void
 sentry__crash_handler_shutdown(void)
 {
@@ -972,16 +1013,19 @@ crash_sigabrt_handler(EXCEPTION_POINTERS *exception_pointers)
 static LONG WINAPI
 crash_exception_filter(EXCEPTION_POINTERS *exception_info)
 {
+    sentry__enter_crash_handler();
     // Only handle crash once
     static volatile long handling_crash = 0;
     if (!sentry__atomic_compare_swap(&handling_crash, 0, 1)) {
         // Already handling a crash (no logging - exception filter context)
+        sentry__exit_crash_handler();
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
     sentry_crash_ipc_t *ipc = g_crash_ipc;
     if (!ipc || !ipc->shmem) {
         // No IPC or shared memory (no logging - exception filter context)
+        sentry__exit_crash_handler();
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -1026,17 +1070,12 @@ crash_exception_filter(EXCEPTION_POINTERS *exception_info)
 
         // Wait for daemon to finish processing (keep process alive for
         // minidump)
-        bool processing_started = false;
         int elapsed_ms = 0;
         while (elapsed_ms < SENTRY_CRASH_HANDLER_WAIT_TIMEOUT_MS) {
             long state = sentry__atomic_fetch(&ctx->state);
-            if (state == SENTRY_CRASH_STATE_PROCESSING && !processing_started) {
-                // Daemon started processing (no logging - exception filter
-                // context)
-                processing_started = true;
-            } else if (state >= SENTRY_CRASH_STATE_CAPTURED) {
-                // Daemon captured crash data (no logging - exception filter
-                // context)
+            if (state >= SENTRY_CRASH_STATE_PROCESSED) {
+                // Daemon already processed crash data (no logging - exception
+                // filter context)
                 break;
             }
             Sleep(SENTRY_CRASH_HANDLER_POLL_INTERVAL_MS);
@@ -1047,31 +1086,49 @@ crash_exception_filter(EXCEPTION_POINTERS *exception_info)
     }
 
     // Continue to default handler (which will terminate the process)
+    sentry__exit_crash_handler();
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 int
-sentry__crash_handler_init(sentry_crash_ipc_t *ipc)
+sentry__crash_handler_init(
+    sentry_crash_ipc_t *ipc, sentry_handler_strategy_t strategy)
 {
     if (!ipc) {
         return -1;
     }
+    (void)strategy;
 
     g_crash_ipc = ipc;
 
-    // Install exception filter
-    g_previous_filter = SetUnhandledExceptionFilter(crash_exception_filter);
-    sentry__win32_install_sigabrt_handler(crash_sigabrt_handler);
+    sentry__crash_handler_reinstall();
 
     SENTRY_DEBUG("crash handler initialized (Windows SEH)");
+    return 0;
+}
+
+int
+sentry__crash_handler_reinstall(void)
+{
+    if (!g_crash_ipc) {
+        return -1;
+    }
+
+    // Install exception filter
+    LPTOP_LEVEL_EXCEPTION_FILTER previous
+        = SetUnhandledExceptionFilter(crash_exception_filter);
+    if (previous != crash_exception_filter) {
+        g_previous_filter = previous;
+    }
+    sentry__win32_install_sigabrt_handler(crash_sigabrt_handler);
     return 0;
 }
 
 void
 sentry__crash_handler_shutdown(void)
 {
-    // Restore previous exception filter
-    if (g_previous_filter) {
+    // Restore previous exception filter (including NULL)
+    if (g_crash_ipc) {
         SetUnhandledExceptionFilter(g_previous_filter);
         g_previous_filter = NULL;
     }

@@ -5,7 +5,10 @@
  * and low-level crash handling functionality.
  */
 
+#include "sentry_database.h"
+#include "sentry_envelope.h"
 #include "sentry_options.h"
+#include "sentry_path.h"
 #include "sentry_testsupport.h"
 #include <string.h>
 
@@ -13,11 +16,175 @@
 // Include native backend headers
 #    include "../../src/backends/native/minidump/sentry_minidump_format.h"
 #    include "../../src/backends/native/sentry_crash_context.h"
+
+static void
+noop_crashed_last_run(const sentry_envelope_t *envelope, void *user_data)
+{
+    (void)envelope;
+    (void)user_data;
+}
+
+static void
+count_sent_envelopes(sentry_envelope_t *envelope, void *state)
+{
+    size_t *count = state;
+    (*count)++;
+    sentry_envelope_free(envelope);
+}
 #endif
 
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
 #    include "sentry_elf.h"
 #endif
+
+#if defined(SENTRY_PLATFORM_LINUX)
+#    include <fcntl.h>
+#    include <stdlib.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
+#endif
+
+SENTRY_TEST(daemon_adopts_existing_run)
+{
+#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)
+    SKIP_TEST();
+#endif
+    SENTRY_TEST_OPTIONS_NEW(options);
+    TEST_ASSERT(sentry__path_remove_all(options->database_path) == 0);
+    TEST_ASSERT(sentry__path_create_dir_all(options->database_path) == 0);
+
+    sentry_run_t *existing_run = sentry__run_new(options->database_path);
+    TEST_ASSERT(!!existing_run);
+    sentry_run_t *adopted_run
+        = sentry__run_adopt(options->database_path, existing_run->run_path);
+    TEST_ASSERT(!!adopted_run);
+
+    sentry_path_t *cache_path
+        = sentry__path_join_str(options->database_path, "cache");
+    sentry_path_t *external_path
+        = sentry__path_join_str(options->database_path, "external");
+    sentry_path_t *daemon_lock_path
+        = sentry__path_append_str(existing_run->run_path, ".daemon.lock");
+    TEST_ASSERT(!!cache_path);
+    TEST_ASSERT(!!external_path);
+    TEST_ASSERT(!!daemon_lock_path);
+
+    TEST_CHECK(sentry__path_eq(adopted_run->run_path, existing_run->run_path));
+    TEST_CHECK(sentry__path_eq(adopted_run->cache_path, cache_path));
+    TEST_CHECK(sentry__path_eq(adopted_run->external_path, external_path));
+    TEST_CHECK(sentry__path_is_file(daemon_lock_path));
+
+    size_t run_count = 0;
+    sentry_pathiter_t *it = sentry__path_iter_directory(options->database_path);
+    const sentry_path_t *entry;
+    while (it && (entry = sentry__pathiter_next(it)) != NULL) {
+        if (sentry__path_is_dir(entry)
+            && sentry__path_ends_with(entry, ".run")) {
+            run_count++;
+        }
+    }
+    sentry__pathiter_free(it);
+    TEST_CHECK_INT_EQUAL(run_count, 1);
+
+    sentry__run_free(adopted_run);
+    TEST_CHECK(!sentry__path_is_file(daemon_lock_path));
+    sentry__run_clean(existing_run, true);
+    sentry__run_free(existing_run);
+    sentry__path_free(daemon_lock_path);
+    sentry__path_free(external_path);
+    sentry__path_free(cache_path);
+    sentry_options_free(options);
+}
+
+SENTRY_TEST(daemon_run_blocks_old_run_cleanup)
+{
+#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)
+    SKIP_TEST();
+#endif
+    SENTRY_TEST_OPTIONS_NEW(options);
+    TEST_ASSERT(sentry__path_remove_all(options->database_path) == 0);
+    TEST_ASSERT(sentry__path_create_dir_all(options->database_path) == 0);
+
+    options->run = sentry__run_new(options->database_path);
+    TEST_ASSERT(!!options->run);
+    sentry_run_t *old_run = sentry__run_new(options->database_path);
+    TEST_ASSERT(!!old_run);
+    sentry__filelock_unlock(old_run->lock);
+
+    sentry_run_t *daemon_run
+        = sentry__run_adopt(options->database_path, old_run->run_path);
+    TEST_ASSERT(!!daemon_run);
+    sentry_path_t *artifact
+        = sentry__path_join_str(old_run->run_path, "daemon.log");
+    TEST_ASSERT(!!artifact);
+    TEST_ASSERT(sentry__path_write_buffer(artifact, "log", 3) == 0);
+
+    sentry__process_old_runs(options, 0);
+    TEST_CHECK(sentry__path_is_dir(old_run->run_path));
+    TEST_CHECK(sentry__path_is_file(artifact));
+
+    sentry__run_free(daemon_run);
+    sentry__process_old_runs(options, 0);
+    TEST_CHECK(!sentry__path_is_dir(old_run->run_path));
+    TEST_CHECK(!sentry__path_is_file(artifact));
+
+    sentry__path_free(artifact);
+    sentry__run_free(old_run);
+    sentry__run_clean(options->run, true);
+    sentry_options_free(options);
+}
+
+SENTRY_TEST(corrupt_crash_envelope_does_not_block_old_run)
+{
+#ifdef SENTRY_BACKEND_NATIVE
+    SENTRY_TEST_OPTIONS_NEW(options);
+    TEST_ASSERT(sentry__path_remove_all(options->database_path) == 0);
+    TEST_ASSERT(sentry__path_create_dir_all(options->database_path) == 0);
+
+    options->run = sentry__run_new(options->database_path);
+    TEST_ASSERT(!!options->run);
+    sentry_run_t *old_run = sentry__run_new(options->database_path);
+    TEST_ASSERT(!!old_run);
+    sentry__filelock_unlock(old_run->lock);
+
+    sentry_path_t *crash_envelope
+        = sentry__path_join_str(old_run->run_path, "__sentry-crash.envelope");
+    sentry_path_t *queued_envelope
+        = sentry__path_join_str(old_run->run_path, "queued.envelope");
+    TEST_ASSERT(!!crash_envelope && !!queued_envelope);
+    TEST_ASSERT(sentry__path_write_buffer(crash_envelope, "garbage", 7) == 0);
+
+    sentry_envelope_t *envelope = sentry__envelope_new();
+    TEST_ASSERT(!!envelope);
+    sentry__envelope_add_event(envelope,
+        sentry_value_new_message_event(SENTRY_LEVEL_ERROR, NULL, "queued"));
+    TEST_ASSERT(sentry_envelope_write_to_path(envelope, queued_envelope) == 0);
+    sentry_envelope_free(envelope);
+
+    size_t sent_envelopes = 0;
+    sentry_transport_t *transport = sentry_transport_new(count_sent_envelopes);
+    TEST_ASSERT(!!transport);
+    sentry_transport_set_state(transport, &sent_envelopes);
+    sentry_options_set_transport(options, transport);
+    sentry_options_set_on_crashed_last_run(
+        options, noop_crashed_last_run, NULL);
+
+    sentry__process_old_runs(options, 0);
+
+    TEST_CHECK_INT_EQUAL(sent_envelopes, 1);
+    TEST_CHECK(!sentry__path_is_dir(old_run->run_path));
+    TEST_CHECK(!sentry__path_is_file(crash_envelope));
+    TEST_CHECK(!sentry__path_is_file(queued_envelope));
+
+    sentry__path_free(queued_envelope);
+    sentry__path_free(crash_envelope);
+    sentry__run_free(old_run);
+    sentry__run_clean(options->run, true);
+    sentry_options_free(options);
+#else
+    SKIP_TEST();
+#endif
+}
 
 /**
  * Test minidump header structure size and alignment
@@ -37,6 +204,32 @@ SENTRY_TEST(minidump_header_size)
     TEST_CHECK(header.version == 0xa793); // Version 1.0
 #else
     SKIP_TEST();
+#endif
+}
+
+SENTRY_TEST(elf_rejects_non_regular_files)
+{
+#if !defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+    SKIP_TEST();
+#else
+    TEST_CHECK(sentry__elf_is_file("/proc/self/exe"));
+    TEST_CHECK(!sentry__elf_is_file("/dev/null"));
+
+    char path[] = "/tmp/sentry-minidump-module-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    TEST_ASSERT(unlink(path) == 0);
+    TEST_ASSERT(mkfifo(path, 0600) == 0);
+
+    fd = open(path, O_RDWR | O_NONBLOCK);
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(write(fd, ELFMAG, SELFMAG) == (ssize_t)SELFMAG);
+
+    TEST_CHECK(!sentry__elf_is_file(path));
+
+    close(fd);
+    TEST_CHECK(unlink(path) == 0);
 #endif
 }
 
@@ -387,6 +580,32 @@ SENTRY_TEST(crash_context_transport_fields)
 #endif
 }
 
+SENTRY_TEST(crash_context_init)
+{
+#ifdef SENTRY_BACKEND_NATIVE
+    sentry_crash_context_t *ctx = sentry_malloc(sizeof(*ctx));
+    TEST_ASSERT(!!ctx);
+    memset(ctx, 0xA5, sizeof(*ctx));
+
+    sentry__crash_context_init(ctx);
+
+    TEST_CHECK_INT_EQUAL(ctx->magic, SENTRY_CRASH_MAGIC);
+    TEST_CHECK_INT_EQUAL(ctx->version, SENTRY_CRASH_VERSION);
+    TEST_CHECK_INT_EQUAL(ctx->state, SENTRY_CRASH_STATE_READY);
+    TEST_CHECK_INT_EQUAL(ctx->sequence, 0);
+    TEST_CHECK_INT_EQUAL(ctx->module_count, 0);
+
+    TEST_CHECK(
+        ((unsigned char *)ctx)[offsetof(sentry_crash_context_t, modules) - 1]
+        == 0);
+    TEST_CHECK(((unsigned char *)&ctx->modules[0])[0] == 0xA5);
+
+    sentry_free(ctx);
+#else
+    SKIP_TEST();
+#endif
+}
+
 /**
  * Test that options transport configuration is propagated to crash context
  * during native backend startup. This verifies the fix for the daemon
@@ -402,9 +621,14 @@ SENTRY_TEST(crash_context_options_propagation)
     sentry_options_set_proxy(options, "http://myproxy:3128");
     sentry_options_set_shutdown_timeout(options, 12345);
     sentry_options_set_system_crash_reporter_enabled(options, true);
+    sentry_options_set_on_crashed_last_run(
+        options, noop_crashed_last_run, NULL);
     sentry_options_set_crash_upload_mode(
         options, SENTRY_CRASH_UPLOAD_MODE_ASYNC);
     sentry_options_set_transfer_timeout(options, 45000);
+#    ifdef SENTRY_PLATFORM_WINDOWS
+    sentry_options_set_minidump_flags(options, 0x00000006);
+#    endif
 
     // Verify options were set correctly
     TEST_CHECK_STRING_EQUAL(
@@ -433,8 +657,12 @@ SENTRY_TEST(crash_context_options_propagation)
     }
     ctx->shutdown_timeout = options->shutdown_timeout;
     ctx->system_crash_reporter_enabled = options->system_crash_reporter_enabled;
+    ctx->has_on_crashed_last_run = options->on_crashed_last_run_func != NULL;
     ctx->crash_upload_mode = options->crash_upload_mode;
     ctx->transfer_timeout = options->transfer_timeout;
+#    ifdef SENTRY_PLATFORM_WINDOWS
+    ctx->minidump_flags = options->minidump_flags;
+#    endif
 
     // Verify crash context received the values
     TEST_CHECK_STRING_EQUAL(ctx->ca_certs, "/path/to/ca-bundle.crt");
@@ -443,9 +671,13 @@ SENTRY_TEST(crash_context_options_propagation)
     TEST_CHECK(ctx->user_agent[0] != '\0');
     TEST_CHECK_UINT64_EQUAL(ctx->shutdown_timeout, 12345);
     TEST_CHECK(ctx->system_crash_reporter_enabled);
+    TEST_CHECK(ctx->has_on_crashed_last_run);
     TEST_CHECK_INT_EQUAL(
         ctx->crash_upload_mode, SENTRY_CRASH_UPLOAD_MODE_ASYNC);
     TEST_CHECK_UINT64_EQUAL(ctx->transfer_timeout, 45000);
+#    ifdef SENTRY_PLATFORM_WINDOWS
+    TEST_CHECK_INT_EQUAL(ctx->minidump_flags, 0x00000006);
+#    endif
 
     sentry_free(ctx);
     sentry_options_free(options);

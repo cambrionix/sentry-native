@@ -29,6 +29,31 @@ extern void run_concurrent_crash(void);
 
 static void *invalid_mem = (void *)1;
 
+#ifdef _WIN32
+// This test stresses inproc's crash handling from many threads at
+// once. The handler normally returns EXCEPTION_CONTINUE_SEARCH, which
+// lets every thread enter WER concurrently and can stall the CI.
+// ==> Chain through the inproc handler to capture the crash, but
+// return EXCEPTION_EXECUTE_HANDLER to terminate and skip WER.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_sentry_exception_filter;
+
+static LONG WINAPI
+test_exception_filter(EXCEPTION_POINTERS *exception_info)
+{
+    if (g_sentry_exception_filter) {
+        g_sentry_exception_filter(exception_info);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void
+install_test_exception_filter(void)
+{
+    g_sentry_exception_filter
+        = SetUnhandledExceptionFilter(test_exception_filter);
+}
+#endif
+
 // Prevent inlining and optimization to ensure predictable frame records.
 #if defined(__clang__)
 #    define NOINLINE __attribute__((noinline, optnone))
@@ -148,11 +173,12 @@ stacktest_A_calls_B_no_frame_record(void)
 
 // on_crash callback that crashes via SIGSEGV: simulates buggy user code
 static sentry_value_t
-crashing_on_crash_callback(
-    const sentry_ucontext_t *uctx, sentry_value_t event, void *closure)
+crashing_on_crash_callback(const sentry_ucontext_t *uctx, sentry_value_t event,
+    sentry_hint_t *hint, void *closure)
 {
     (void)uctx;
     (void)event;
+    (void)hint;
     (void)closure;
 
     fprintf(stderr, "on_crash callback about to crash\n");
@@ -165,11 +191,12 @@ crashing_on_crash_callback(
 
 // on_crash callback that crashes via abort(): tests signal mask reset behavior
 static sentry_value_t
-aborting_on_crash_callback(
-    const sentry_ucontext_t *uctx, sentry_value_t event, void *closure)
+aborting_on_crash_callback(const sentry_ucontext_t *uctx, sentry_value_t event,
+    sentry_hint_t *hint, void *closure)
 {
     (void)uctx;
     (void)event;
+    (void)hint;
     (void)closure;
 
     fprintf(stderr, "on_crash callback about to abort\n");
@@ -230,6 +257,10 @@ test_concurrent_crash(PATH_TYPE database_path)
 
     sentry_set_tag("test", "concurrent-crash");
 
+#ifdef _WIN32
+    install_test_exception_filter();
+#endif
+
     fprintf(stderr, "Starting concurrent crash test\n");
     fflush(stderr);
 
@@ -239,12 +270,6 @@ test_concurrent_crash(PATH_TYPE database_path)
     fprintf(stderr, "ERROR: Threads returned without crashing\n");
     sentry_close();
     return 1;
-}
-
-static void
-trigger_crash(void)
-{
-    memset((char *)invalid_mem, 1, 100);
 }
 
 static int
@@ -301,7 +326,7 @@ test_handler_thread_crash(PATH_TYPE database_path)
     // This will crash, trigger the handler thread, which will call
     // on_crash callback, which will crash the handler thread.
     // The fallback should then process in the signal handler.
-    trigger_crash();
+    sentry_crash();
 
     fprintf(stderr, "ERROR: Should have crashed\n");
     sentry_close();
@@ -323,7 +348,7 @@ test_handler_abort_crash(PATH_TYPE database_path)
     // This will crash, trigger the handler thread, which will call
     // on_crash callback, which will call abort(). abort() resets the
     // signal mask, so this tests a different code path.
-    trigger_crash();
+    sentry_crash();
 
     fprintf(stderr, "ERROR: Should have crashed\n");
     sentry_close();
@@ -389,7 +414,7 @@ test_simple_crash(PATH_TYPE database_path)
     fprintf(stderr, "Starting simple crash test\n");
     fflush(stderr);
 
-    trigger_crash();
+    sentry_crash();
 
     fprintf(stderr, "ERROR: Should have crashed\n");
     sentry_close();

@@ -209,6 +209,12 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
 - `SENTRY_LINK_PTHREAD` (Default: `ON`):
   Links platform threads library like `pthread` on UNIX targets.
 
+- `SENTRY_LINK_CURL` (Default: `AUTO`):
+  Controls whether the `curl` transport links `libcurl` directly or loads it
+  dynamically at runtime on UNIX targets. Possible values are `AUTO`, `ON`, and
+  `OFF`. `AUTO` currently behaves like `ON`, except for the native crash daemon
+  on UNIX targets, where it behaves like `OFF`.
+
 - `SENTRY_BUILD_FORCE32` (Default: `OFF`):
   Forces cross-compilation from 64-bit host to 32-bit target. Only affects Linux.
 
@@ -246,10 +252,10 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
     only supported on Desktop OSs.
   - **inproc**: A small in-process handler that is supported on all platforms,
     and is used as a default on Android.
-  - **native**: **(Experimental)** An out-of-process crash handler that uses a
-    lightweight daemon to monitor the application, generate minidumps, and send
-    crash reports. Supports Linux, macOS, and Windows. Compatible with TSAN and
-    ASAN sanitizers. This backend is under active development.
+  - **native**: An out-of-process crash handler that uses a lightweight daemon
+    to monitor the application, generate minidumps, and send crash reports.
+    Supports Linux, macOS, and Windows. Compatible with TSAN and ASAN
+    sanitizers.
   - **none**: This builds `sentry-native` without a backend, so it does not handle
     crashes. It is primarily used for tests.
 
@@ -285,13 +291,19 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
   Sets the SDK name that should be included in the reported events. If you're overriding this, also define
   the same value using `target_compile_definitions()` on your own targets that include `sentry.h`.
 
+- `SENTRY_BATCHER_BUFFER_COUNT` (Default: `3`):
+  Sets the number of 100-item buffers allocated by each telemetry batcher. Valid values range from `2` to `10`.
+  Increasing the value retains more logs and metrics during sudden bursts, at the cost of reserving more memory even
+  when the buffers are empty. For example, `-D SENTRY_BATCHER_BUFFER_COUNT=10` provides capacity for up to 1,000
+  queued items per batcher while keeping each envelope limited to 100 items.
+
 - `SENTRY_HANDLER_STACK_SIZE` (Default: `64`):
   This specifies the size in KiB of the stack reserved for the crash handler (including hooks like `on_crash` and
   `before_send`) on Windows, Linux, and the `inproc` backend in macOS. Reserving the stack is necessary in case of a
   stack-overflow, where the handler could otherwise no longer execute. This parameter allows users to specify their
-  target stack size in KiB, because some applications might require a different value from our default. This value can
-  be as small as 16KiB (on `crashpad` and `breakpad`) for handlers to work, but we recommend 32KiB as the lower bound
-  on 64-bit systems. **The value should be a multiple of the page size**.
+  target stack size in KiB, because some applications might require a different value from our default. On Windows,
+  this value can be as small as 16KiB with `breakpad` and 24KiB with `crashpad` and `native`, but we recommend 32KiB
+  as the lower bound on 64-bit systems. **The value should be a multiple of the page size**.
 
 - `SENTRY_THREAD_STACK_GUARANTEE_FACTOR` (Default: `10`, only for Windows):
   Defines the factor by which the thread's stack reserve must exceed the specified guarantee for the handler.
@@ -322,6 +334,7 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
 |            |         |       |       |         |      |
 | Backends   |         |       |       |         |      |
 | - crashpad | ☑       | ☑     | ☑     |         |      |
+| - native   | ✓       | ✓     | ✓     |         |      |
 | - breakpad | ✓       | ✓     | ✓     | (✓)*    | (✓)* |
 | - inproc   | ✓       | ✓     | ✓     | ☑       |      |
 | - none     | ✓       | ✓     | ✓     | ✓       |      |

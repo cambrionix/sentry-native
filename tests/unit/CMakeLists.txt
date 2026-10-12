@@ -1,13 +1,3 @@
-function(sentry_get_property NAME)
-	get_target_property(prop sentry "${NAME}")
-
-	if(NOT prop)
-		set(prop)
-	endif()
-
-	set("SENTRY_${NAME}" "${prop}" PARENT_SCOPE)
-endfunction()
-
 sentry_get_property(SOURCES)
 sentry_get_property(COMPILE_DEFINITIONS)
 sentry_get_property(INTERFACE_INCLUDE_DIRECTORIES)
@@ -21,6 +11,7 @@ add_executable(sentry_test_unit
 	${SENTRY_SOURCES}
 	main.c
 	sentry_testsupport.h
+	test_batcher.c
 	test_app_hang.c
 	test_attachments.c
 	test_basic.c
@@ -33,6 +24,7 @@ add_executable(sentry_test_unit
 	test_failures.c
 	test_feedback.c
 	test_fuzzfailures.c
+	test_http_transport.c
 	test_info.c
 	test_logger.c
 	test_logs.c

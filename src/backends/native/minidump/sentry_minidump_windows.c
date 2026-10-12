@@ -46,11 +46,43 @@ sentry__write_minidump(
     }
     sentry_free(woutput_path);
 
+    MINIDUMP_TYPE dump_type;
+    if (ctx->minidump_flags >= 0) {
+        dump_type = (MINIDUMP_TYPE)ctx->minidump_flags;
+    } else {
+        switch (ctx->minidump_mode) {
+        case SENTRY_MINIDUMP_MODE_STACK_ONLY:
+            dump_type = MiniDumpNormal;
+            break;
+
+        case SENTRY_MINIDUMP_MODE_SMART:
+            // Only indirectly-referenced memory: dbghelp walks the stack and
+            // registers and captures a small window around each pointer that
+            // lands in mapped memory. We deliberately omit MiniDumpWithDataSegs
+            // here: it writes the entire writable data segment of *every*
+            // loaded module (all DLL .data/.bss), which is uncapped and
+            // dominates dump size — for large module graphs it produces dumps
+            // 10-30x larger than intended. Global/static data is rarely needed
+            // for crash triage; callers that want it can opt in via
+            // sentry_options_set_minidump_flags() or MODE_FULL.
+            dump_type = MiniDumpWithIndirectlyReferencedMemory;
+            break;
+
+        case SENTRY_MINIDUMP_MODE_FULL:
+            dump_type = MiniDumpWithFullMemory | MiniDumpWithHandleData
+                | MiniDumpWithThreadInfo;
+            break;
+
+        default:
+            dump_type = MiniDumpNormal;
+            break;
+        }
+    }
+
     // Open crashed process with permissions needed for MiniDumpWriteDump.
-    // FULL mode uses MiniDumpWithHandleData | MiniDumpWithThreadInfo which
-    // requires PROCESS_DUP_HANDLE.
+    // MiniDumpWithHandleData requires PROCESS_DUP_HANDLE.
     DWORD access_flags = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
-    if (ctx->minidump_mode == SENTRY_MINIDUMP_MODE_FULL) {
+    if ((dump_type & MiniDumpWithHandleData) != 0) {
         access_flags |= PROCESS_DUP_HANDLE;
     }
     HANDLE process_handle = OpenProcess(access_flags, FALSE, ctx->crashed_pid);
@@ -89,28 +121,6 @@ sentry__write_minidump(
             = (PCONTEXT)&ctx->platform.context;
         exception_info.ExceptionPointers = &local_exception_pointers;
         exception_info.ClientPointers = FALSE;
-    }
-
-    // Determine minidump type based on configuration
-    MINIDUMP_TYPE dump_type;
-    switch (ctx->minidump_mode) {
-    case SENTRY_MINIDUMP_MODE_STACK_ONLY:
-        dump_type = MiniDumpNormal;
-        break;
-
-    case SENTRY_MINIDUMP_MODE_SMART:
-        dump_type
-            = MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs;
-        break;
-
-    case SENTRY_MINIDUMP_MODE_FULL:
-        dump_type = MiniDumpWithFullMemory | MiniDumpWithHandleData
-            | MiniDumpWithThreadInfo;
-        break;
-
-    default:
-        dump_type = MiniDumpNormal;
-        break;
     }
 
     // Write minidump using Windows API

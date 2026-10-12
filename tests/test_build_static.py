@@ -2,7 +2,14 @@ import subprocess
 import sys
 import os
 import pytest
-from .conditions import has_breakpad, has_crashpad, has_native, is_android, is_qemu
+from .conditions import (
+    has_breakpad,
+    has_crashpad,
+    has_native,
+    is_android,
+    is_qemu,
+    is_wine,
+)
 
 
 def test_static_lib(cmake):
@@ -16,12 +23,12 @@ def test_static_lib(cmake):
     )
 
     # on linux we can use `ldd` to check that we don’t link to `libsentry.so`
-    if sys.platform == "linux" and not is_android and not is_qemu:
+    if sys.platform == "linux" and not is_android and not is_qemu and not is_wine:
         output = subprocess.check_output("ldd sentry_example", cwd=tmp_path, shell=True)
         assert b"libsentry.so" not in output
 
     # on windows, we read the file header to check that the exe is compiled correctly
-    if sys.platform == "win32":
+    if sys.platform == "win32" or is_wine:
         with open(os.path.join(tmp_path, "sentry_example.exe"), "rb") as binary:
             binary.seek(0x3C, 0)
             offset = int.from_bytes(binary.read(4), byteorder="little")
@@ -36,7 +43,7 @@ def test_static_lib(cmake):
                 expected = b"PE\x00\x00\x64\x86"  # IMAGE_FILE_MACHINE_AMD64
             assert magic == expected
     # similarly, we use `file` on linux
-    if sys.platform == "linux":
+    if sys.platform == "linux" and not is_wine:
         output = subprocess.check_output(
             "file sentry_example", cwd=tmp_path, shell=True
         )
@@ -96,3 +103,35 @@ def test_static_native(cmake):
             "BUILD_SHARED_LIBS": "OFF",
         },
     )
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or is_android or is_qemu,
+    reason="requires nm",
+)
+def test_static_mpack(cmake):
+    tmp_path = cmake(
+        ["sentry"],
+        {
+            "SENTRY_BACKEND": "none",
+            "SENTRY_TRANSPORT": "none",
+            "BUILD_SHARED_LIBS": "OFF",
+        },
+    )
+
+    library = tmp_path / "libsentry.a"
+    output = subprocess.check_output(["nm", "-g", library], text=True)
+    symbols = {
+        line.rsplit(maxsplit=1)[-1].removeprefix("_")
+        for line in output.splitlines()
+        if line.split()
+    }
+
+    unprefixed = sorted(symbol for symbol in symbols if symbol.startswith("mpack_"))
+    assert not unprefixed, (
+        f"{library.name} contains {len(unprefixed)} unprefixed MPack symbols: "
+        f"{', '.join(unprefixed[:10])}"
+    )
+    assert any(
+        symbol.startswith("sentry__mpack_") for symbol in symbols
+    ), f"{library.name} contains no Sentry-prefixed MPack symbols"

@@ -33,11 +33,14 @@ from .assertions import (
     assert_user_report,
     assert_minidump,
     assert_breakpad_crash,
+    assert_crash_timestamp,
+    assert_no_crash_timestamp,
     assert_gzip_content_encoding,
     assert_gzip_file_header,
     assert_attachment_view_hierarchy,
     assert_before_breadcrumb,
     assert_no_breadcrumbs,
+    wait_for_file,
 )
 from .conditions import (
     has_http,
@@ -46,6 +49,7 @@ from .conditions import (
     has_files,
     is_asan,
     is_qemu,
+    is_wine,
 )
 
 
@@ -87,6 +91,12 @@ auth_header = (
         ({}),  # SENTRY_TRANSPORT_COMPRESSION=Off (default, cached)
         ({"SENTRY_TRANSPORT_COMPRESSION": "On"}),
     ],
+)
+@pytest.mark.xfail(
+    bool(os.environ.get("TEST_MINGW")),
+    reason="DbgHelp cannot read MinGW DWARF symbols",
+    raises=pytest.RaisesExc(AssertionError, match="^missing symbolicated frames"),
+    strict=True,
 )
 def test_capture_http(cmake, httpserver, build_args):
     build_args.update({"SENTRY_BACKEND": "none"})
@@ -359,14 +369,162 @@ def test_external_crash_reporter_http(cmake, httpserver, build_args):
     crash = crash_request.get_data()
 
     envelope = Envelope.deserialize(crash)
-    assert envelope.headers["cache_dir"] == str(cache_dir)
+    actual_cache_dir = envelope.headers["cache_dir"]
+    if is_wine:
+        actual_cache_dir = subprocess.check_output(
+            ["winepath", "-u", actual_cache_dir], text=True
+        ).strip()
+    assert actual_cache_dir == str(cache_dir)
     assert_meta(envelope, integration=build_args.get("SENTRY_BACKEND", ""))
 
     envelope = Envelope.deserialize(feedback)
     assert_user_feedback(envelope)
 
 
+@pytest.mark.parametrize(
+    "build_args",
+    [
+        ({"SENTRY_BACKEND": "inproc"}),
+        pytest.param(
+            {"SENTRY_BACKEND": "breakpad"},
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+    ],
+)
+def test_external_crash_reporter_consent_revoked(cmake, httpserver, build_args):
+    """With consent revoked, must not launch the external reporter.
+
+    Before the fix, crash-reporter + user-consent-revoke still spawned
+    sentry_crash_reporter, which uploaded via HTTP. Consent should block that
+    the same way it blocks the normal transport path.
+    """
+    tmp_path = cmake(["sentry_example", "sentry_crash_reporter"], build_args)
+    cache_dir = tmp_path.joinpath(".sentry-native/cache")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "cache-keep",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    assert wait_for_file(cache_dir / "*.envelope")
+    assert len(list(cache_dir.glob("*.envelope"))) == 1
+
+
+@pytest.mark.parametrize(
+    "build_args",
+    [
+        ({"SENTRY_BACKEND": "inproc"}),
+        pytest.param(
+            {"SENTRY_BACKEND": "breakpad"},
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+    ],
+)
+def test_external_crash_reporter_consent_revoked_no_cache(
+    cmake, httpserver, build_args
+):
+    """With consent revoked and no cache_keep, the crash envelope is discarded."""
+    tmp_path = cmake(["sentry_example", "sentry_crash_reporter"], build_args)
+    cache_dir = tmp_path.joinpath(".sentry-native/cache")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    assert not cache_dir.exists() or len(list(cache_dir.glob("*.envelope"))) == 0
+
+
+@pytest.mark.parametrize(
+    "build_args",
+    [
+        ({"SENTRY_BACKEND": "inproc"}),
+        pytest.param(
+            {"SENTRY_BACKEND": "breakpad"},
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
+    ],
+)
+def test_external_crash_reporter_consent_flush(cmake, httpserver, build_args):
+    """Cached crash envelope uploads once consent is given."""
+    tmp_path = cmake(["sentry_example", "sentry_crash_reporter"], build_args)
+    cache_dir = tmp_path.joinpath(".sentry-native/cache")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "cache-keep",
+            "http-retry",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert wait_for_file(cache_dir / "*.envelope")
+    assert len(list(cache_dir.glob("*.envelope"))) == 1
+    assert len(httpserver.log) == 0
+
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            [
+                "log",
+                "cache-keep",
+                "http-retry",
+                "require-user-consent",
+                "user-consent-give",
+            ],
+            env=env,
+        )
+    assert waiting.result
+    assert len(list(cache_dir.glob("*.envelope"))) == 0
+
+
 @pytest.mark.skipif(is_qemu, reason="unreliable under qemu-user")
+@pytest.mark.xfail(
+    bool(os.environ.get("TEST_MINGW")),
+    reason="DbgHelp cannot read MinGW DWARF symbols",
+    raises=pytest.RaisesExc(AssertionError, match="^missing symbolicated frames"),
+    strict=True,
+)
 def test_exception_and_session_http(cmake, httpserver):
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "none"})
 
@@ -920,6 +1078,64 @@ def test_native_crash_http(cmake, httpserver):
                 not has_breakpad or is_qemu, reason="test needs breakpad backend"
             ),
         ),
+    ],
+)
+def test_on_crashed_last_run(cmake, backend):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": backend})
+    args = ["log", "on-crashed-last-run"]
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [*args, "crash"],
+        expect_failure=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert_crash_timestamp(has_files, tmp_path)
+
+    run_dirs = list((tmp_path / ".sentry-native").glob("*.run"))
+    assert len(run_dirs) == 1
+    markers = list(run_dirs[0].glob("*.crash"))
+    assert len(markers) == 1
+    assert (run_dirs[0] / f"{markers[0].stem}.envelope").is_file()
+
+    restarted = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert_no_crash_timestamp(has_files, tmp_path)
+    callbacks = [
+        line
+        for line in restarted.stdout.splitlines()
+        if line.startswith(b"CRASHED_LAST_RUN:")
+    ]
+    assert len(callbacks) == 1
+    assert callbacks[0] == f"CRASHED_LAST_RUN:{markers[0].stem}".encode()
+
+    restarted_again = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert b"CRASHED_LAST_RUN:" not in restarted_again.stdout
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "inproc",
+        pytest.param(
+            "breakpad",
+            marks=pytest.mark.skipif(
+                not has_breakpad or is_qemu, reason="test needs breakpad backend"
+            ),
+        ),
         pytest.param(
             "native",
             marks=pytest.mark.skipif(
@@ -1431,3 +1647,29 @@ def test_restart_on_crash(cmake, httpserver, backend):
             assert_breakpad_crash(envelope)
         else:
             assert False
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "inproc",
+        pytest.param(
+            "breakpad",
+            marks=pytest.mark.skipif(
+                not has_breakpad, reason="breakpad backend not available"
+            ),
+        ),
+    ],
+)
+def test_early_init(cmake, backend):
+    tmp_path = cmake(
+        ["sentry_early_init"],
+        {
+            "SENTRY_BACKEND": backend,
+            "SENTRY_TRANSPORT": "none",
+            "BUILD_SHARED_LIBS": "OFF",
+        },
+    )
+
+    result = run(tmp_path, "sentry_early_init", [])
+    assert result.returncode == 0

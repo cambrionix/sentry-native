@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from . import adb
+from . import adb, exe_name, lib_name
 from .conditions import has_sccache
 from .build_config import (
     get_android_config,
@@ -72,30 +72,34 @@ class CMake:
         os.mkdir(coveragedir)
 
         if "llvm-cov" in os.environ.get("RUN_ANALYZER", ""):
+
             for i, (d, _) in enumerate(self.runs.values()):
                 # first merge the raw profiling runs
                 files = [f for f in os.listdir(d) if f.endswith(".profraw")]
                 if len(files) == 0:
                     continue
                 cmd = [
-                    "llvm-profdata",
+                    os.environ.get("LLVM_PROFDATA", "llvm-profdata"),
                     "merge",
                     "-sparse",
                     "-o=sentry.profdata",
                     *files,
                 ]
                 print("{} > {}".format(d, " ".join(cmd)))
-                subprocess.run(cmd, cwd=d)
+                subprocess.run(cmd, cwd=d, check=True)
 
                 # then export lcov from the profiling data, since this needs access
                 # to the object files, we need to do it per-test
                 objects = [
-                    "sentry_example",
-                    "sentry_test_unit",
-                    "libsentry.dylib" if sys.platform == "darwin" else "libsentry.so",
+                    exe_name("sentry_example"),
+                    exe_name("sentry_test_unit"),
+                    lib_name("sentry"),
+                    exe_name("sentry-crash"),
+                    exe_name("sentry_early_init"),
+                    exe_name("sentry_test_platform"),
                 ]
                 cmd = [
-                    "llvm-cov",
+                    os.environ.get("LLVM_COV", "llvm-cov"),
                     "export",
                     "-format=lcov",
                     "-instr-profile=sentry.profdata",
@@ -105,7 +109,7 @@ class CMake:
                 lcov = os.path.join(coveragedir, f"run-{i}.lcov")
                 with open(lcov, "w") as lcov_file:
                     print("{} > {} > {}".format(d, " ".join(cmd), lcov))
-                    subprocess.run(cmd, stdout=lcov_file, cwd=d)
+                    subprocess.run(cmd, stdout=lcov_file, cwd=d, check=True)
 
         if "kcov" in os.environ.get("RUN_ANALYZER", ""):
             coverage_dirs = [
@@ -325,6 +329,11 @@ def configure_clang_cl(config_cmd: list[str]):
 
 
 def configure_llvm_cov(config_cmd: list[str]):
+    def cmake_flags(name: str, value: str) -> str:
+        if os.environ.get("VS_GENERATOR_TOOLSET") == "ClangCL":
+            return f"-D{name}={value}"
+        return f"-D{name}='{value}'"
+
     if False and os.environ.get("VS_GENERATOR_TOOLSET") == "ClangCL":
         # for clang-cl in CI we have to use `--coverage` rather than `fprofile-instr-generate` and provide an
         # architecture-specific profiling library for it work:
@@ -342,7 +351,15 @@ def configure_llvm_cov(config_cmd: list[str]):
         config_cmd.append(f"-DCMAKE_MODULE_LINKER_FLAGS='{profile_lib}'")
     else:
         flags = "-fprofile-instr-generate -fcoverage-mapping"
-    config_cmd.append("-DCMAKE_C_FLAGS='{}'".format(flags))
+        if os.environ.get("VS_GENERATOR_TOOLSET") == "ClangCL":
+            # clang-cl source-based coverage needs the profile runtime explicitly linked.
+            # The flags above enable instrumentation; the runtime library merges and
+            # writes the raw profile at process exit.
+            profile_lib = "clang_rt.profile-x86_64.lib"
+            config_cmd.append(f"-DCMAKE_EXE_LINKER_FLAGS={profile_lib}")
+            config_cmd.append(f"-DCMAKE_SHARED_LINKER_FLAGS={profile_lib}")
+            config_cmd.append(f"-DCMAKE_MODULE_LINKER_FLAGS={profile_lib}")
+    config_cmd.append(cmake_flags("CMAKE_C_FLAGS", flags))
 
     # Since we overwrite `CXXFLAGS` below, we must add the experimental library here for the GHA runner that builds
     # sentry-native with LLVM clang for macOS (to run ASAN on macOS) rather than the version coming with XCode.
@@ -357,4 +374,4 @@ def configure_llvm_cov(config_cmd: list[str]):
             + " -L/usr/local/opt/llvm@15/lib/c++ -fexperimental-library -Wno-unused-command-line-argument"
         )
 
-    config_cmd.append("-DCMAKE_CXX_FLAGS='{}'".format(flags))
+    config_cmd.append(cmake_flags("CMAKE_CXX_FLAGS", flags))

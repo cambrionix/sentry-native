@@ -2,7 +2,27 @@
 #include "sentry_string.h"
 #include "sentry_testsupport.h"
 
-#if defined(SENTRY_PLATFORM_UNIX) && !defined(SENTRY_PLATFORM_NX)              \
+#if defined(SENTRY_PLATFORM_WINDOWS) && !defined(SENTRY_PLATFORM_XBOX)
+static int
+symlink(const char *target, const char *link)
+{
+    sentry_path_t *target_path = sentry__path_from_str(target);
+    sentry_path_t *link_path = sentry__path_from_str(link);
+    if (!target_path || !link_path) {
+        sentry__path_free(link_path);
+        sentry__path_free(target_path);
+        return -1;
+    }
+
+    BOOLEAN success
+        = CreateSymbolicLinkW(link_path->path_w, target_path->path_w,
+            SYMBOLIC_LINK_FLAG_DIRECTORY
+                | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE);
+    sentry__path_free(link_path);
+    sentry__path_free(target_path);
+    return success ? 0 : -1;
+}
+#elif defined(SENTRY_PLATFORM_UNIX) && !defined(SENTRY_PLATFORM_NX)            \
     && !defined(SENTRY_PLATFORM_PS)
 #    include <unistd.h>
 #endif
@@ -151,6 +171,16 @@ SENTRY_TEST(path_joining_windows)
 
 SENTRY_TEST(path_relative_filename)
 {
+    const char unterminated[] = { 'f', 'o', 'o', '/', 'b', 'a', 'r' };
+    TEST_CHECK(sentry__path_filename_from_str(NULL) == NULL);
+    TEST_CHECK(
+        sentry__path_filename_from_str_n(unterminated, sizeof(unterminated))
+        == unterminated + 4);
+#ifdef SENTRY_PLATFORM_WINDOWS
+    TEST_CHECK_STRING_EQUAL(
+        sentry__path_filename_from_str("C:foobar.txt"), "foobar.txt");
+#endif
+
     sentry_path_t *path = sentry__path_from_str("foobar.txt");
     TEST_ASSERT(!!path);
     TEST_CHECK_STRING_EQUAL(sentry__path_filename(path), "foobar.txt");
@@ -254,8 +284,8 @@ SENTRY_TEST(path_directory)
 
 SENTRY_TEST(path_remove_all_symlink)
 {
-#if !defined(SENTRY_PLATFORM_UNIX) || defined(SENTRY_PLATFORM_NX)              \
-    || defined(SENTRY_PLATFORM_PS)
+#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)                 \
+    || defined(SENTRY_PLATFORM_XBOX)
     SKIP_TEST();
 #else
     sentry_path_t *base
@@ -503,6 +533,10 @@ SENTRY_TEST(path_unique)
     TEST_CHECK(!sentry__path_unique(dir, NULL));
     TEST_CHECK(!sentry__path_unique(dir, ""));
 
+    TEST_CHECK(!sentry__path_unique(dir, "."));
+    TEST_CHECK(!sentry__path_unique(dir, ".."));
+    TEST_CHECK(!sentry__path_unique(dir, "../file"));
+
     sentry__path_remove_all(dir);
     sentry__path_free(dir);
 }
@@ -554,4 +588,42 @@ SENTRY_TEST(path_copy)
     sentry__path_remove_all(dst);
     sentry__path_free(dst);
     sentry__path_free(src);
+}
+
+SENTRY_TEST(path_join_filename)
+{
+    sentry_path_t *dir = sentry__path_from_str(
+        SENTRY_TEST_PATH_PREFIX "sentry_test_join_filename");
+    TEST_ASSERT(!!dir);
+    TEST_CHECK(!sentry__path_join_filename(NULL, "file.txt"));
+
+    const char *invalid[]
+        = { NULL, "", ".", "..", "/file", "../file", "sub/file", "file/",
+#ifdef SENTRY_PLATFORM_WINDOWS
+              "\\file", "..\\file", "back\\slash.txt", "C:file", "C:\\file",
+              "\\\\server\\share"
+#endif
+          };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        sentry_path_t *path = sentry__path_join_filename(dir, invalid[i]);
+        TEST_CHECK(!path);
+        sentry__path_free(path);
+    }
+
+    const char *valid[] = { "file.txt", ".hidden", "..hidden",
+#ifndef SENTRY_PLATFORM_WINDOWS
+        "back\\slash.txt", "C:file"
+#endif
+    };
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        sentry_path_t *path = sentry__path_join_filename(dir, valid[i]);
+        TEST_ASSERT(!!path);
+        sentry_path_t *parent = sentry__path_dir(path);
+        TEST_ASSERT(!!parent);
+        TEST_CHECK(sentry__path_eq(parent, dir));
+        TEST_CHECK_STRING_EQUAL(sentry__path_filename(path), valid[i]);
+        sentry__path_free(parent);
+        sentry__path_free(path);
+    }
+    sentry__path_free(dir);
 }

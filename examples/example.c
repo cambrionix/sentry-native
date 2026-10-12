@@ -7,6 +7,9 @@
 #endif
 
 #include "sentry.h"
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__)
+#    include <corecrt.h>
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,11 +38,44 @@
 
 #if defined(SENTRY_PLATFORM_WINDOWS)
 #    include <windows.h>
+#    ifdef HAVE_APPMODEL
+#        include <appmodel.h>
+#    endif
 unsigned long
 get_current_thread_id()
 {
     return GetCurrentThreadId();
 }
+
+#    ifdef HAVE_APPMODEL
+static void
+print_package_identity(void)
+{
+    UINT32 length = 0;
+    LONG status = GetCurrentPackageFullName(&length, NULL);
+    if (status == APPMODEL_ERROR_NO_PACKAGE) {
+        printf("PACKAGE_IDENTITY:none\n");
+        fflush(stdout);
+        return;
+    }
+
+    wchar_t *package_name = (wchar_t *)calloc(length, sizeof(wchar_t));
+    if (!package_name) {
+        printf("PACKAGE_IDENTITY:allocation-failed\n");
+        fflush(stdout);
+        return;
+    }
+
+    status = GetCurrentPackageFullName(&length, package_name);
+    if (status == ERROR_SUCCESS) {
+        printf("PACKAGE_IDENTITY:present\n");
+    } else {
+        printf("PACKAGE_IDENTITY:error:%ld\n", status);
+    }
+    fflush(stdout);
+    free(package_name);
+}
+#    endif
 #elif defined(SENTRY_PLATFORM_MACOS)
 #    include <pthread.h>
 #    include <stdint.h>
@@ -91,10 +127,14 @@ traces_sampler_callback(const sentry_transaction_context_t *transaction_ctx,
 }
 
 static sentry_value_t
-before_send_callback(sentry_value_t event, void *hint, void *user_data)
+before_send_callback(sentry_value_t event, sentry_hint_t *hint, void *user_data)
 {
-    (void)hint;
     (void)user_data;
+
+    sentry_hint_clear_attachments(hint);
+    sentry_hint_add_attachment(hint,
+        sentry_attachment_from_bytes(
+            "before_send", strlen("before_send"), "callback.txt"));
 
     // make our mark on the event
     sentry_value_set_by_key(
@@ -106,7 +146,7 @@ before_send_callback(sentry_value_t event, void *hint, void *user_data)
 
 static sentry_value_t
 discarding_before_send_callback(
-    sentry_value_t event, void *hint, void *user_data)
+    sentry_value_t event, sentry_hint_t *hint, void *user_data)
 {
     (void)hint;
     (void)user_data;
@@ -117,10 +157,11 @@ discarding_before_send_callback(
 }
 
 static sentry_value_t
-discarding_on_crash_callback(
-    const sentry_ucontext_t *uctx, sentry_value_t event, void *user_data)
+discarding_on_crash_callback(const sentry_ucontext_t *uctx,
+    sentry_value_t event, sentry_hint_t *hint, void *user_data)
 {
     (void)uctx;
+    (void)hint;
     (void)user_data;
 
     // discard event and signal backend to stop further processing
@@ -129,21 +170,81 @@ discarding_on_crash_callback(
 }
 
 static sentry_value_t
-on_crash_callback(
-    const sentry_ucontext_t *uctx, sentry_value_t event, void *user_data)
+on_crash_callback(const sentry_ucontext_t *uctx, sentry_value_t event,
+    sentry_hint_t *hint, void *user_data)
 {
     (void)uctx;
     (void)user_data;
+
+    sentry_hint_clear_attachments(hint);
+    sentry_hint_add_attachment(hint,
+        sentry_attachment_from_bytes(
+            "on_crash", strlen("on_crash"), "callback.txt"));
 
     // tell the backend to retain the event
     return event;
 }
 
+static sentry_value_t create_debug_crumb(const char *message);
+
+static void
+configure_initial_scope(sentry_scope_t *scope, void *user_data)
+{
+    sentry_scope_set_tag(scope, "test.initial-tag", "initial-value");
+
+    sentry_value_t context = sentry_value_new_object();
+    sentry_value_set_by_key(context, "foo", sentry_value_new_string("bar"));
+    sentry_scope_set_context(scope, "initial", context);
+
+    sentry_value_t user
+        = sentry_value_new_user("1", "user", "initial@example.com", NULL);
+    sentry_scope_set_user(scope, user);
+
+    if (user_data && *(bool *)user_data) {
+        sentry_scope_add_breadcrumb(
+            scope, create_debug_crumb("initial scope breadcrumb"));
+        sentry_scope_attach_file(scope, "CMakeCache.txt");
+        sentry_scope_attach_bytes(scope, "\xc0\xff\xee", 3, "bytes.bin");
+    }
+}
+
+static void
+on_crashed_last_run_callback(const sentry_envelope_t *envelope, void *user_data)
+{
+    (void)user_data;
+    const char *event_id = sentry_value_as_string(
+        sentry_envelope_get_header(envelope, "event_id"));
+    printf("CRASHED_LAST_RUN:%s\n", event_id ? event_id : "");
+    sentry_value_t event = sentry_envelope_get_event(envelope);
+    sentry_value_t tags = sentry_value_get_by_key(event, "tags");
+    const char *initial_tag = sentry_value_as_string(
+        sentry_value_get_by_key(tags, "test.initial-tag"));
+    if (initial_tag) {
+        printf("CRASHED_LAST_RUN_INITIAL_TAG:%s\n", initial_tag);
+    }
+    sentry_value_t contexts = sentry_value_get_by_key(event, "contexts");
+    sentry_value_t initial_context
+        = sentry_value_get_by_key(contexts, "initial");
+    const char *context_value = sentry_value_as_string(
+        sentry_value_get_by_key(initial_context, "foo"));
+    if (context_value) {
+        printf("CRASHED_LAST_RUN_INITIAL_CONTEXT:%s\n", context_value);
+    }
+    sentry_value_t user = sentry_value_get_by_key(event, "user");
+    const char *user_id
+        = sentry_value_as_string(sentry_value_get_by_key(user, "id"));
+    if (user_id) {
+        printf("CRASHED_LAST_RUN_INITIAL_USER:%s\n", user_id);
+    }
+    fflush(stdout);
+}
+
 static sentry_value_t
-restart_on_crash(
-    const sentry_ucontext_t *uctx, sentry_value_t event, void *user_data)
+restart_on_crash(const sentry_ucontext_t *uctx, sentry_value_t event,
+    sentry_hint_t *hint, void *user_data)
 {
     (void)uctx;
+    (void)hint;
 
 #ifdef SENTRY_PLATFORM_WINDOWS
     wchar_t **argv = user_data;
@@ -282,6 +383,16 @@ discarding_before_send_metric_callback(sentry_value_t metric, void *user_data)
 }
 
 static sentry_value_t
+discarding_before_send_feedback_callback(
+    sentry_value_t feedback, sentry_hint_t *hint, void *user_data)
+{
+    (void)hint;
+    (void)user_data;
+    sentry_value_decref(feedback);
+    return sentry_value_new_null();
+}
+
+static sentry_value_t
 before_breadcrumb_callback(sentry_value_t breadcrumb, void *user_data)
 {
     (void)user_data;
@@ -414,6 +525,34 @@ trigger_stack_buffer_overrun()
 }
 
 static void
+trigger_heap_corruption()
+{
+    __try {
+        if (!HeapSetInformation(
+                NULL, HeapEnableTerminationOnCorruption, NULL, 0)) {
+            abort();
+        }
+        HANDLE heap = HeapCreate(0, 0, 0);
+        if (!heap) {
+            abort();
+        }
+        void *addr = HeapAlloc(heap, 0, 0x1000);
+        if (!addr) {
+            abort();
+        }
+
+        char *addr_mutable = (char *)addr;
+        memset(addr_mutable - sizeof(addr), 0xCC, sizeof(addr));
+
+        HeapFree(heap, 0, addr);
+        HeapDestroy(heap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf("Heap corruption exception should not be caught");
+    }
+    abort();
+}
+
+static void
 trigger_fastfail_crash()
 {
     // this bypasses WINDOWS SEH and will only be caught with the
@@ -421,37 +560,15 @@ trigger_fastfail_crash()
     RaiseFailFastException(NULL, NULL, 0);
 }
 
-#endif
-
-#ifdef SENTRY_PLATFORM_AIX
-// AIX has a null page mapped to the bottom of memory, which means null derefs
-// don't segfault. try dereferencing the top of memory instead; the top nibble
-// seems to be unusable.
-static void *invalid_mem = (void *)0xFFFFFFFFFFFFFF9B; // -100 for memset
-#else
-static void *invalid_mem = (void *)1;
-#endif
-
-// Detect Address Sanitizer (works for both GCC and Clang)
-#if defined(__SANITIZE_ADDRESS__)
-#    define SENTRY_ASAN_ACTIVE 1
-#elif defined(__has_feature)
-#    if __has_feature(address_sanitizer)
-#        define SENTRY_ASAN_ACTIVE 1
-#    endif
-#endif
-
 static void
-trigger_crash()
+trigger_invalid_parameter()
 {
-#ifdef SENTRY_ASAN_ACTIVE
-    // Under ASAN, raise signal directly to bypass ASAN's memory interception.
-    // ASAN intercepts memset and would abort before our signal handler runs.
-    raise(SIGSEGV);
-#else
-    memset((char *)invalid_mem, 1, 100);
-#endif
+    // with no custom handler, this invokes _invoke_watson and fast-fails:
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/invalid-parameter-functions
+    _invalid_parameter_noinfo();
 }
+
+#endif
 
 static void
 trigger_stack_overflow()
@@ -700,6 +817,11 @@ main(int argc, char **argv)
         sentry_options_set_on_crash(options, on_crash_callback, NULL);
     }
 
+    if (has_arg(argc, argv, "on-crashed-last-run")) {
+        sentry_options_set_on_crashed_last_run(
+            options, on_crashed_last_run_callback, NULL);
+    }
+
     if (has_arg(argc, argv, "discarding-on-crash")) {
         sentry_options_set_on_crash(
             options, discarding_on_crash_callback, NULL);
@@ -771,6 +893,12 @@ main(int argc, char **argv)
         sentry_options_set_crashpad_wait_for_upload(options, true);
     }
 
+    bool initial_scope_payload = has_arg(argc, argv, "initial-scope-payload");
+    if (has_arg(argc, argv, "initial-scope")) {
+        sentry_options_set_initial_scope(
+            options, configure_initial_scope, &initial_scope_payload);
+    }
+
     if (has_arg(argc, argv, "test-logger")) {
         // Set up the test logger for integration tests
         sentry_options_set_logger(options, test_logger_callback, NULL);
@@ -784,10 +912,6 @@ main(int argc, char **argv)
     if (has_arg(argc, argv, "enable-logger-when-crashed")) {
         // Explicitly enable logging during crash handling (default behavior)
         sentry_options_set_logger_enabled_when_crashed(options, 1);
-    }
-
-    if (has_arg(argc, argv, "disable-logs")) {
-        sentry_options_set_enable_logs(options, false);
     }
 
     if (has_arg(argc, argv, "crash-reporter")) {
@@ -824,10 +948,6 @@ main(int argc, char **argv)
         sentry_options_set_http_retry(options, false);
     }
 
-    if (has_arg(argc, argv, "disable-metrics")) {
-        sentry_options_set_enable_metrics(options, false);
-    }
-
     if (has_arg(argc, argv, "before-send-metric")) {
         sentry_options_set_before_send_metric(
             options, before_send_metric_callback, NULL);
@@ -836,6 +956,11 @@ main(int argc, char **argv)
     if (has_arg(argc, argv, "discarding-before-send-metric")) {
         sentry_options_set_before_send_metric(
             options, discarding_before_send_metric_callback, NULL);
+    }
+
+    if (has_arg(argc, argv, "discarding-before-send-feedback")) {
+        sentry_options_set_before_send_feedback(
+            options, discarding_before_send_feedback_callback, NULL);
     }
 
     if (has_arg(argc, argv, "before-breadcrumb")) {
@@ -904,6 +1029,12 @@ main(int argc, char **argv)
                 sentry_value_new_string("my_global_value"), NULL));
     }
 
+#if defined(SENTRY_PLATFORM_WINDOWS) && defined(HAVE_APPMODEL)
+    if (has_arg(argc, argv, "appx")) {
+        print_package_identity();
+    }
+#endif
+
     // E2E test mode: set tags and output test ID for event correlation
     if (e2e_test_id[0] != '\0') {
         sentry_set_tag("test.id", e2e_test_id);
@@ -924,8 +1055,7 @@ main(int argc, char **argv)
         sentry_value_set_by_key(attributes, "number.first", attr_2);
         sentry_value_set_by_key(attributes, "number.second", attr_3);
         // testing multiple attributes
-        sentry_log_debug(
-            "logging with %d custom attributes", attributes, (int64_t)3);
+        sentry_log_debug("logging with %d custom attributes", attributes, 3);
         // testing no attributes
         sentry_log_debug("logging with %s custom attributes",
             sentry_value_new_object(), "no");
@@ -944,17 +1074,19 @@ main(int argc, char **argv)
     }
 
     if (has_arg(argc, argv, "attachment")) {
-        sentry_attachment_t *bytes
-            = sentry_attach_bytes("\xc0\xff\xee", 3, "bytes.bin");
+        sentry_value_t bytes
+            = sentry_attachment_from_bytes("\xc0\xff\xee", 3, "bytes.bin");
         sentry_attachment_set_content_type(bytes, "application/octet-stream");
+        sentry_add_attachment(bytes);
     }
     if (has_arg(argc, argv, "attach-view-hierarchy")) {
         // assuming the example / test is run directly from the cmake build
         // directory
-        sentry_attachment_t *view_hierarchy
-            = sentry_attach_file("./view-hierarchy.json");
+        sentry_value_t view_hierarchy
+            = sentry_attachment_from_file("./view-hierarchy.json");
         sentry_attachment_set_type(
             view_hierarchy, SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY);
+        sentry_add_attachment(view_hierarchy);
     }
 
     if (has_arg(argc, argv, "large-attachment")) {
@@ -972,64 +1104,56 @@ main(int argc, char **argv)
                 remaining -= chunk;
             }
             fclose(f);
-            sentry_attachment_t *attachment = sentry_attach_file(large_file);
-            if (attachment) {
-                sentry_attachment_set_type(
-                    attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
-            }
+            sentry_value_t attachment = sentry_attachment_from_file(large_file);
+            sentry_attachment_set_type(
+                attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
+            sentry_add_attachment(attachment);
         }
     }
 
-    if (sentry_options_get_enable_logs(options)) {
-        if (has_arg(argc, argv, "capture-log")) {
-            sentry_log_debug("I'm a log message!");
+    if (has_arg(argc, argv, "capture-log")) {
+        sentry_log_debug("I'm a log message!");
+    }
+    if (has_arg(argc, argv, "logs-timer")) {
+        for (int i = 0; i < 10; i++) {
+            sentry_log_info("Informational log nr.%d", i);
         }
-        if (has_arg(argc, argv, "logs-timer")) {
-            for (int i = 0; i < 10; i++) {
-                sentry_log_info("Informational log nr.%d", i);
-            }
-            // sleep >5s to trigger logs timer
-            sleep_s(6);
-            // we should see two envelopes make its way to Sentry
-            sentry_log_debug("post-sleep log");
-        }
-        if (has_arg(argc, argv, "logs-threads")) {
-            run_threads(log_thread_func);
-        }
+        // sleep >5s to trigger logs timer
+        sleep_s(6);
+        // we should see two envelopes make its way to Sentry
+        sentry_log_debug("post-sleep log");
+    }
+    if (has_arg(argc, argv, "logs-threads")) {
+        run_threads(log_thread_func);
     }
 
-    if (sentry_options_get_enable_metrics(options)) {
-        if (has_arg(argc, argv, "capture-metric")) {
-            sentry_metrics_count("test.counter", 1, sentry_value_new_null());
-        }
-        if (has_arg(argc, argv, "capture-metric-all-types")) {
-            sentry_metrics_count("test.counter", 1, sentry_value_new_null());
-            sentry_metrics_gauge("test.gauge", 42.5, SENTRY_UNIT_PERCENT,
-                sentry_value_new_null());
-            sentry_metrics_distribution("test.distribution", 123.456,
-                SENTRY_UNIT_MILLISECOND, sentry_value_new_null());
-        }
-        if (has_arg(argc, argv, "metric-with-attributes")) {
-            sentry_value_t attributes = sentry_value_new_object();
-            sentry_value_t attr = sentry_value_new_attribute(
-                sentry_value_new_string("my_value"), NULL);
-            sentry_value_set_by_key(attributes, "my.custom.attribute", attr);
-            sentry_metrics_count("test.counter.with.attributes", 1, attributes);
-        }
-        if (has_arg(argc, argv, "metrics-timer")) {
-            for (int i = 0; i < 10; i++) {
-                sentry_metrics_count(
-                    "batch.counter", 1, sentry_value_new_null());
-            }
-            sleep_s(6);
-            sentry_metrics_count(
-                "post.sleep.counter", 1, sentry_value_new_null());
-        }
-        if (has_arg(argc, argv, "metrics-threads")) {
-            run_threads(metric_thread_func);
-        }
+    if (has_arg(argc, argv, "capture-metric")) {
+        sentry_metrics_count("test.counter", 1, sentry_value_new_null());
     }
-
+    if (has_arg(argc, argv, "capture-metric-all-types")) {
+        sentry_metrics_count("test.counter", 1, sentry_value_new_null());
+        sentry_metrics_gauge(
+            "test.gauge", 42.5, SENTRY_UNIT_PERCENT, sentry_value_new_null());
+        sentry_metrics_distribution("test.distribution", 123.456,
+            SENTRY_UNIT_MILLISECOND, sentry_value_new_null());
+    }
+    if (has_arg(argc, argv, "metric-with-attributes")) {
+        sentry_value_t attributes = sentry_value_new_object();
+        sentry_value_t attr = sentry_value_new_attribute(
+            sentry_value_new_string("my_value"), NULL);
+        sentry_value_set_by_key(attributes, "my.custom.attribute", attr);
+        sentry_metrics_count("test.counter.with.attributes", 1, attributes);
+    }
+    if (has_arg(argc, argv, "metrics-timer")) {
+        for (int i = 0; i < 10; i++) {
+            sentry_metrics_count("batch.counter", 1, sentry_value_new_null());
+        }
+        sleep_s(6);
+        sentry_metrics_count("post.sleep.counter", 1, sentry_value_new_null());
+    }
+    if (has_arg(argc, argv, "metrics-threads")) {
+        run_threads(metric_thread_func);
+    }
     if (!has_arg(argc, argv, "no-setup")) {
         sentry_set_transaction("test-transaction");
         sentry_set_level(SENTRY_LEVEL_WARNING);
@@ -1083,9 +1207,10 @@ main(int argc, char **argv)
         // assuming the example / test is run directly from the cmake build
         // directory
         sentry_attach_file("./CMakeCache.txt");
-        sentry_attachment_t *bytes
-            = sentry_attach_bytes("\xc0\xff\xee", 3, "bytes.bin");
+        sentry_value_t bytes
+            = sentry_attachment_from_bytes("\xc0\xff\xee", 3, "bytes.bin");
         sentry_attachment_set_content_type(bytes, "application/octet-stream");
+        sentry_add_attachment(bytes);
     }
 
     if (has_arg(argc, argv, "update-release-env")) {
@@ -1126,13 +1251,14 @@ main(int argc, char **argv)
             // assuming the example / test is run directly from the cmake build
             // directory
             sentry_scope_attach_file(scope, "./CMakeCache.txt");
-            sentry_attachment_t *bytes = sentry_scope_attach_bytes(
-                scope, "\xc0\xff\xee", 3, "bytes.bin");
+            sentry_value_t bytes
+                = sentry_attachment_from_bytes("\xc0\xff\xee", 3, "bytes.bin");
             sentry_attachment_set_content_type(
                 bytes, "application/octet-stream");
+            sentry_scope_add_attachment(scope, bytes);
         }
 
-        sentry_capture_event_with_scope(event, scope);
+        sentry_scope_capture_event(scope, event, NULL);
     }
 
     if (has_arg(argc, argv, "capture-multiple")) {
@@ -1148,6 +1274,16 @@ main(int argc, char **argv)
 
     if (has_arg(argc, argv, "reinstall")) {
         sentry_reinstall_backend();
+    }
+
+    if (has_arg(argc, argv, "attach-custom-filename")) {
+        // assuming the example / test is run directly from the cmake build
+        // directory
+        sentry_value_t attachment
+            = sentry_attachment_from_file("./CMakeCache.txt");
+        sentry_attachment_set_filename(attachment, "custom-name.log");
+        sentry_attachment_set_content_type(attachment, "application/zstd");
+        sentry_add_attachment(attachment);
     }
 
     if (has_arg(argc, argv, "flush")) {
@@ -1201,7 +1337,7 @@ main(int argc, char **argv)
     }
 
     if (has_arg(argc, argv, "crash")) {
-        trigger_crash();
+        sentry_crash();
     }
     if (has_arg(argc, argv, "stack-overflow")) {
         trigger_stack_overflow();
@@ -1214,15 +1350,21 @@ main(int argc, char **argv)
     if (has_arg(argc, argv, "fastfail")) {
         trigger_fastfail_crash();
     }
+    if (has_arg(argc, argv, "invalid-parameter")) {
+        trigger_invalid_parameter();
+    }
     if (has_arg(argc, argv, "stack-buffer-overrun")) {
         trigger_stack_buffer_overrun();
+    }
+    if (has_arg(argc, argv, "heap-corruption")) {
+        trigger_heap_corruption();
     }
 #endif
     if (has_arg(argc, argv, "assert")) {
         assert(0);
     }
     if (has_arg(argc, argv, "abort")) {
-#ifdef _WIN32
+#if defined(_WIN32) && (defined(_MSC_VER) || defined(_UCRT))
         // Suppress the Windows abort dialog that would block CI
         _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
@@ -1407,7 +1549,7 @@ main(int argc, char **argv)
     }
 
     if (has_arg(argc, argv, "crash-after-shutdown")) {
-        trigger_crash();
+        sentry_crash();
     }
 
     return EXIT_SUCCESS;

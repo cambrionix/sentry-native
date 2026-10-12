@@ -138,7 +138,11 @@ SENTRY_TEST(basic_http_request_preparation_for_user_feedback)
     sentry_envelope_t *envelope = sentry__envelope_new();
     sentry_value_t user_feedback = sentry_value_new_feedback(
         "some-message", "some-email", "some-name", &event_id);
-    sentry__envelope_add_user_feedback(envelope, user_feedback);
+    sentry_value_t feedback_event = sentry_value_new_event();
+    sentry_value_t feedback_contexts = sentry_value_new_object();
+    sentry_value_set_by_key(feedback_contexts, "feedback", user_feedback);
+    sentry_value_set_by_key(feedback_event, "contexts", feedback_contexts);
+    sentry__envelope_add_feedback_event(envelope, feedback_event);
 
     sentry_prepared_http_request_t *req
         = sentry__prepare_http_request(envelope, dsn, NULL, NULL);
@@ -160,7 +164,7 @@ SENTRY_TEST(basic_http_request_preparation_for_user_feedback)
     TEST_CHECK_STRING_EQUAL(line2, "{\"type\":\"feedback\",\"length\":269}");
 
     char *line3 = line2_end + 1;
-    sentry_value_t line3_json = sentry__value_from_json(line3, strlen(line3));
+    sentry_value_t line3_json = sentry_value_from_json(line3, strlen(line3));
     TEST_CHECK(!sentry_value_is_null(line3_json));
 
     TEST_CHECK_STRING_EQUAL(
@@ -392,6 +396,9 @@ SENTRY_TEST(write_raw_envelope_to_file)
 
 SENTRY_TEST(raw_envelope_event_id)
 {
+    sentry_uuid_t event_id = sentry__envelope_get_event_id(NULL);
+    TEST_CHECK(sentry_uuid_is_nil(&event_id));
+
     sentry_envelope_t *envelope = create_test_envelope();
     const char *test_file_str = SENTRY_TEST_PATH_PREFIX "sentry_test_envelope";
     sentry_path_t *test_file_path = sentry__path_from_str(test_file_str);
@@ -402,7 +409,7 @@ SENTRY_TEST(raw_envelope_event_id)
         = sentry__envelope_from_path(test_file_path);
     TEST_CHECK(!!raw_envelope);
 
-    sentry_uuid_t event_id = sentry__envelope_get_event_id(raw_envelope);
+    event_id = sentry__envelope_get_event_id(raw_envelope);
     char event_id_str[37];
     sentry_uuid_as_string(&event_id, event_id_str);
     TEST_CHECK_STRING_EQUAL(
@@ -801,6 +808,29 @@ SENTRY_TEST(envelope_remove_item)
     sentry_envelope_free(envelope);
 }
 
+SENTRY_TEST(attachment_bytes_no_copy)
+{
+    const char bytes[] = { 'a', '\0', 'b' };
+    sentry_value_t attachment
+        = sentry_attachment_from_bytes(bytes, sizeof(bytes), "bytes.bin");
+    const char *attachment_bytes
+        = sentry__attachment_get_bytes(attachment, NULL);
+    sentry_envelope_t *envelope = sentry__envelope_new();
+    sentry_envelope_item_t *item
+        = sentry__envelope_add_attachment(envelope, attachment);
+
+    TEST_ASSERT(!!item);
+    size_t payload_len = 0;
+    const char *payload = sentry__envelope_item_get_payload(item, &payload_len);
+    TEST_CHECK(payload == attachment_bytes);
+    TEST_CHECK_INT_EQUAL(payload_len, sizeof(bytes));
+
+    sentry_value_remove_by_key(attachment, "bytes");
+    sentry_value_decref(attachment);
+    TEST_CHECK(memcmp(payload, bytes, sizeof(bytes)) == 0);
+    sentry_envelope_free(envelope);
+}
+
 SENTRY_TEST(attachment_ref_creation)
 {
     const char *test_file_str
@@ -815,8 +845,8 @@ SENTRY_TEST(attachment_ref_creation)
                                  small_data, sizeof(small_data) - 1),
             0);
 
-        sentry_attachment_t *attachment
-            = sentry__attachment_from_path(sentry__path_clone(test_file_path));
+        sentry_value_t attachment
+            = sentry_attachment_from_file(test_file_path->path);
         sentry_envelope_item_t *item
             = sentry__envelope_add_attachment(envelope, attachment);
 
@@ -826,7 +856,31 @@ SENTRY_TEST(attachment_ref_creation)
         TEST_CHECK_STRING_EQUAL(
             sentry__envelope_item_get_payload(item, &payload_len), "small");
 
-        sentry__attachment_free(attachment);
+        sentry_value_decref(attachment);
+        sentry_envelope_free(envelope);
+    }
+
+    // A path value may fail to materialize because of invalid encoding or an
+    // allocation failure. Attachment processing must fail without dereferencing
+    // the missing path object.
+    {
+        sentry_envelope_t *envelope = sentry__envelope_new();
+        sentry_value_t attachment
+            = sentry_attachment_from_file(test_file_path->path);
+        sentry_value_remove_by_key(attachment, "path");
+
+        TEST_CHECK(!sentry__envelope_add_attachment(envelope, attachment));
+        TEST_CHECK_INT_EQUAL(sentry__envelope_get_item_count(envelope), 0);
+
+        sentry_uuid_t event_id = sentry_uuid_new_v4();
+        sentry__envelope_set_event_id(envelope, &event_id);
+        sentry_path_t *cache_path = sentry__path_from_str(
+            SENTRY_TEST_PATH_PREFIX "missing-attachment-path-cache");
+        TEST_CHECK(!sentry__cache_attachment_ref(
+            envelope, attachment, cache_path, NULL));
+
+        sentry__path_free(cache_path);
+        sentry_value_decref(attachment);
         sentry_envelope_free(envelope);
     }
 
@@ -927,8 +981,8 @@ SENTRY_TEST(attachment_ref_copy)
     fputs("minidump_data", f);
     fclose(f);
 
-    sentry_attachment_t *attachment
-        = sentry__attachment_from_path(sentry__path_clone(test_file_path));
+    sentry_value_t attachment
+        = sentry_attachment_from_file(test_file_path->path);
     sentry_attachment_set_type(attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
     sentry_attachment_set_content_type(attachment, "application/x-dmp");
 
@@ -977,7 +1031,7 @@ SENTRY_TEST(attachment_ref_copy)
     sentry__path_free(cache_dir);
     sentry__path_free(cached);
     sentry__path_free(db_path);
-    sentry__attachment_free(attachment);
+    sentry_value_decref(attachment);
     sentry__path_remove(test_file_path);
     sentry__path_free(test_file_path);
     sentry_close();
@@ -1012,8 +1066,7 @@ SENTRY_TEST(attachment_ref_move)
     fputs("attachment_data", f);
     fclose(f);
 
-    sentry_attachment_t *attachment
-        = sentry__attachment_from_path(sentry__path_clone(src_path));
+    sentry_value_t attachment = sentry_attachment_from_file(src_path->path);
 
     sentry_envelope_t *envelope = sentry__envelope_new();
     sentry__envelope_set_event_id(envelope, &event_id);
@@ -1043,7 +1096,7 @@ SENTRY_TEST(attachment_ref_move)
     sentry__path_remove(cached);
     sentry__path_free(cached);
     sentry__path_free(db_path);
-    sentry__attachment_free(attachment);
+    sentry_value_decref(attachment);
     sentry__path_free(src_path);
     sentry__path_free(run_path);
     sentry_close();
@@ -1063,8 +1116,8 @@ SENTRY_TEST(attachment_ref_cache_cleanup)
     sentry_envelope_t *raw_envelope = sentry__envelope_from_path(raw_path);
     TEST_ASSERT(!!raw_envelope);
 
-    sentry_attachment_t *attachment = sentry__attachment_from_buffer(
-        "payload", strlen("payload"), sentry__path_from_str("payload.bin"));
+    sentry_value_t attachment = sentry_attachment_from_bytes(
+        "payload", strlen("payload"), "payload.bin");
     sentry_path_t *cache_path = NULL;
     SENTRY_WITH_OPTIONS (opts) {
         cache_path = sentry__path_clone(opts->run->cache_path);
@@ -1078,7 +1131,7 @@ SENTRY_TEST(attachment_ref_cache_cleanup)
 
     sentry__path_free(cached);
     sentry__path_free(cache_path);
-    sentry__attachment_free(attachment);
+    sentry_value_decref(attachment);
     sentry_envelope_free(raw_envelope);
     sentry__path_remove(raw_path);
     sentry__path_free(raw_path);
@@ -1100,12 +1153,15 @@ SENTRY_TEST(attachment_ref_cache_discard)
         SENTRY_TEST_PATH_PREFIX "sentry_test_attachment_ref_cache_file");
     TEST_CHECK_INT_EQUAL(sentry__path_write_buffer(cache_path, "x", 1), 0);
 
-    sentry_attachment_t *attachment = sentry__attachment_from_buffer(
-        "x", 1, sentry__path_from_str("large.bin"));
-    attachment->buf_len = SENTRY_LARGE_ATTACHMENT_SIZE;
+    sentry_value_t attachment
+        = sentry_attachment_from_bytes("x", 1, "large.bin");
+    sentry_value_set_by_key(attachment, "size",
+        sentry_value_new_uint64(SENTRY_LARGE_ATTACHMENT_SIZE));
 
+    sentry_value_t attachments = sentry_value_new_list();
+    sentry_value_append(attachments, sentry_value_incref(attachment));
     sentry__cache_attachment_refs(
-        envelope, attachment, options, cache_path, NULL);
+        envelope, attachments, options, cache_path, NULL);
     TEST_CHECK_INT_EQUAL(sentry__envelope_get_item_count(envelope), 0);
 
     sentry_client_report_t report = { { 0 } };
@@ -1114,7 +1170,8 @@ SENTRY_TEST(attachment_ref_cache_discard)
                                       [SENTRY_DATA_CATEGORY_ATTACHMENT],
         1);
 
-    sentry__attachment_free(attachment);
+    sentry_value_decref(attachment);
+    sentry_value_decref(attachments);
     sentry__path_remove(cache_path);
     sentry__path_free(cache_path);
     sentry_envelope_free(envelope);
@@ -1152,6 +1209,73 @@ SENTRY_TEST(attachment_ref_roundtrip)
     sentry_envelope_free(parsed);
 }
 
+static void
+check_oversized_minidump(sentry_envelope_t *envelope, void *data)
+{
+    size_t *called = data;
+    (*called)++;
+    TEST_ASSERT_INT_EQUAL(sentry__envelope_get_item_count(envelope), 2);
+
+    sentry_uuid_t event_id = sentry__envelope_get_event_id(envelope);
+    char filename[41];
+    sentry_uuid_as_string(&event_id, filename);
+    memcpy(filename + 36, ".dmp", 5);
+    check_attachment_ref_item(envelope, 1, "sentry_test_oversized_minidump.dmp",
+        "application/octet-stream", SENTRY_ATTACHMENT_TYPE_MINIDUMP,
+        SENTRY_MAX_ATTACHMENT_SIZE + 1, filename);
+
+    SENTRY_WITH_OPTIONS (options) {
+        sentry_path_t *cached
+            = sentry__path_join_str(options->run->cache_path, filename);
+        TEST_CHECK_INT_EQUAL(
+            sentry__path_get_size(cached), SENTRY_MAX_ATTACHMENT_SIZE + 1);
+        sentry__path_remove(cached);
+        sentry__path_free(cached);
+    }
+    sentry_envelope_free(envelope);
+}
+
+SENTRY_TEST(capture_minidump_oversized)
+{
+#if defined(SENTRY_PLATFORM_ANDROID) || defined(SENTRY_PLATFORM_NX)            \
+    || defined(SENTRY_PLATFORM_PS) || defined(SENTRY_PLATFORM_XBOX)
+    SKIP_TEST();
+#else
+    const char *filename
+        = SENTRY_TEST_PATH_PREFIX "sentry_test_oversized_minidump.dmp";
+    sentry_path_t *path = sentry__path_from_str(filename);
+    FILE *f = fopen(filename, "wb");
+    TEST_ASSERT(!!f);
+    TEST_ASSERT_INT_EQUAL(fseek(f, SENTRY_MAX_ATTACHMENT_SIZE, SEEK_SET), 0);
+    TEST_ASSERT_INT_EQUAL(fputc('x', f), 'x');
+    TEST_ASSERT_INT_EQUAL(fclose(f), 0);
+
+    sentry_value_t attachment = sentry_attachment_from_file(filename);
+    TEST_CHECK(sentry_value_is_null(attachment));
+    sentry_value_decref(attachment);
+
+    size_t called = 0;
+    sentry_transport_t *transport
+        = sentry_transport_new(check_oversized_minidump);
+    sentry_transport_set_state(transport, &called);
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
+    sentry_options_set_auto_session_tracking(options, false);
+    sentry_options_set_enable_large_attachments(options, true);
+    sentry_options_set_transport(options, transport);
+    TEST_ASSERT_INT_EQUAL(sentry_init(options), 0);
+
+    sentry_uuid_t event_id = sentry_capture_minidump(filename);
+    TEST_CHECK(!sentry_uuid_is_nil(&event_id));
+    TEST_CHECK_INT_EQUAL(
+        sentry__path_get_size(path), SENTRY_MAX_ATTACHMENT_SIZE + 1);
+    sentry_close();
+    sentry__path_remove(path);
+    sentry__path_free(path);
+    TEST_CHECK_INT_EQUAL(called, 1);
+#endif
+}
+
 SENTRY_TEST(deserialize_envelope_invalid)
 {
     TEST_CHECK(!sentry_envelope_deserialize("", 0));
@@ -1163,6 +1287,8 @@ SENTRY_TEST(deserialize_envelope_invalid)
     TEST_CHECK(!sentry_envelope_deserialize("{}\n{\"length\":-1}\n", 17));
     char buf[128];
     snprintf(buf, sizeof(buf), "{}\n{\"length\":%zu}\n", SIZE_MAX);
+    TEST_CHECK(!sentry_envelope_deserialize(buf, strlen(buf)));
+    snprintf(buf, sizeof(buf), "{}\n{\"length\":%zu}\n", SIZE_MAX - 1);
     TEST_CHECK(!sentry_envelope_deserialize(buf, strlen(buf)));
 }
 
@@ -1288,4 +1414,126 @@ SENTRY_TEST(write_envelope_partial_write_fails)
     sentry_envelope_free(envelope);
     sentry_close();
 #endif
+}
+
+static size_t
+check_rate_limit(const char *header, const char *type1, const char *type2)
+{
+    sentry_envelope_t *envelope = sentry__envelope_new();
+    TEST_ASSERT(!!envelope);
+
+    TEST_ASSERT(!!sentry__envelope_add_from_buffer(envelope, "{}", 2, type1));
+    if (type2) {
+        TEST_ASSERT(
+            !!sentry__envelope_add_from_buffer(envelope, "{}", 2, type2));
+    }
+
+    sentry_rate_limiter_t *rl = sentry__rate_limiter_new();
+    TEST_ASSERT(!!rl);
+    TEST_ASSERT(sentry__rate_limiter_update_from_header(rl, header));
+
+    size_t size = 0;
+    bool owned = false;
+    char *serialized
+        = sentry_envelope_serialize_ratelimited(envelope, rl, &size, &owned);
+    TEST_CHECK((size == 0) == (serialized == NULL));
+    size_t count = 0;
+    if (serialized) {
+        sentry_envelope_t *sent = sentry_envelope_deserialize(serialized, size);
+        TEST_ASSERT(!!sent);
+        count = sentry__envelope_get_item_count(sent);
+        sentry_envelope_free(sent);
+    }
+    if (type2) {
+        TEST_CHECK(sentry__envelope_can_add_client_report(envelope, rl)
+            == (count > 0));
+    }
+
+    if (owned) {
+        sentry_free(serialized);
+    }
+    sentry__rate_limiter_free(rl);
+    sentry_envelope_free(envelope);
+    sentry__client_report_reset();
+    return count;
+}
+
+SENTRY_TEST(envelope_rate_limit)
+{
+    TEST_CHECK(check_rate_limit("60:error:key", "event", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60:error:key", "feedback", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:error:key", "log", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:error:key", "attachment", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:error:key", "trace_metric", NULL) == 1);
+
+    TEST_CHECK(check_rate_limit("60::key", "event", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60::key", "feedback", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60::key", "log", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60::key", "attachment", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60::key", "trace_metric", NULL) == 0);
+
+    TEST_CHECK(check_rate_limit("60:feedback:key", "feedback", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60:log_item:key", "log", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60:log_byte:key", "log", NULL) == 0);
+    TEST_CHECK(check_rate_limit("60:attachment:key", "attachment", NULL) == 0);
+    TEST_CHECK(
+        check_rate_limit("60:attachment_item:key", "attachment", NULL) == 0);
+    TEST_CHECK(
+        check_rate_limit("60:trace_metric:key", "trace_metric", NULL) == 0);
+    TEST_CHECK(
+        check_rate_limit("60:trace_metric_byte:key", "trace_metric", NULL)
+        == 0);
+
+    TEST_CHECK(check_rate_limit("60:feedback;log_item;attachment;"
+                                "trace_metric:key",
+                   "event", NULL)
+        == 1);
+    TEST_CHECK(check_rate_limit("60:log_item:key", "feedback", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:trace_metric:key", "log", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:feedback:key", "attachment", NULL) == 1);
+    TEST_CHECK(
+        check_rate_limit("60:attachment:key", "trace_metric", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60:unknown:key", "feedback", NULL) == 1);
+    TEST_CHECK(check_rate_limit("60::key", "client_report", NULL) == 1);
+}
+
+SENTRY_TEST(attachment_rate_limit)
+{
+    TEST_CHECK(check_rate_limit("60:error:key", "attachment", "event") == 0);
+    TEST_CHECK(check_rate_limit("60:error:key", "attachment", "feedback") == 2);
+    TEST_CHECK(
+        check_rate_limit("60:error:key", "attachment", "transaction") == 2);
+    TEST_CHECK(
+        check_rate_limit("60:feedback:key", "attachment", "feedback") == 0);
+    TEST_CHECK(
+        check_rate_limit("60:transaction:key", "attachment", "transaction")
+        == 0);
+    TEST_CHECK(
+        check_rate_limit("60:attachment:key", "attachment", "event") == 1);
+    TEST_CHECK(
+        check_rate_limit("60:attachment:key", "attachment", "feedback") == 1);
+    TEST_CHECK(check_rate_limit("60::key", "attachment", "feedback") == 0);
+}
+
+SENTRY_TEST(minidump_rate_limit)
+{
+    sentry_envelope_t *envelope = sentry__envelope_new();
+    TEST_ASSERT(!!envelope);
+    sentry_envelope_item_t *item
+        = sentry__envelope_add_from_buffer(envelope, "MDMP", 4, "attachment");
+    TEST_ASSERT(!!item);
+    sentry__envelope_item_set_header(item, "attachment_type",
+        sentry_value_new_string(SENTRY_ATTACHMENT_TYPE_MINIDUMP));
+
+    sentry_rate_limiter_t *rl = sentry__rate_limiter_new();
+    TEST_ASSERT(!!rl);
+    TEST_CHECK(!sentry__envelope_item_is_ratelimited(envelope, item, rl));
+    TEST_ASSERT(
+        sentry__rate_limiter_update_from_header(rl, "60:attachment:key"));
+    TEST_CHECK(!sentry__envelope_item_is_ratelimited(envelope, item, rl));
+    TEST_ASSERT(sentry__rate_limiter_update_from_header(rl, "60:error:key"));
+    TEST_CHECK(sentry__envelope_item_is_ratelimited(envelope, item, rl));
+
+    sentry__rate_limiter_free(rl);
+    sentry_envelope_free(envelope);
 }

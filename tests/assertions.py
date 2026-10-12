@@ -13,7 +13,7 @@ import tests
 import msgpack
 
 from . import REPLAY_ID, SENTRY_VERSION
-from .conditions import is_android, is_asan, is_tsan
+from .conditions import is_android, is_asan, is_tsan, is_wine
 
 VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)[-.]?(.*)")
 
@@ -87,14 +87,19 @@ def assert_meta(
     assert envelope.headers["event_id"]
     event = envelope.get_event()
     assert_event_meta(
-        event, release, integration, transaction, transaction_data, sdk_override
+        event,
+        release=release,
+        integrations=[integration] if integration is not None else None,
+        transaction=transaction,
+        transaction_data=transaction_data,
+        sdk_override=sdk_override,
     )
 
 
 def assert_event_meta(
     event,
     release="test-example-release",
-    integration=None,
+    integrations=None,
     transaction="test-transaction",
     transaction_data=None,
     sdk_override=None,
@@ -126,11 +131,12 @@ def assert_event_meta(
     if is_android:
         expected_sdk["name"] = "sentry.native.android"
     else:
-        if sys.platform == "win32":
-            assert_matches(
-                event["contexts"]["os"],
-                {"name": "Windows", "version": platform.version()},
-            )
+        if sys.platform == "win32" or is_wine:
+            expected_os_context = {"name": "Windows"}
+            if not is_wine:
+                expected_os_context["version"] = platform.version()
+            assert_matches(event["contexts"]["os"], expected_os_context)
+            assert event["contexts"]["os"]["version"] is not None
             assert event["contexts"]["os"]["build"] is not None
         elif sys.platform == "linux":
             version = platform.release()
@@ -163,6 +169,14 @@ def assert_event_meta(
     if sdk_override is not None:
         expected_sdk["name"] = sdk_override
 
+    # ignore e2e test tags
+    event = event.copy()
+    event["tags"] = {
+        key: value
+        for key, value in event["tags"].items()
+        if not key.startswith("test.")
+    }
+
     assert_matches(event, expected)
     assert event["user"]["username"] == "some_name"
     assert INSTALLATION_ID_RE.match(event["user"]["id"])
@@ -171,10 +185,10 @@ def assert_event_meta(
         event["contexts"], {"runtime": {"type": "runtime", "name": "testing-runtime"}}
     )
 
-    if integration is None:
+    if integrations is None:
         assert event["sdk"].get("integrations") is None
     else:
-        assert event["sdk"]["integrations"] == [integration]
+        assert event["sdk"]["integrations"] == integrations
     if event.get("type") == "event":
         assert any(
             "sentry_example" in image["code_file"]
@@ -230,7 +244,7 @@ def assert_stacktrace(
         assert any(
             frame.get("function") is not None and frame.get("package") is not None
             for frame in frames
-        )
+        ), "missing symbolicated frames"
 
     if check_package:
         for frame in frames:
@@ -463,12 +477,15 @@ def assert_native_crash(envelope, exception_code=None):
 
 
 def assert_crash_timestamp(has_files, tmp_path):
-    # The crash file should survive a `sentry_init` and should still be there
-    # even after restarts.
     if has_files:
         with open("{}/.sentry-native/last_crash".format(tmp_path)) as f:
             crash_timestamp = f.read()
         assert_timestamp(crash_timestamp)
+
+
+def assert_no_crash_timestamp(has_files, tmp_path):
+    if has_files:
+        assert not (Path(tmp_path) / ".sentry-native" / "last_crash").exists()
 
 
 def assert_before_send(envelope):
@@ -502,6 +519,8 @@ class CrashpadAttachments:
     view_hierarchy: dict
     cmake_cache: int
     bytes_bin: bytes = None
+    minidump: bytes = None
+    callback: bytes = None
 
 
 def _unpack_breadcrumbs(payload):
@@ -517,7 +536,10 @@ def _load_crashpad_attachments(msg):
     view_hierarchy = {}
     cmake_cache = -1
     bytes_bin = None
+    minidump = None
+    callback = None
     for part in msg.walk():
+        assert part.get_filename() != "__sentry-attachments"
         if part.get_filename() is not None:
             assert part.get("Content-Type") is None
 
@@ -534,9 +556,24 @@ def _load_crashpad_attachments(msg):
                 cmake_cache = len(part.get_payload(decode=True))
             case "bytes.bin":
                 bytes_bin = part.get_payload(decode=True)
+            case "callback.txt":
+                callback = part.get_payload(decode=True)
+
+        if (
+            part.get_param("name", header="content-disposition")
+            == "upload_file_minidump"
+        ):
+            minidump = part.get_payload(decode=True)
 
     return CrashpadAttachments(
-        event, breadcrumb1, breadcrumb2, view_hierarchy, cmake_cache, bytes_bin
+        event,
+        breadcrumb1,
+        breadcrumb2,
+        view_hierarchy,
+        cmake_cache,
+        bytes_bin,
+        minidump,
+        callback,
     )
 
 
@@ -565,13 +602,21 @@ def assert_overflowing_breadcrumb(attachments):
         assert_breadcrumb_inner(attachments.breadcrumb1)
 
 
-def assert_crashpad_upload(req, expect_attachment=False, expect_view_hierarchy=False):
+def assert_crashpad_upload(
+    req,
+    expect_attachment=False,
+    expect_view_hierarchy=False,
+    expect_breadcrumbs=True,
+    expect_default_scope=True,
+):
     multipart = gzip.decompress(req.get_data())
     msg = email.message_from_bytes(bytes(str(req.headers), encoding="utf8") + multipart)
     attachments = _load_crashpad_attachments(msg)
 
-    assert_overflowing_breadcrumb(attachments)
-    assert_event_meta(attachments.event, integration="crashpad")
+    if expect_breadcrumbs:
+        assert_overflowing_breadcrumb(attachments)
+    if expect_default_scope:
+        assert_event_meta(attachments.event, integrations=["crashpad"])
     if expect_attachment:
         assert attachments.cmake_cache > 0
         assert attachments.bytes_bin == b"\xc0\xff\xee"
@@ -580,11 +625,8 @@ def assert_crashpad_upload(req, expect_attachment=False, expect_view_hierarchy=F
         assert attachments.bytes_bin == None
     if expect_view_hierarchy:
         assert_attachment_content_view_hierarchy(attachments.view_hierarchy)
-    assert any(
-        b'name="upload_file_minidump"' in part.as_bytes()
-        and b"\n\nMDMP" in part.as_bytes()
-        for part in msg.walk()
-    )
+    assert attachments.minidump is not None, "minidump attachment missing"
+    assert attachments.minidump.startswith(b"MDMP"), "invalid minidump signature"
     return attachments
 
 
@@ -697,7 +739,7 @@ def wait_for_daemon(tmp_path, started_at, timeout=None):
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        for log_path in db_dir.glob("sentry-daemon-*.log"):
+        for log_path in db_dir.glob("*.run/sentry-daemon.log"):
             try:
                 if log_path.stat().st_mtime < started_at:
                     continue
@@ -748,7 +790,9 @@ def wait_for_stdout(process, predicate, timeout=10):
 
 def assert_replay_envelope(envelope, video, replay_id=REPLAY_ID):
     """Validate a `replay_video` envelope built from the fixture staged by
-    `tests.stage_replay` (the sidecar values below match that fixture)."""
+    `tests.stage_replay` (the sidecar values below match that fixture) for a
+    crash of the example run with its default setup (the breadcrumb values
+    below match the crumbs that setup adds)."""
     assert envelope.headers["event_id"] == replay_id
 
     (item,) = envelope.items
@@ -770,7 +814,8 @@ def assert_replay_envelope(envelope, video, replay_id=REPLAY_ID):
 
     header, _, rrweb = body["replay_recording"].partition(b"\n")
     assert json.loads(header) == {"segment_id": 0}
-    meta_event, video_event = json.loads(rrweb)
+    events = json.loads(rrweb)
+    meta_event, video_event = events[0], events[1]
     assert meta_event["type"] == 4
     assert meta_event["data"]["width"] == 3864
     assert meta_event["data"]["height"] == 2100
@@ -784,5 +829,35 @@ def assert_replay_envelope(envelope, video, replay_id=REPLAY_ID):
     assert payload["container"] == "mp4"
     assert payload["frameCount"] == 58
     assert payload["frameRate"] == 30
+
+    # the crash event's breadcrumbs falling into the replay window are
+    # embedded as rrweb `breadcrumb` custom events, in timestamp order
+    breadcrumb_events = events[2:]
+    assert len(breadcrumb_events) == 3
+    for rrweb_event in breadcrumb_events:
+        assert rrweb_event["type"] == 5
+        assert rrweb_event["data"]["tag"] == "breadcrumb"
+        # the outer rrweb timestamp is in ms, the payload timestamp in seconds
+        payload_ts = rrweb_event["data"]["payload"]["timestamp"]
+        assert abs(rrweb_event["timestamp"] - payload_ts * 1000) < 1
+        assert event["replay_start_timestamp"] <= payload_ts <= event["timestamp"]
+    timestamps = [e["timestamp"] for e in events]
+    assert timestamps == sorted(timestamps)
+
+    crumbs = [e["data"]["payload"] for e in breadcrumb_events]
+    assert [c.get("message") for c in crumbs] == [
+        "default level is info",
+        "debug crumb",
+        "lf\ncrlf\r\nlf\n...",
+    ]
+    assert crumbs[0]["type"] == "default"
+    http_crumb = crumbs[1]
+    assert http_crumb["type"] == "http"
+    assert http_crumb["category"] == "example!"
+    assert http_crumb["level"] == "debug"
+    assert http_crumb["data"]["url"] == "https://example.com/api/1.0/users"
+    assert http_crumb["data"]["method"] == "GET"
+    assert http_crumb["data"]["status_code"] == 200
+    assert crumbs[2]["category"] == "something else"
 
     assert body["replay_video"] == video

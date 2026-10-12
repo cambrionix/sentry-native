@@ -13,6 +13,14 @@
 #include <math.h>
 #include <stdlib.h>
 
+#ifdef SENTRY_INTEGRATION_QT
+#    include "integrations/sentry_integration_qt.h"
+#endif
+
+#ifdef SENTRY_INTEGRATION_WER
+#    include "integrations/sentry_integration_wer.h"
+#endif
+
 static double
 normalize_sample_rate(double sample_rate, double default_value)
 {
@@ -82,12 +90,12 @@ sentry_options_new(void)
     opts->propagate_traceparent = false;
     opts->strict_trace_continuation = false;
     opts->crashpad_limit_stack_capture_to_sp = false;
-    opts->enable_metrics = true;
-    opts->enable_logs = true;
+    opts->max_stack_capture_size = 0;
     opts->cache_keep = SENTRY_CACHE_KEEP_NONE;
     opts->cache_max_age = 0;
     opts->cache_max_size = 0;
     opts->cache_max_items = 30;
+    opts->attachments = sentry_value_new_null();
     opts->symbolize_stacktraces =
     // AIX doesn't have reliable debug IDs for server-side symbolication,
     // and the diversity of Android makes it infeasible to have access to debug
@@ -110,15 +118,32 @@ sentry_options_new(void)
     opts->max_spans = SENTRY_SPANS_MAX;
     opts->handler_strategy = SENTRY_HANDLER_STRATEGY_DEFAULT;
     opts->minidump_mode = SENTRY_MINIDUMP_MODE_SMART; // Default: balanced mode
+#ifdef SENTRY_PLATFORM_WINDOWS
+    opts->minidump_flags = -1;
+#endif
     opts->crash_reporting_mode
         = SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP; // Default: best of
                                                             // both worlds
     opts->crash_upload_mode = SENTRY_CRASH_UPLOAD_MODE_SYNC;
+    opts->thread_stackwalk_mode = SENTRY_THREAD_STACKWALK_MODE_ALL;
     opts->enable_app_hang_tracking = false;
     opts->app_hang_timeout = 5000;
     opts->http_retry = false;
     opts->send_client_reports = true;
     opts->enable_large_attachments = false;
+#ifdef SENTRY_INTEGRATION_PLATFORM
+    if (!sentry__options_add_integration(
+            opts, sentry_integration_platform_new())) {
+        sentry_options_free(opts);
+        return NULL;
+    }
+#endif
+#ifdef SENTRY_INTEGRATION_QT
+    sentry__options_add_integration(opts, sentry_integration_qt_new());
+#endif
+#ifdef SENTRY_INTEGRATION_WER
+    sentry__options_add_integration(opts, sentry_integration_wer_new());
+#endif
 
     return opts;
 }
@@ -130,6 +155,18 @@ sentry__options_incref(sentry_options_t *options)
         sentry__atomic_fetch_and_add(&options->refcount, 1);
     }
     return options;
+}
+
+static void
+free_integration(sentry_integration_t *integration)
+{
+    if (!integration) {
+        return;
+    }
+    if (integration->free_func) {
+        integration->free_func(integration->data);
+    }
+    sentry_free(integration);
 }
 
 void
@@ -153,10 +190,22 @@ sentry_options_free(sentry_options_t *opts)
     sentry__path_free(opts->external_crash_reporter);
     sentry_transport_free(opts->transport);
     sentry__backend_free(opts->backend);
-    sentry__attachments_free(opts->attachments);
+    sentry_value_decref(opts->attachments);
     sentry__run_free(opts->run);
+    for (size_t i = 0; i < opts->num_integrations; i++) {
+        free_integration(opts->integrations[i]);
+    }
+    sentry_free(opts->integrations);
 
     sentry_free(opts);
+}
+
+void
+sentry_options_set_initial_scope(sentry_options_t *opts,
+    sentry_initial_scope_function_t func, void *user_data)
+{
+    opts->initial_scope_func = func;
+    opts->initial_scope_data = user_data;
 }
 
 void
@@ -164,7 +213,7 @@ sentry_options_set_transport(
     sentry_options_t *opts, sentry_transport_t *transport)
 {
     sentry_transport_free(opts->transport);
-    opts->transport = transport;
+    opts->transport = transport ? transport : sentry__transport_new_null();
 }
 
 #ifdef SENTRY_PLATFORM_NX
@@ -199,6 +248,14 @@ sentry_options_set_on_crash(
 }
 
 void
+sentry_options_set_on_crashed_last_run(sentry_options_t *opts,
+    sentry_crashed_last_run_function_t func, void *user_data)
+{
+    opts->on_crashed_last_run_func = func;
+    opts->on_crashed_last_run_data = user_data;
+}
+
+void
 sentry_options_set_before_transaction(
     sentry_options_t *opts, sentry_transaction_function_t func, void *user_data)
 {
@@ -220,6 +277,14 @@ sentry_options_set_before_breadcrumb(sentry_options_t *opts,
 {
     opts->before_breadcrumb_func = func;
     opts->before_breadcrumb_data = user_data;
+}
+
+void
+sentry_options_set_before_send_feedback(sentry_options_t *opts,
+    sentry_before_send_feedback_function_t func, void *user_data)
+{
+    opts->before_send_feedback_func = func;
+    opts->before_send_feedback_data = user_data;
 }
 
 void
@@ -261,10 +326,10 @@ sentry_options_set_org_id(sentry_options_t *opts, const char *org_id)
 const char *
 sentry__options_get_org_id(const sentry_options_t *opts)
 {
-    if (opts->org_id && *opts->org_id) {
+    if (!sentry__string_empty(opts->org_id)) {
         return opts->org_id;
     }
-    if (opts->dsn && opts->dsn->org_id && *opts->dsn->org_id) {
+    if (opts->dsn && !sentry__string_empty(opts->dsn->org_id)) {
         return opts->dsn->org_id;
     }
     return NULL;
@@ -609,6 +674,15 @@ sentry_options_set_minidump_mode(
     opts->minidump_mode = mode;
 }
 
+#ifdef SENTRY_PLATFORM_WINDOWS
+void
+sentry_options_set_minidump_flags(
+    sentry_options_t *opts, sentry_minidump_flags_t flags)
+{
+    opts->minidump_flags = (int32_t)(flags & 0x01ffffff);
+}
+#endif
+
 void
 sentry_options_set_crash_reporting_mode(
     sentry_options_t *opts, sentry_crash_reporting_mode_t mode)
@@ -627,6 +701,26 @@ sentry_crash_reporting_mode_t
 sentry_options_get_crash_reporting_mode(const sentry_options_t *opts)
 {
     return (sentry_crash_reporting_mode_t)opts->crash_reporting_mode;
+}
+
+void
+sentry_options_set_thread_stackwalk_mode(
+    sentry_options_t *opts, sentry_thread_stackwalk_mode_t mode)
+{
+    // Clamp to valid range (cast to int to handle negative values)
+    int imode = (int)mode;
+    if (imode < SENTRY_THREAD_STACKWALK_MODE_CRASHED_ONLY) {
+        imode = SENTRY_THREAD_STACKWALK_MODE_CRASHED_ONLY;
+    } else if (imode > SENTRY_THREAD_STACKWALK_MODE_ALL) {
+        imode = SENTRY_THREAD_STACKWALK_MODE_ALL;
+    }
+    opts->thread_stackwalk_mode = imode;
+}
+
+sentry_thread_stackwalk_mode_t
+sentry_options_get_thread_stackwalk_mode(const sentry_options_t *opts)
+{
+    return (sentry_thread_stackwalk_mode_t)opts->thread_stackwalk_mode;
 }
 
 void
@@ -663,6 +757,13 @@ sentry_options_set_crashpad_limit_stack_capture_to_sp(
 }
 
 void
+sentry_options_set_max_stack_capture_size(
+    sentry_options_t *opts, uint32_t max_stack_capture_size)
+{
+    opts->max_stack_capture_size = max_stack_capture_size;
+}
+
+void
 sentry_options_set_shutdown_timeout(
     sentry_options_t *opts, uint64_t shutdown_timeout)
 {
@@ -691,33 +792,31 @@ sentry_options_get_transfer_timeout(sentry_options_t *opts)
 void
 sentry_options_add_attachment(sentry_options_t *opts, const char *path)
 {
-    sentry__attachments_add_path(
-        &opts->attachments, sentry__path_from_str(path), NULL, NULL);
+    sentry_value_decref(
+        sentry__attachments_add_path(&opts->attachments, path, NULL, NULL));
 }
 
 void
 sentry_options_add_attachment_n(
     sentry_options_t *opts, const char *path, size_t path_len)
 {
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str_n(path, path_len), NULL, NULL);
+    sentry_value_decref(sentry__attachments_add_path_n(
+        &opts->attachments, path, path_len, NULL, NULL));
 }
 
 void
 sentry_options_add_view_hierarchy(sentry_options_t *opts, const char *path)
 {
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str(path), SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY,
-        "application/json");
+    sentry_value_decref(sentry__attachments_add_path(&opts->attachments, path,
+        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json"));
 }
 
 void
 sentry_options_add_view_hierarchy_n(
     sentry_options_t *opts, const char *path, size_t path_len)
 {
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_str_n(path, path_len),
-        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
+    sentry_value_decref(sentry__attachments_add_path_n(&opts->attachments, path,
+        path_len, SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json"));
 }
 
 void
@@ -798,8 +897,8 @@ void
 sentry_options_add_attachmentw_n(
     sentry_options_t *opts, const wchar_t *path, size_t path_len)
 {
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_wstr_n(path, path_len), NULL, NULL);
+    sentry_value_decref(sentry__attachments_add_wpath_n(
+        &opts->attachments, path, path_len, NULL, NULL));
 }
 
 void
@@ -813,18 +912,18 @@ void
 sentry_options_add_view_hierarchyw(sentry_options_t *opts, const wchar_t *path)
 {
     size_t path_len = path ? wcslen(path) : 0;
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_wstr_n(path, path_len),
-        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
+    sentry_value_decref(
+        sentry__attachments_add_wpath_n(&opts->attachments, path, path_len,
+            SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json"));
 }
 
 void
 sentry_options_add_view_hierarchyw_n(
     sentry_options_t *opts, const wchar_t *path, size_t path_len)
 {
-    sentry__attachments_add_path(&opts->attachments,
-        sentry__path_from_wstr_n(path, path_len),
-        SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json");
+    sentry_value_decref(
+        sentry__attachments_add_wpath_n(&opts->attachments, path, path_len,
+            SENTRY_ATTACHMENT_TYPE_VIEW_HIERARCHY, "application/json"));
 }
 
 void
@@ -930,16 +1029,42 @@ sentry_options_set_backend(sentry_options_t *opts, sentry_backend_t *backend)
     opts->backend = backend;
 }
 
-void
-sentry_options_set_enable_logs(sentry_options_t *opts, int enable_logs)
+bool
+sentry__options_add_integration(
+    sentry_options_t *opts, sentry_integration_t *integration)
 {
-    opts->enable_logs = !!enable_logs;
+    if (!integration) {
+        return false;
+    }
+
+    size_t new_count = opts->num_integrations + 1;
+    sentry_integration_t **integrations
+        = sentry__calloc(new_count, sizeof(sentry_integration_t *));
+    if (!integrations) {
+        free_integration(integration);
+        return false;
+    }
+
+    for (size_t i = 0; i < opts->num_integrations; i++) {
+        integrations[i] = opts->integrations[i];
+    }
+    integrations[opts->num_integrations] = integration;
+    sentry_free(opts->integrations);
+    opts->integrations = integrations;
+    opts->num_integrations = new_count;
+    return true;
 }
 
-int
-sentry_options_get_enable_logs(const sentry_options_t *opts)
+bool
+sentry__options_has_integration(const sentry_options_t *opts, const char *name)
 {
-    return opts->enable_logs;
+    for (size_t i = 0; i < opts->num_integrations; i++) {
+        const char *integration_name = opts->integrations[i]->name;
+        if (integration_name && sentry__string_eq(integration_name, name)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void
@@ -953,18 +1078,6 @@ int
 sentry_options_get_logs_with_attributes(const sentry_options_t *opts)
 {
     return opts->logs_with_attributes;
-}
-
-void
-sentry_options_set_enable_metrics(sentry_options_t *opts, int enable_metrics)
-{
-    opts->enable_metrics = !!enable_metrics;
-}
-
-int
-sentry_options_get_enable_metrics(const sentry_options_t *opts)
-{
-    return opts->enable_metrics;
 }
 
 void

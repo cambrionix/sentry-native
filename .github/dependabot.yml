@@ -4,3 +4,10 @@ updates:
   directory: "/"
   schedule:
     interval: "weekly"
+  groups:
+    github-codeql-action:
+      patterns:
+        - "github/codeql-action/*"
+    docker-actions:
+      patterns:
+        - "docker/*"

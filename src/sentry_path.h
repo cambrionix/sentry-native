@@ -86,6 +86,13 @@ sentry_path_t *sentry__path_join_str(
     const sentry_path_t *base, const char *other);
 
 /**
+ * Join a single filename to `dir`, rejecting empty names, path separators,
+ * `.` and `..`. Does not check the filesystem.
+ */
+sentry_path_t *sentry__path_join_filename(
+    const sentry_path_t *dir, const char *filename);
+
+/**
  * Return a new path with the given suffix stripped.
  * If `suffix` is NULL, strips at the last dot in the filename.
  * Returns NULL if the suffix does not match.
@@ -128,6 +135,12 @@ void sentry__path_free(sentry_path_t *path);
 const char *sentry__path_filename(const sentry_path_t *path);
 
 /**
+ * Returns a pointer to the last path segment in the borrowed string.
+ */
+const char *sentry__path_filename_from_str(const char *path);
+const char *sentry__path_filename_from_str_n(const char *path, size_t path_len);
+
+/**
  * Returns whether the two paths are equal.
  */
 bool sentry__path_eq(const sentry_path_t *path_a, const sentry_path_t *path_b);
@@ -149,7 +162,8 @@ bool sentry__path_ends_with(const sentry_path_t *path, const char *suffix);
 bool sentry__path_is_dir(const sentry_path_t *path);
 
 /**
- * Return whether the path refers to a symlink.
+ * Return whether the path refers to a symlink. On Windows, this includes
+ * name-surrogate reparse points such as junctions.
  */
 bool sentry__path_is_symlink(const sentry_path_t *path);
 

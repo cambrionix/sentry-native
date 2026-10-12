@@ -48,28 +48,51 @@ bool sentry__should_skip_upload(void);
 bool sentry__event_is_transaction(sentry_value_t event);
 
 /**
- * Convert the given event into an envelope. This assumes that the event
- * being passed in is not a transaction.
+ * Invokes the configured `on_crash` callback, if any.
+ *
+ * Returns the callback result, or `event` unchanged when no callback is
+ * configured.
+ */
+sentry_value_t sentry__invoke_on_crash(const sentry_options_t *options,
+    const sentry_ucontext_t *uctx, sentry_value_t event, sentry_hint_t *hint);
+
+/**
+ * Invokes the configured `before_send` callback, if any.
+ *
+ * Returns the callback result, or `event` unchanged when no callback is
+ * configured. Records a client report when the callback discards the event.
+ */
+sentry_value_t sentry__invoke_before_send(
+    const sentry_options_t *options, sentry_value_t event, sentry_hint_t *hint);
+
+/**
+ * Prepares an event by recording errors on the current session and applying
+ * the local and global scopes.
+ *
+ * Returns `event` without transferring ownership.
+ */
+sentry_value_t sentry__prepare_event(const sentry_options_t *options,
+    sentry_value_t event, sentry_scope_t *local_scope);
+
+/**
+ * Encloses the given event in an envelope. This assumes that the event being
+ * passed in is not a transaction.
  *
  * More specifically, it will do the following things:
- * - apply the scope to it,
- * - call the before_send hook on it (if invoke_before_send == true),
  * - add the event to a new envelope,
- * - record errors on the current session,
  * - add any attachments to the envelope as well
  *
  * The function will ensure the event has a UUID and write it into the
  * `event_id` out-parameter.
  */
-sentry_envelope_t *sentry__prepare_event(const sentry_options_t *options,
-    sentry_value_t event, sentry_uuid_t *event_id, bool invoke_before_send,
-    sentry_scope_t *local_scope);
+sentry_envelope_t *sentry__enclose_event(const sentry_options_t *options,
+    sentry_value_t event, sentry_uuid_t *event_id, sentry_value_t attachments);
 
 /**
  * Sends a sentry event, regardless of its type.
  */
 sentry_uuid_t sentry__capture_event(
-    sentry_value_t event, sentry_scope_t *local_scope);
+    sentry_value_t event, sentry_scope_t *local_scope, sentry_hint_t *hint);
 
 /**
  * Convert the given transaction into an envelope. This assumes that the
@@ -95,6 +118,16 @@ sentry_value_t sentry__transaction_finish_value(
 /**
  * This function will submit the `envelope` to the given `transport`, first
  * checking for consent.
+ */
+void sentry__submit_envelope(sentry_transport_t *transport,
+    sentry_envelope_t *envelope, const sentry_options_t *options);
+
+/**
+ * Captures the `envelope` on the global scope, recording the last sent event
+ * ID.
+ *
+ * Note: This is not safe to call from crash handlers; use
+ * `sentry__submit_envelope` directly instead.
  */
 void sentry__capture_envelope(sentry_transport_t *transport,
     sentry_envelope_t *envelope, const sentry_options_t *options);
@@ -129,14 +162,21 @@ void sentry__options_unlock(void);
 
 void sentry__set_propagation_context(const char *key, sentry_value_t value);
 
-/**
- * Adds default attributes to the telemetry attributes object.
+/*
+ * Populates a telemetry item (a log or metric) with attributes and scope data
+ * from all available sources. Values are applied in precedence order, where the
+ * first write wins: per-call attributes already present in `attributes`, then
+ * the passed `scope`, then the global scope, and finally the options.
  */
-void sentry__apply_attributes(
-    sentry_value_t telemetry, sentry_value_t attributes);
+void sentry__apply_to_telemetry(const sentry_scope_t *scope,
+    const sentry_options_t *options, sentry_value_t telemetry,
+    sentry_value_t attributes);
 
 bool sentry__launch_external_crash_reporter(
     const sentry_options_t *options, sentry_envelope_t *envelope);
+
+void sentry__enter_crash_handler(void);
+void sentry__exit_crash_handler(void);
 
 #define SENTRY_WITH_OPTIONS(Options)                                           \
     for (const sentry_options_t *Options = sentry__options_getref(); Options;  \
@@ -147,11 +187,6 @@ bool sentry__launch_external_crash_reporter(
 bool sentry__roll_dice(double probability);
 bool sentry__should_send_transaction(
     sentry_value_t tx_ctx, sentry_sampling_context_t *sampling_ctx);
-#endif
-
-#if defined(SENTRY_PLATFORM_NX) || defined(SENTRY_PLATFORM_PS)                 \
-    || defined(SENTRY_PLATFORM_XBOX)
-int sentry__native_init(sentry_options_t *options);
 #endif
 
 #endif

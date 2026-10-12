@@ -3,6 +3,7 @@
 #include "sentry_random.h"
 #include "sentry_string.h"
 #include "sentry_uuid.h"
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -110,7 +111,7 @@ sentry_uuid_as_string(const sentry_uuid_t *uuid, char str[37])
 }
 
 void
-sentry__internal_uuid_as_string(const sentry_uuid_t *uuid, char str[37])
+sentry__internal_uuid_as_string(const sentry_uuid_t *uuid, char str[33])
 {
 #define B(X) (unsigned char)uuid->bytes[X]
     snprintf(str, 33,
@@ -172,3 +173,22 @@ sentry__uuid_from_native(const GUID *guid)
     return rv;
 }
 #endif
+
+bool
+sentry__uuid_is_valid(const char *id, size_t len)
+{
+    if (!id || (len != 32 && len != 36)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        if (len == 36 && (i == 8 || i == 13 || i == 18 || i == 23)) {
+            if (id[i] != '-') {
+                return false;
+            }
+        } else if (!isxdigit((unsigned char)id[i])) {
+            return false;
+        }
+    }
+    return true;
+}

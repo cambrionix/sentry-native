@@ -4,33 +4,11 @@
 #include "sentry_database.h"
 #include "sentry_envelope.h"
 #include "sentry_json.h"
+#include "sentry_mpack.h"
 #include "sentry_string.h"
 #include "sentry_utils.h"
+#include "sentry_uuid.h"
 #include "sentry_value.h"
-
-#if defined(_MSC_VER)
-#    pragma warning(push)
-#    pragma warning(disable : 4127) // conditional expression is constant
-#    if defined(__clang__) // clang-cl
-#        pragma clang diagnostic push
-#        pragma clang diagnostic ignored "-Wdocumentation"
-#        pragma clang diagnostic ignored "-Wpre-c11-compat"
-#    endif
-#elif defined(__clang__)
-#    pragma clang diagnostic push
-#    pragma clang diagnostic ignored "-Wstatic-in-inline"
-#endif
-
-#include "../vendor/mpack.h"
-
-#if defined(_MSC_VER)
-#    pragma warning(pop)
-#    ifdef __clang__ // clang-cl
-#        pragma clang diagnostic pop
-#    endif
-#elif defined(__clang__)
-#    pragma clang diagnostic pop
-#endif
 
 #include <stdio.h>
 
@@ -70,7 +48,7 @@ build_replay_event(sentry_value_t meta, const char *replay_id, double start_sec,
         event, "type", sentry_value_new_string("replay_event"));
     sentry_value_set_by_key(event, "replay_type",
         sentry_value_new_string(
-            replay_type && replay_type[0] ? replay_type : "buffer"));
+            !sentry__string_empty(replay_type) ? replay_type : "buffer"));
     sentry_value_set_by_key(
         event, "segment_id", sentry_value_new_int32(segment_id));
     sentry_value_set_by_key(
@@ -112,11 +90,80 @@ build_replay_event(sentry_value_t meta, const char *replay_id, double start_sec,
     return event;
 }
 
-// Build the rrweb recording list (meta event + video event) describing the
-// clip.
+// Convert the breadcrumbs that fall inside the replay window into rrweb
+// `breadcrumb` events (custom event type 5) and append them to `recording`,
+// so they show up on the replay timeline. `breadcrumbs` is timestamp-ordered
+// (it comes from the scope ring buffer or the merged ring files), and every
+// in-window crumb lies at or after the meta/video events' `start_sec`, so
+// appending keeps the recording chronologically sorted.
+static void
+append_breadcrumb_events(sentry_value_t recording, sentry_value_t breadcrumbs,
+    double start_sec, double end_sec)
+{
+    // events may carry breadcrumbs as either a bare list or `{"values": [...]}`
+    if (sentry_value_get_type(breadcrumbs) == SENTRY_VALUE_TYPE_OBJECT) {
+        breadcrumbs = sentry_value_get_by_key(breadcrumbs, "values");
+    }
+    if (sentry_value_get_type(breadcrumbs) != SENTRY_VALUE_TYPE_LIST) {
+        return;
+    }
+
+    const size_t len = sentry_value_get_length(breadcrumbs);
+    for (size_t i = 0; i < len; i++) {
+        sentry_value_t crumb = sentry_value_get_by_index(breadcrumbs, i);
+        const char *ts = sentry_value_as_string(
+            sentry_value_get_by_key(crumb, "timestamp"));
+        if (sentry__string_empty(ts)) {
+            continue;
+        }
+        const uint64_t usec = sentry__iso8601_to_usec(ts);
+        if (!usec) {
+            continue;
+        }
+        const double ts_sec = (double)usec / 1000000.0;
+        if (ts_sec < start_sec || ts_sec > end_sec) {
+            continue;
+        }
+
+        sentry_value_t payload = sentry_value_new_object();
+        const char *crumb_type
+            = sentry_value_as_string(sentry_value_get_by_key(crumb, "type"));
+        sentry_value_set_by_key(payload, "type",
+            sentry_value_new_string(
+                !sentry__string_empty(crumb_type) ? crumb_type : "default"));
+        // the rrweb payload timestamp is in seconds, the outer one in ms
+        sentry_value_set_by_key(
+            payload, "timestamp", sentry_value_new_double(ts_sec));
+        static const char *const copy_keys[]
+            = { "category", "message", "level", "data" };
+        for (size_t k = 0; k < sizeof(copy_keys) / sizeof(copy_keys[0]); k++) {
+            sentry_value_t v = sentry_value_get_by_key(crumb, copy_keys[k]);
+            if (!sentry_value_is_null(v)) {
+                sentry_value_incref(v);
+                sentry_value_set_by_key(payload, copy_keys[k], v);
+            }
+        }
+
+        sentry_value_t crumb_data = sentry_value_new_object();
+        sentry_value_set_by_key(
+            crumb_data, "tag", sentry_value_new_string("breadcrumb"));
+        sentry_value_set_by_key(crumb_data, "payload", payload);
+
+        sentry_value_t crumb_event = sentry_value_new_object();
+        sentry_value_set_by_key(crumb_event, "type", sentry_value_new_int32(5));
+        sentry_value_set_by_key(
+            crumb_event, "timestamp", sentry_value_new_double(ts_sec * 1000.0));
+        sentry_value_set_by_key(crumb_event, "data", crumb_data);
+        sentry_value_append(recording, crumb_event);
+    }
+}
+
+// Build the rrweb recording list (meta event + video event + breadcrumb
+// events) describing the clip.
 static sentry_value_t
-build_replay_recording(sentry_value_t meta, double start_sec,
-    int32_t segment_id, double size_bytes, double duration_ms)
+build_replay_recording(sentry_value_t meta, double start_sec, double end_sec,
+    int32_t segment_id, double size_bytes, double duration_ms,
+    sentry_value_t breadcrumbs)
 {
     const int32_t width
         = sentry_value_as_int32(sentry_value_get_by_key(meta, "width"));
@@ -171,6 +218,7 @@ build_replay_recording(sentry_value_t meta, double start_sec,
     sentry_value_t recording = sentry_value_new_list();
     sentry_value_append(recording, meta_event);
     sentry_value_append(recording, video_event);
+    append_breadcrumb_events(recording, breadcrumbs, start_sec, end_sec);
     return recording;
 }
 
@@ -187,7 +235,7 @@ build_replay_envelope(const sentry_options_t *options, sentry_value_t meta,
 
     const char *replay_id
         = sentry_value_as_string(sentry_value_get_by_key(meta, "replayId"));
-    if (!replay_id || !replay_id[0]) {
+    if (sentry__string_empty(replay_id)) {
         return NULL;
     }
 
@@ -210,8 +258,9 @@ build_replay_envelope(const sentry_options_t *options, sentry_value_t meta,
 
     sentry_value_t event = build_replay_event(
         meta, replay_id, start_sec, end_sec, segment_id, scope_source);
-    sentry_value_t recording = build_replay_recording(
-        meta, start_sec, segment_id, (double)video_len, duration_ms);
+    sentry_value_t recording = build_replay_recording(meta, start_sec, end_sec,
+        segment_id, (double)video_len, duration_ms,
+        sentry_value_get_by_key(scope_source, "breadcrumbs"));
 
     sentry_envelope_t *envelope = NULL;
 
@@ -326,10 +375,10 @@ sentry__session_replay_flush_pending(const sentry_options_t *options,
     if (!sentry_value_is_null(scope_source)) {
         sentry_value_t replay_ctx = sentry_value_get_by_key(
             sentry_value_get_by_key(scope_source, "contexts"), "replay");
-        const char *rid = sentry_value_as_string(
-            sentry_value_get_by_key(replay_ctx, "replay_id"));
-        if (rid && rid[0]) {
-            replay_id = rid;
+        sentry_value_t rid = sentry_value_get_by_key(replay_ctx, "replay_id");
+        if (sentry__uuid_is_valid(
+                sentry_value_as_string(rid), sentry_value_get_length(rid))) {
+            replay_id = sentry_value_as_string(rid);
         }
     }
     if (!replay_id) {
@@ -353,14 +402,14 @@ sentry__session_replay_flush_pending(const sentry_options_t *options,
     size_t json_len = 0;
     char *json = sentry__path_read_to_buffer(sidecar_path, &json_len);
     if (json) {
-        sentry_value_t meta = sentry__value_from_json(json, json_len);
+        sentry_value_t meta = sentry_value_from_json(json, json_len);
         sentry_free(json);
 
         // build_replay_envelope falls back to the sidecar's end timestamp if 0.
         double end_sec = 0.0;
         const char *ts = sentry_value_as_string(
             sentry_value_get_by_key(scope_source, "timestamp"));
-        if (ts && ts[0]) {
+        if (!sentry__string_empty(ts)) {
             uint64_t usec = sentry__iso8601_to_usec(ts);
             if (usec) {
                 end_sec = (double)usec / 1000000.0;
@@ -370,7 +419,7 @@ sentry__session_replay_flush_pending(const sentry_options_t *options,
         sentry_envelope_t *envelope = build_replay_envelope(
             options, meta, mp4_path, end_sec, scope_source);
         if (envelope) {
-            sentry__capture_envelope(transport, envelope, options);
+            sentry__submit_envelope(transport, envelope, options);
         }
         sentry_value_decref(meta);
 

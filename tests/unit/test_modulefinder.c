@@ -4,6 +4,9 @@
 
 #ifdef SENTRY_PLATFORM_LINUX
 #    include "modulefinder/sentry_modulefinder_linux.h"
+#    include <fcntl.h>
+#    include <stdlib.h>
+#    include <unistd.h>
 #endif
 
 SENTRY_TEST(module_finder)
@@ -71,6 +74,64 @@ SENTRY_TEST(module_addr)
 
     ptr = sentry__module_get_addr(&module, 7, 9);
     TEST_CHECK(ptr == NULL); // too big
+
+    ptr = sentry__module_get_addr(&module, 1, UINT64_MAX);
+    TEST_CHECK(ptr == NULL); // size overflows
+
+    module.offset_in_inode = 10;
+    ptr = sentry__module_get_addr(&module, UINT64_MAX - 8, 1);
+    TEST_CHECK(ptr == NULL); // mapping offset underflows
+#endif
+}
+
+SENTRY_TEST(elf_metadata_section)
+{
+#if !defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+    SKIP_TEST();
+#else
+    char tmp_path[] = "/tmp/sentry-native-elf-section-XXXXXX";
+    int fd = mkstemp(tmp_path);
+    TEST_ASSERT(fd >= 0);
+    TEST_ASSERT(write(fd, "test", 4) == 4);
+
+    char *buf = sentry__elf_read_metadata_section(fd, 1, 3);
+    TEST_ASSERT(!!buf);
+    TEST_CHECK(memcmp(buf, "est", 3) == 0);
+    sentry_free(buf);
+
+    TEST_CHECK(!sentry__elf_read_metadata_section(
+        fd, 0, SENTRY_ELF_MAX_METADATA_SECTION_SIZE + 1));
+    TEST_CHECK(!sentry__elf_read_metadata_section(fd, UINT64_MAX, 1));
+
+    close(fd);
+    unlink(tmp_path);
+#endif
+}
+
+SENTRY_TEST(mmap_file_closes_fd_zero_on_failure)
+{
+#if !defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+    SKIP_TEST();
+#else
+    char tmp_path[] = "/tmp/sentry-native-mmap-XXXXXX";
+    int tmp_fd = mkstemp(tmp_path);
+    TEST_ASSERT(tmp_fd >= 0);
+    close(tmp_fd);
+
+    int saved_stdin = dup(STDIN_FILENO);
+    TEST_ASSERT(saved_stdin >= 0);
+    close(STDIN_FILENO);
+
+    sentry_mmap_t mmap = { 0 };
+    bool mapped = sentry__mmap_file(&mmap, tmp_path);
+    int fd_flags = fcntl(STDIN_FILENO, F_GETFD);
+
+    dup2(saved_stdin, STDIN_FILENO);
+    close(saved_stdin);
+    unlink(tmp_path);
+
+    TEST_CHECK(!mapped);
+    TEST_CHECK(fd_flags == -1);
 #endif
 }
 
@@ -173,16 +234,17 @@ parse_elf_and_check_code_and_build_id(const char *rel_elf_path,
 
     sentry_module_t module = { 0 };
     module.num_mappings = 1;
-    size_t *file_size = &module.mappings[0].size;
-    char **buf = (char **)&module.mappings[0].addr;
 
     sentry_value_t value = sentry_value_new_object();
     sentry_path_t *elf_path = sentry__path_join_str(dir, rel_elf_path);
-    *buf = sentry__path_read_to_buffer(elf_path, file_size);
+    size_t file_size = 0;
+    char *buf = sentry__path_read_to_buffer(elf_path, &file_size);
     sentry__path_free(elf_path);
+    module.mappings[0].addr = (uint64_t)(uintptr_t)buf;
+    module.mappings[0].size = file_size;
 
     TEST_CHECK(sentry__procmaps_read_ids_from_elf(value, &module));
-    sentry_free(*buf);
+    sentry_free(buf);
     sentry__path_free(dir);
 
     if (expected_code_id) {

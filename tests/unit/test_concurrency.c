@@ -1,5 +1,14 @@
+#include "sentry_alloc.h"
+#include "sentry_backend.h"
 #include "sentry_core.h"
+#include "sentry_database.h"
+#include "sentry_envelope.h"
+#include "sentry_options.h"
+#include "sentry_path.h"
+#include "sentry_scope.h"
 #include "sentry_testsupport.h"
+#include "sentry_transport.h"
+#include "sentry_utils.h"
 
 #include <sentry_sync.h>
 
@@ -76,6 +85,92 @@ SENTRY_TEST(multiple_inits)
     TEST_CHECK_INT_EQUAL(called, 4);
 }
 
+typedef struct {
+    sentry_envelope_t *queued;
+    long send_started;
+    long release_send;
+    long send_count;
+    long dump_count;
+} suspend_transport_state_t;
+
+static void
+suspend_send(sentry_envelope_t *envelope, void *data)
+{
+    suspend_transport_state_t *state = data;
+    sentry__atomic_store(&state->send_started, 1);
+    while (!sentry__atomic_fetch(&state->release_send)) {
+        sentry__thread_yield();
+    }
+    state->queued = envelope;
+    sentry__atomic_fetch_and_add(&state->send_count, 1);
+}
+
+static size_t
+suspend_dump(sentry_run_t *run, void *data)
+{
+    (void)run;
+    suspend_transport_state_t *state = data;
+    sentry__atomic_fetch_and_add(&state->dump_count, 1);
+    if (!state->queued) {
+        return 0;
+    }
+    sentry_envelope_free(state->queued);
+    state->queued = NULL;
+    return 1;
+}
+
+SENTRY_THREAD_FN
+suspend_send_thread(void *data)
+{
+    sentry__transport_send_envelope(data, sentry__envelope_new());
+    return 0;
+}
+
+SENTRY_TEST(transport_suspend)
+{
+    sentry_path_t *database_path = sentry__path_from_str(
+        SENTRY_TEST_PATH_PREFIX ".transport-crash-mode");
+    TEST_ASSERT(!!database_path);
+    sentry__path_remove_all(database_path);
+    TEST_ASSERT(!sentry__path_create_dir_all(database_path));
+    sentry_run_t *run = sentry__run_new(database_path);
+    TEST_ASSERT(!!run);
+
+    suspend_transport_state_t state = { 0 };
+    sentry_transport_t *transport = sentry_transport_new(suspend_send);
+    TEST_ASSERT(!!transport);
+    sentry_transport_set_state(transport, &state);
+    sentry__transport_set_dump_func(transport, suspend_dump);
+    sentry_options_t startup_options = { 0 };
+    startup_options.run = run;
+    TEST_CHECK(!sentry__transport_startup(transport, &startup_options));
+
+    sentry_threadid_t thread;
+    sentry__thread_init(&thread);
+    TEST_ASSERT(!sentry__thread_spawn(&thread, suspend_send_thread, transport));
+    while (!sentry__atomic_fetch(&state.send_started)) {
+        sentry__thread_yield();
+    }
+
+    sentry__transport_suspend(transport);
+    sentry__atomic_store(&state.release_send, 1);
+    sentry__thread_join(thread);
+
+    TEST_CHECK_INT_EQUAL(sentry__atomic_fetch(&state.send_count), 1);
+    TEST_CHECK_INT_EQUAL(sentry__atomic_fetch(&state.dump_count), 1);
+    TEST_CHECK(!state.queued);
+
+    sentry__transport_send_envelope(transport, sentry__envelope_new());
+    TEST_CHECK_INT_EQUAL(sentry__atomic_fetch(&state.send_count), 1);
+    TEST_CHECK(sentry__atomic_fetch(&run->retain));
+
+    sentry_transport_free(transport);
+    sentry__run_clean(run, true);
+    sentry__run_free(run);
+    sentry__path_remove_all(database_path);
+    sentry__path_free(database_path);
+}
+
 SENTRY_THREAD_FN
 thread_worker(void *called)
 {
@@ -149,4 +244,185 @@ SENTRY_TEST(concurrent_uninit)
     sentry__thread_free(&thread);
 
     sentry_close();
+}
+
+typedef struct {
+    long started;
+    long shutdowns;
+} reinstall_backend_state_t;
+
+static void
+reinstall_backend_shutdown(sentry_backend_t *backend)
+{
+    reinstall_backend_state_t *state = backend->data;
+    sentry__atomic_fetch_and_add(&state->shutdowns, 1);
+}
+
+SENTRY_THREAD_FN
+reinstall_backend_thread(void *data)
+{
+    reinstall_backend_state_t *state = data;
+    sentry__atomic_store(&state->started, 1);
+    sentry_reinstall_backend();
+    return 0;
+}
+
+SENTRY_TEST(concurrent_reinstall)
+{
+    reinstall_backend_state_t state = { 0 };
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_backend_t *backend = SENTRY_MAKE(sentry_backend_t);
+    TEST_ASSERT(!!backend);
+    backend->data = &state;
+    backend->shutdown_func = reinstall_backend_shutdown;
+    sentry_options_set_backend(options, backend);
+    sentry_init(options);
+
+    // Holding the scope observer lock simulates an observer callback in
+    // progress. Backend reinstall must wait until that callback finishes.
+    sentry_scope_t *scope = sentry__scope_getref();
+    TEST_ASSERT(!!scope);
+    sentry__mutex_lock(&scope->observers_lock);
+    sentry_threadid_t thread;
+    sentry__thread_init(&thread);
+    TEST_ASSERT(
+        !sentry__thread_spawn(&thread, reinstall_backend_thread, &state));
+    while (!sentry__atomic_fetch(&state.started)) {
+        sentry__thread_yield();
+    }
+
+    const uint64_t deadline = sentry__monotonic_time() + 100;
+    while (!sentry__atomic_fetch(&state.shutdowns)
+        && sentry__monotonic_time() < deadline) {
+        sentry__thread_yield();
+    }
+    TEST_CHECK_INT_EQUAL(sentry__atomic_fetch(&state.shutdowns), 0);
+
+    sentry__mutex_unlock(&scope->observers_lock);
+    sentry__scope_finish_mut(scope, false);
+    sentry__thread_join(thread);
+    sentry__thread_free(&thread);
+    TEST_CHECK_INT_EQUAL(sentry__atomic_fetch(&state.shutdowns), 1);
+    sentry_close();
+}
+
+typedef struct {
+    sentry_mutex_t lock;
+    sentry_cond_t access_signal;
+    sentry_cond_t cleanup_signal;
+    size_t accesses;
+    bool release_access;
+    bool cleanup_started;
+    bool cleanup_finished;
+    sentry_level_t level;
+} scope_cleanup_state_t;
+
+SENTRY_THREAD_FN
+scope_access_thread(void *data)
+{
+    scope_cleanup_state_t *state = data;
+    sentry_scope_t *scope = sentry__scope_getref();
+
+    sentry__mutex_lock(&state->lock);
+    state->accesses++;
+    state->level = sentry__scope_get_level(scope);
+    sentry__cond_wake_all(&state->access_signal);
+    while (!state->release_access) {
+        sentry__cond_wait(&state->access_signal, &state->lock);
+    }
+    sentry__mutex_unlock(&state->lock);
+
+    (void)sentry__scope_get_level(scope);
+    (void)sentry_is_enabled();
+    SENTRY_WITH_SCOPE (nested) {
+        (void)sentry__scope_get_level(nested);
+    }
+    sentry__scope_finish(scope);
+    return 0;
+}
+
+SENTRY_THREAD_FN
+scope_cleanup_thread(void *data)
+{
+    scope_cleanup_state_t *state = data;
+
+    sentry__mutex_lock(&state->lock);
+    state->cleanup_started = true;
+    sentry__cond_wake(&state->cleanup_signal);
+    sentry__mutex_unlock(&state->lock);
+
+    sentry_close();
+
+    sentry__mutex_lock(&state->lock);
+    state->cleanup_finished = true;
+    sentry__cond_wake(&state->cleanup_signal);
+    sentry__mutex_unlock(&state->lock);
+    return 0;
+}
+
+SENTRY_TEST(scope_cleanup)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    TEST_ASSERT_INT_EQUAL(sentry_init(options), 0);
+    sentry_set_level(SENTRY_LEVEL_WARNING);
+
+    scope_cleanup_state_t state = { 0 };
+    sentry__mutex_init(&state.lock);
+    sentry__cond_init(&state.access_signal);
+    sentry__cond_init(&state.cleanup_signal);
+
+    sentry_threadid_t access_thread;
+    sentry__thread_init(&access_thread);
+    TEST_ASSERT_INT_EQUAL(
+        sentry__thread_spawn(&access_thread, scope_access_thread, &state), 0);
+
+    sentry__mutex_lock(&state.lock);
+    while (!state.accesses) {
+        sentry__cond_wait(&state.access_signal, &state.lock);
+    }
+    sentry__mutex_unlock(&state.lock);
+
+    sentry_threadid_t cleanup_thread;
+    sentry__thread_init(&cleanup_thread);
+    TEST_ASSERT_INT_EQUAL(
+        sentry__thread_spawn(&cleanup_thread, scope_cleanup_thread, &state), 0);
+
+    sentry__mutex_lock(&state.lock);
+    while (!state.cleanup_started) {
+        sentry__cond_wait(&state.cleanup_signal, &state.lock);
+    }
+    sentry__cond_wait_timeout(&state.cleanup_signal, &state.lock, 250);
+    TEST_CHECK(!state.cleanup_finished);
+
+    sentry_threadid_t late_thread;
+    sentry__thread_init(&late_thread);
+    TEST_ASSERT_INT_EQUAL(
+        sentry__thread_spawn(&late_thread, scope_access_thread, &state), 0);
+    sentry__cond_wait_timeout(&state.access_signal, &state.lock, 250);
+    TEST_CHECK_INT_EQUAL(state.accesses, 1);
+    state.release_access = true;
+    sentry__cond_wake_all(&state.access_signal);
+    sentry__mutex_unlock(&state.lock);
+
+    sentry__thread_join(access_thread);
+    sentry__thread_free(&access_thread);
+    sentry__thread_join(cleanup_thread);
+    sentry__thread_free(&cleanup_thread);
+    sentry__thread_join(late_thread);
+    sentry__thread_free(&late_thread);
+
+    TEST_CHECK(state.cleanup_finished);
+    TEST_CHECK_INT_EQUAL(state.accesses, 2);
+    TEST_CHECK_INT_EQUAL(state.level, SENTRY_LEVEL_ERROR);
+
+    SENTRY_TEST_OPTIONS_NEW(next_options);
+    TEST_ASSERT_INT_EQUAL(sentry_init(next_options), 0);
+    sentry_set_level(SENTRY_LEVEL_WARNING);
+    sentry__scope_cleanup();
+    SENTRY_WITH_SCOPE (scope) {
+        TEST_CHECK_INT_EQUAL(
+            sentry__scope_get_level(scope), SENTRY_LEVEL_WARNING);
+    }
+    sentry_close();
+    sentry__mutex_free(&state.lock);
 }

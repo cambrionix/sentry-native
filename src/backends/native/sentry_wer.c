@@ -14,6 +14,10 @@
 #    define STATUS_STACK_BUFFER_OVERRUN ((DWORD)0xC0000409)
 #endif
 
+#ifndef STATUS_HEAP_CORRUPTION
+#    define STATUS_HEAP_CORRUPTION ((DWORD)0xC0000374)
+#endif
+
 static BOOL
 is_fatal_wer_exception(const WER_RUNTIME_EXCEPTION_INFORMATION *info)
 {
@@ -42,7 +46,8 @@ static BOOL
 is_native_wer_exception(DWORD code)
 {
     return code == STATUS_FAIL_FAST_EXCEPTION
-        || code == STATUS_STACK_BUFFER_OVERRUN;
+        || code == STATUS_STACK_BUFFER_OVERRUN
+        || code == STATUS_HEAP_CORRUPTION;
 }
 
 static BOOL
@@ -113,9 +118,7 @@ static BOOL
 process_wer_exception(
     PVOID context, const WER_RUNTIME_EXCEPTION_INFORMATION *exception_info)
 {
-    if (!exception_info || !is_fatal_wer_exception(exception_info)
-        || !is_native_wer_exception(
-            exception_info->exceptionRecord.ExceptionCode)) {
+    if (!exception_info || !is_fatal_wer_exception(exception_info)) {
         return FALSE;
     }
 
@@ -132,6 +135,20 @@ process_wer_exception(
     }
 
     BOOL claimed = FALSE;
+    ctx->platform.wer_report_id[0] = '\0';
+    if (exception_info->pwszReportId
+        && !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+            exception_info->pwszReportId, -1, ctx->platform.wer_report_id,
+            (int)sizeof(ctx->platform.wer_report_id), NULL, NULL)) {
+        ctx->platform.wer_report_id[0] = '\0';
+    }
+    InterlockedExchange(&ctx->platform.wer_done, TRUE);
+
+    if (!is_native_wer_exception(
+            exception_info->exceptionRecord.ExceptionCode)) {
+        goto cleanup;
+    }
+
     if (InterlockedCompareExchange(&ctx->state, SENTRY_CRASH_STATE_PROCESSING,
             SENTRY_CRASH_STATE_READY)
         == SENTRY_CRASH_STATE_READY) {
@@ -161,11 +178,12 @@ process_wer_exception(
                 }
                 Sleep(SENTRY_CRASH_HANDLER_POLL_INTERVAL_MS);
             }
-            TerminateProcess(exception_info->hProcess,
-                exception_info->exceptionRecord.ExceptionCode);
+            // Return control to WER so it can finish report generation,
+            // including custom metadata registered by the crashed process.
         }
     }
 
+cleanup:
     CloseHandle(event);
     UnmapViewOfFile(ctx);
     CloseHandle(mapping);

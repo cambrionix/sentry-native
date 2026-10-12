@@ -1,13 +1,22 @@
+import com.android.build.gradle.internal.lint.AndroidLintAnalysisTask
+
 plugins {
     id("com.android.library")
     kotlin("android")
-    id("com.ydq.android.gradle.native-aar.export")
 }
 
 var sentryNativeSrc: String = "${project.projectDir}/../.."
+val sanitizer =
+    System
+        .getenv("RUN_ANALYZER")
+        .orEmpty()
+        .split(',')
+        .firstOrNull { it == "asan" || it == "tsan" }
 
 android {
-    compileSdk = 35
+    compileSdk = 37
+    // retain AGP 8.7.3's default NDK to avoid changing the compiler and libc++ in a hotfix
+    ndkVersion = System.getenv("ANDROID_NDK")?.let { File(it).name } ?: "27.0.12077973"
     namespace = "io.sentry.ndk"
 
     testBuildType = "debug"
@@ -15,18 +24,44 @@ android {
     defaultConfig {
         minSdk = 21
 
+        aarMetadata {
+            // avoid requiring consumers to compile against API 37
+            minCompileSdk = 1
+        }
+
         externalNativeBuild {
             cmake {
-                arguments.add(0, "-DANDROID_STL=c++_static")
+                arguments.add(0, "-DANDROID_STL=${if (sanitizer != null) "c++_shared" else "c++_static"}")
                 arguments.add(0, "-DSENTRY_NATIVE_SRC=$sentryNativeSrc")
+                if (sanitizer == "asan") {
+                    arguments.add(0, "-DWITH_ASAN_OPTION=ON")
+                }
+                if (sanitizer == "tsan") {
+                    arguments.add(0, "-DWITH_TSAN_OPTION=ON")
+                }
             }
         }
 
         ndk {
-            abiFilters.addAll(listOf("x86", "armeabi-v7a", "x86_64", "arm64-v8a"))
+            abiFilters.addAll(
+                if (sanitizer == "tsan") {
+                    listOf("x86_64", "arm64-v8a")
+                } else {
+                    listOf("x86", "armeabi-v7a", "x86_64", "arm64-v8a")
+                },
+            )
         }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    if (sanitizer != null) {
+        sourceSets {
+            getByName("androidTest") {
+                jniLibs.srcDir("build/$sanitizer/jniLibs")
+                resources.srcDir("build/$sanitizer/resources")
+            }
+        }
     }
 
     // we use the default NDK and CMake versions based on the AGP's version
@@ -65,19 +100,6 @@ android {
         }
     }
 
-    // legacy pre-prefab support
-    // https://github.com/howardpang/androidNativeBundle
-    // creates
-    // lib.aar/jni/<arch>/<lib>.so
-    // lib.aar/jni/include/sentry.h
-    nativeBundleExport {
-        headerDir = "../../include"
-    }
-
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_1_8.toString()
-    }
-
     testOptions {
         animationsDisabled = true
         unitTests.apply {
@@ -90,11 +112,22 @@ android {
         warningsAsErrors = true
         checkDependencies = true
         checkReleaseBuilds = true
+        disable.addAll(listOf("NewerVersionAvailable", "GradleDependency", "AndroidGradlePluginVersion"))
     }
 
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+}
+
+// legacy pre-prefab support
+// creates lib.aar/jni/include/sentry.h alongside AGP's lib.aar/jni/<arch>/<lib>.so
+tasks.withType<Zip>().configureEach {
+    if (name.startsWith("bundle") && name.endsWith("Aar")) {
+        from("../../include") {
+            into("jni/include")
         }
     }
 }
@@ -139,11 +172,18 @@ dependencies {
 afterEvaluate {
     tasks.getByName("prefabReleasePackage") {
         doLast {
-            project.fileTree("build/intermediates/prefab_package/") {
-                include("**/abi.json")
-            }.forEach { file ->
-                file.writeText(file.readText().replace("c++_static", "none"))
-            }
+            project
+                .fileTree("build/intermediates/prefab_package/") {
+                    include("**/abi.json")
+                }.forEach { file ->
+                    file.writeText(file.readText().replace("c++_static", "none"))
+                }
         }
     }
+}
+
+// always rerun lint analysis
+// cached results can hide errors when dependency metadata changes
+tasks.withType<AndroidLintAnalysisTask>().configureEach {
+    doNotTrackState("Dependency metadata can change without code changes")
 }

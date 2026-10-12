@@ -7,21 +7,18 @@
 #include "sentry_cpu_relax.h"
 #include "sentry_database.h"
 #include "sentry_envelope.h"
+#include "sentry_hint.h"
 #include "sentry_logger.h"
-#include "sentry_logs.h"
-#include "sentry_metrics.h"
 #include "sentry_options.h"
-#if defined(SENTRY_PLATFORM_WINDOWS)
-#    include "sentry_os.h"
-#endif
+#include "sentry_os.h"
 #include "sentry_scope.h"
 #include "sentry_screenshot.h"
 #include "sentry_session_replay.h"
 #include "sentry_sync.h"
+#include "sentry_telemetry.h"
 #include "sentry_tracing.h"
 #include "sentry_transport.h"
 #include "sentry_unix_pageallocator.h"
-#include "transports/sentry_disk_transport.h"
 #include <errno.h>
 #include <limits.h>
 #ifdef SENTRY_PLATFORM_UNIX
@@ -318,7 +315,7 @@ wait_for_handler_ready(int timeout_ms)
         SENTRY_WARNF("poll for handler ready failed: %s", strerror(errno));
     } else if (rv > 0) {
         char c;
-        read(g_handler_ready_pipe[0], &c, 1);
+        (void)!read(g_handler_ready_pipe[0], &c, 1);
     }
 #elif defined(SENTRY_PLATFORM_WINDOWS)
     WaitForSingleObject(g_handler_ready_event, (DWORD)timeout_ms);
@@ -959,45 +956,6 @@ registers_from_uctx(const sentry_ucontext_t *uctx)
     return registers;
 }
 
-#ifdef SENTRY_PLATFORM_LINUX
-static uintptr_t
-get_stack_pointer(const sentry_ucontext_t *uctx)
-{
-#    if defined(__i386__)
-    return uctx->user_context->uc_mcontext.gregs[REG_ESP];
-#    elif defined(__x86_64__)
-    return uctx->user_context->uc_mcontext.gregs[REG_RSP];
-#    elif defined(__arm__)
-    return uctx->user_context->uc_mcontext.arm_sp;
-#    elif defined(__aarch64__)
-    return uctx->user_context->uc_mcontext.sp;
-#    else
-    SENTRY_WARN("get_stack_pointer is not implemented for this architecture. "
-                "Signal chaining may not work as expected.");
-    return NULL;
-#    endif
-}
-
-static uintptr_t
-get_instruction_pointer(const sentry_ucontext_t *uctx)
-{
-#    if defined(__i386__)
-    return uctx->user_context->uc_mcontext.gregs[REG_EIP];
-#    elif defined(__x86_64__)
-    return uctx->user_context->uc_mcontext.gregs[REG_RIP];
-#    elif defined(__arm__)
-    return uctx->user_context->uc_mcontext.arm_pc;
-#    elif defined(__aarch64__)
-    return uctx->user_context->uc_mcontext.pc;
-#    else
-    SENTRY_WARN(
-        "get_instruction_pointer is not implemented for this architecture. "
-        "Signal chaining may not work as expected.");
-    return NULL;
-#    endif
-}
-#endif
-
 static sentry_value_t
 make_signal_event(const struct signal_slot *sig_slot,
     const sentry_ucontext_t *uctx, sentry_handler_strategy_t strategy)
@@ -1118,22 +1076,22 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
 
         sentry_value_t transaction
             = sentry__trace_finish(SENTRY_SPAN_STATUS_ABORTED);
+        sentry_uuid_t event_id = sentry_uuid_nil();
+
+        sentry_hint_t hint;
+        sentry__hint_init(&hint);
 
         if (options->on_crash_func && !skip_hooks) {
-            SENTRY_DEBUG("invoking `on_crash` hook");
-            event = options->on_crash_func(uctx, event, options->on_crash_data);
+            event = sentry__invoke_on_crash(options, uctx, event, &hint);
             should_handle = !sentry_value_is_null(event);
         } else if (skip_hooks && options->on_crash_func) {
             SENTRY_DEBUG("skipping `on_crash` hook due to recursive crash");
         }
 
+        sentry__transport_suspend(options->transport);
+
         // Flush logs in a crash-safe manner before crash handling
-        if (options->enable_logs) {
-            sentry__logs_flush_crash_safe();
-        }
-        if (options->enable_metrics) {
-            sentry__metrics_flush_crash_safe();
-        }
+        sentry__telemetry_flush_crash_safe();
         TEST_CRASH_POINT("before_capture");
         if (should_handle) {
             bool capture_screenshot = options->attach_screenshot;
@@ -1146,63 +1104,65 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
             }
 #endif
 
-            sentry_envelope_t *envelope = sentry__prepare_event(options, event,
-                NULL, !options->on_crash_func && !skip_hooks, NULL);
+            event = sentry__prepare_event(options, event, NULL);
+            if (!options->on_crash_func && !skip_hooks) {
+                event = sentry__invoke_before_send(options, event, &hint);
+            }
+            sentry_value_t attachments
+                = sentry__hint_resolve_attachments(&hint);
+            sentry_envelope_t *envelope
+                = sentry__enclose_event(options, event, NULL, attachments);
+            sentry_value_decref(attachments);
+            if (envelope) {
+                event_id = sentry__envelope_get_event_id(envelope);
+            }
             sentry_session_t *session = sentry__end_current_session_with_status(
                 SENTRY_SESSION_STATUS_CRASHED);
             sentry__envelope_add_session(envelope, session);
 
             if (capture_screenshot) {
-                sentry_attachment_t *screenshot = sentry__attachment_from_path(
-                    sentry__screenshot_get_path(options));
-                if (screenshot
-                    && sentry__screenshot_capture(screenshot->path, 0)) {
+                sentry_path_t *path = sentry__screenshot_get_path(options);
+                sentry_value_t screenshot
+                    = sentry_attachment_from_file(path ? path->path : NULL);
+                if (!sentry_value_is_null(screenshot)
+                    && sentry__screenshot_capture(path, 0)) {
                     sentry__envelope_add_attachment(envelope, screenshot);
                 }
-                sentry__attachment_free(screenshot);
+                sentry_value_decref(screenshot);
+                sentry__path_free(path);
             }
 
             if (options->attach_session_replay) {
-                sentry_attachment_t *replay = sentry__attachment_from_path(
-                    sentry__session_replay_get_path(options));
-                if (replay
+                sentry_path_t *path = sentry__session_replay_get_path(options);
+                sentry_value_t replay
+                    = sentry_attachment_from_file(path ? path->path : NULL);
+                if (!sentry_value_is_null(replay)
                     && sentry__session_replay_capture(
-                        replay->path, options->session_replay_duration, 0)) {
+                        path, options->session_replay_duration, 0)) {
                     sentry__envelope_add_attachment(envelope, replay);
                 }
-                sentry__attachment_free(replay);
+                sentry_value_decref(replay);
+                sentry__path_free(path);
             }
 
             if (envelope && sentry__session_replay_has_pending(options)) {
                 sentry_value_t crash_event
                     = sentry_envelope_get_event(envelope);
-                sentry_transport_t *replay_transport
-                    = sentry_new_disk_transport(options->run);
-                if (replay_transport) {
-                    sentry__session_replay_flush_pending(
-                        options, replay_transport, crash_event);
-                    sentry__transport_dump_queue(
-                        replay_transport, options->run);
-                    sentry_transport_free(replay_transport);
-                }
+                sentry__session_replay_flush_pending(
+                    options, options->transport, crash_event);
             }
 
             if (!sentry__launch_external_crash_reporter(options, envelope)) {
-                // capture the envelopes with the disk transport
-                sentry_transport_t *disk_transport
-                    = sentry_new_disk_transport(options->run);
                 if (!sentry_value_is_null(transaction)) {
                     sentry_envelope_t *tx_envelope
                         = sentry__prepare_transaction(
                             options, transaction, NULL);
                     if (tx_envelope) {
-                        sentry__capture_envelope(
-                            disk_transport, tx_envelope, options);
+                        sentry__submit_envelope(
+                            options->transport, tx_envelope, options);
                     }
                 }
-                sentry__capture_envelope(disk_transport, envelope, options);
-                sentry__transport_dump_queue(disk_transport, options->run);
-                sentry_transport_free(disk_transport);
+                sentry__submit_envelope(options->transport, envelope, options);
             } else {
                 sentry_value_decref(transaction);
             }
@@ -1211,9 +1171,14 @@ process_ucontext_deferred(const sentry_ucontext_t *uctx,
             sentry_value_decref(event);
             sentry_value_decref(transaction);
         }
+        sentry__hint_deinit(&hint);
 
         // after capturing the crash event, dump all the envelopes to disk
         sentry__transport_dump_queue(options->transport, options->run);
+        if (!sentry_uuid_is_nil(&event_id)
+            && !sentry__run_write_crash_marker(options->run, &event_id)) {
+            SENTRY_SIGNAL_SAFE_LOG("WARN writing run crash marker failed");
+        }
 
         // Use signal-safe logging here since this may run in signal handler
         // context (fallback path) where stdio functions are not safe.
@@ -1259,8 +1224,10 @@ handler_thread_main(void *UNUSED(data))
             continue;
         }
 
+        sentry__enter_crash_handler();
         process_ucontext_deferred(
             &g_handler_state.uctx, g_handler_state.sig_slot, false);
+        sentry__exit_crash_handler();
         sentry__atomic_store(&g_handler_has_work, 0);
 #ifdef SENTRY_PLATFORM_UNIX
         if (g_handler_ack_pipe[1] >= 0) {
@@ -1585,8 +1552,8 @@ process_ucontext(const sentry_ucontext_t *uctx)
         // cases, we shouldn't react to the signal at all and let their handler
         // discontinue the signal chain by invoking the runtime handler before
         // we process the signal.
-        uintptr_t ip = get_instruction_pointer(uctx);
-        uintptr_t sp = get_stack_pointer(uctx);
+        uintptr_t ip = sentry__ucontext_get_ip(uctx->user_context);
+        uintptr_t sp = sentry__ucontext_get_sp(uctx->user_context);
 
 #    ifdef SENTRY_PLATFORM_ANDROID
         // Mask the signal so SA_NODEFER doesn't let re-raises from the chained
@@ -1621,8 +1588,8 @@ process_ucontext(const sentry_ucontext_t *uctx)
         // signal into a managed exception and transferred execution to a
         // managed exception handler.
         // https://github.com/dotnet/runtime/blob/6d96e28597e7da0d790d495ba834cc4908e442cd/src/mono/mono/mini/exceptions-arm64.c#L538
-        if (ip != get_instruction_pointer(uctx)
-            || sp != get_stack_pointer(uctx)) {
+        if (ip != sentry__ucontext_get_ip(uctx->user_context)
+            || sp != sentry__ucontext_get_sp(uctx->user_context)) {
             return;
         }
 
@@ -1644,6 +1611,7 @@ process_ucontext(const sentry_ucontext_t *uctx)
     }
 #endif
 
+    sentry__enter_crash_handler();
 #ifdef SENTRY_PLATFORM_UNIX
     int handler_depth = sentry__enter_signal_handler();
     if (handler_depth >= 3) {
@@ -1675,6 +1643,7 @@ process_ucontext(const sentry_ucontext_t *uctx)
             "handler thread not ready, falling through to previous handler");
         reset_signal_handlers();
         sentry__atomic_store(&g_preloaded, 0);
+        sentry__exit_crash_handler();
         sentry__leave_signal_handler();
         invoke_signal_handler(
             uctx->signum, uctx->siginfo, (void *)uctx->user_context);
@@ -1716,6 +1685,7 @@ process_ucontext(const sentry_ucontext_t *uctx)
     // Signal handlers are already reset by the handling thread, so
     // re-executing the crashing instruction will hit the default handler.
     if (!is_handling_thread) {
+        sentry__exit_crash_handler();
         return;
     }
 
@@ -1732,6 +1702,7 @@ cleanup:
     // are unregistered, re-executing their crash will hit the default handler.
     sentry__atomic_store(&g_crash_handling_state, CRASH_STATE_DONE);
 
+    sentry__exit_crash_handler();
     sentry__leave_signal_handler();
     if (g_backend_config.handler_strategy
         != SENTRY_HANDLER_STRATEGY_CHAIN_AT_START) {
@@ -1743,6 +1714,7 @@ cleanup:
     // done. They can now return EXCEPTION_CONTINUE_SEARCH from their UEF,
     // allowing the exception to propagate and terminate the process.
     sentry__atomic_store(&g_crash_handling_state, CRASH_STATE_DONE);
+    sentry__exit_crash_handler();
 #endif
 }
 

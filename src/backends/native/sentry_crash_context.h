@@ -9,9 +9,12 @@
 
 #include "sentry.h" // For sentry_minidump_mode_t
 #include "sentry_boot.h"
+#include "sentry_sync.h"
 
 #include <limits.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #if defined(SENTRY_PLATFORM_UNIX)
 #    include <signal.h>
@@ -61,6 +64,8 @@ typedef DWORD pid_t;
 
 // String formatting buffer sizes
 #define SENTRY_CRASH_TIMESTAMP_SIZE 32 // Timestamp strings
+
+#define SENTRY_WER_REPORT_ID_SIZE 40 // GUID, braces, and null terminator
 
 // Memory and stack size limits
 #define SENTRY_CRASH_MAX_STACK_CAPTURE                                         \
@@ -122,8 +127,9 @@ typedef enum {
     SENTRY_CRASH_STATE_READY = 0,
     SENTRY_CRASH_STATE_CRASHED = 1,
     SENTRY_CRASH_STATE_PROCESSING = 2,
-    SENTRY_CRASH_STATE_CAPTURED = 3,
-    SENTRY_CRASH_STATE_DONE = 4
+    SENTRY_CRASH_STATE_PROCESSED = 3,
+    SENTRY_CRASH_STATE_CAPTURED = 4,
+    SENTRY_CRASH_STATE_DONE = 5
 } sentry_crash_state_t;
 
 /**
@@ -242,6 +248,11 @@ typedef struct {
     // Additional thread contexts
     DWORD num_threads;
     sentry_thread_context_windows_t threads[SENTRY_CRASH_MAX_THREADS];
+
+    bool wer_enabled;
+    bool wer_integration;
+    volatile long wer_done;
+    char wer_report_id[SENTRY_WER_REPORT_ID_SIZE];
 } sentry_crash_platform_windows_t;
 
 typedef struct {
@@ -275,8 +286,13 @@ typedef struct {
 
     // Configuration (set by app during init)
     sentry_minidump_mode_t minidump_mode;
+#ifdef SENTRY_PLATFORM_WINDOWS
+    int32_t minidump_flags;
+#endif
     int crash_reporting_mode; // sentry_crash_reporting_mode_t
     int crash_upload_mode; // sentry_crash_upload_mode_t
+    int thread_stackwalk_mode; // sentry_thread_stackwalk_mode_t
+    uint32_t max_stack_capture_size;
     bool debug_enabled; // Debug logging enabled in parent process
     bool attach_screenshot; // Screenshot attachment enabled in parent process
     bool attach_session_replay; // Session replay attachment enabled in parent
@@ -285,6 +301,7 @@ typedef struct {
                                       // ms
     int cache_keep; // sentry_cache_keep_t
     bool require_user_consent;
+    bool has_on_crashed_last_run;
     bool enable_large_attachments;
     bool http_retry;
     uint64_t shutdown_timeout;
@@ -306,8 +323,8 @@ typedef struct {
 #endif
 
     // Sentry-specific metadata paths
-    char database_path[SENTRY_CRASH_MAX_PATH]; // Database directory for all
-                                               // files
+    char database_path[SENTRY_CRASH_MAX_PATH]; // Shared across runs
+    char run_path[SENTRY_CRASH_MAX_PATH]; // For current run
     char event_path[SENTRY_CRASH_MAX_PATH];
     char breadcrumb1_path[SENTRY_CRASH_MAX_PATH];
     char breadcrumb2_path[SENTRY_CRASH_MAX_PATH];
@@ -323,11 +340,34 @@ typedef struct {
     // Minidump output path (filled by daemon)
     char minidump_path[SENTRY_CRASH_MAX_PATH];
 
+    uint32_t module_count; // Guards modules[] (uninitialized)
+
+    // === UNINITIALIZED MEMORY BEGIN ===
+
     // Module information (captured in signal handler from dyld)
-    uint32_t module_count;
     sentry_module_info_t modules[SENTRY_CRASH_MAX_MODULES];
 
+    // NOTE: Any new members added here remain uninitialized by
+    // sentry__crash_context_init().
+
 } sentry_crash_context_t;
+
+static inline void
+sentry__crash_context_init(sentry_crash_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    // Zero until the large modules[] array, and leave the rest uninitialized:
+    // https://github.com/getsentry/sentry-native/issues/1852
+    memset(ctx, 0, offsetof(sentry_crash_context_t, modules));
+
+    ctx->magic = SENTRY_CRASH_MAGIC;
+    ctx->version = SENTRY_CRASH_VERSION;
+    sentry__atomic_store(&ctx->state, SENTRY_CRASH_STATE_READY);
+    sentry__atomic_store(&ctx->sequence, 0);
+}
 
 // Shared memory size: calculated at compile-time based on actual struct size
 // Add 8KB padding for safety and future additions

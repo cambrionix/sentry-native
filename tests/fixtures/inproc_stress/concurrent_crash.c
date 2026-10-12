@@ -5,9 +5,10 @@
  * race conditions in the signal handler / handler thread synchronization.
  */
 
+#include <sentry.h>
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #ifndef _WIN32
 #    include <pthread.h>
@@ -20,8 +21,6 @@
 #endif
 
 #define CRASH_THREADS 20
-
-static void *invalid_mem = (void *)1;
 
 // Barrier for synchronizing threads
 #ifndef _WIN32
@@ -40,7 +39,7 @@ __declspec(noinline)
 void
 do_crash(void)
 {
-    memset((char *)invalid_mem, 1, 100);
+    sentry_crash();
 }
 
 static void
@@ -54,7 +53,8 @@ wait_at_barrier(void)
 #else
     InterlockedIncrement(&g_ready_count);
     while (InterlockedCompareExchange(&g_barrier, 1, 1) == 0) {
-        // spin
+        // let other threads start on CPU-constrained runners
+        SwitchToThread();
     }
 #endif
 }

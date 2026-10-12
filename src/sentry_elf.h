@@ -6,9 +6,52 @@
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
 
 #    include <elf.h>
+#    include <fcntl.h>
 #    include <stdbool.h>
 #    include <stddef.h>
 #    include <string.h>
+#    include <sys/stat.h>
+#    include <unistd.h>
+
+static inline int
+sentry__elf_open(const char *path)
+{
+    // Named mappings can refer to devices or FIFOs. Open non-blocking first,
+    // then reject anything that is not a regular file before reading it.
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+/**
+ * Quickly verify a file is an ELF binary by reading its magic bytes.
+ * Used to filter out non-ELF mappings (e.g. files under /dev/shm, deleted
+ * files, sentry-native's own IPC shared memory) from the module list — LLDB and
+ * other consumers can choke on entries that look like modules but aren't.
+ */
+static inline bool
+sentry__elf_is_file(const char *path)
+{
+    int fd = sentry__elf_open(path);
+    if (fd < 0) {
+        return false;
+    }
+
+    unsigned char magic[SELFMAG];
+    bool is_elf = read(fd, magic, SELFMAG) == (ssize_t)SELFMAG
+        && memcmp(magic, ELFMAG, SELFMAG) == 0;
+    close(fd);
+    return is_elf;
+}
 
 static inline bool
 sentry__elf_is_native_class(const unsigned char e_ident[EI_NIDENT])
@@ -63,6 +106,34 @@ sentry__elf_has_phdr_size(
 #    else
     return e_phentsize == sizeof(Elf32_Phdr);
 #    endif
+}
+
+#    define SENTRY_ELF_MAX_METADATA_SECTION_SIZE (1024 * 1024)
+
+static inline void *
+sentry__elf_read_metadata_section(int fd, uint64_t offset, uint64_t size)
+{
+    if (size == 0 || size > SENTRY_ELF_MAX_METADATA_SECTION_SIZE) {
+        return NULL;
+    }
+
+    off_t file_offset = (off_t)offset;
+    if (file_offset < 0 || (uint64_t)file_offset != offset) {
+        return NULL;
+    }
+
+    size_t len = (size_t)size;
+    void *buf = sentry_malloc(len);
+    if (!buf) {
+        return NULL;
+    }
+
+    if (lseek(fd, file_offset, SEEK_SET) != file_offset
+        || read(fd, buf, len) != (ssize_t)len) {
+        sentry_free(buf);
+        return NULL;
+    }
+    return buf;
 }
 
 /**

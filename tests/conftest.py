@@ -11,13 +11,16 @@ import threading
 from datetime import datetime, timedelta, UTC
 from . import adb, run
 from .cmake import CMake
-from .conditions import has_sccache, is_android
+from .conditions import has_sccache, is_android, is_wine
 import tests
 
 LABEL = "label"
 TIME_UNIT = "time_unit"
 REAL_TIME = "real_time"
 CPU_TIME = "cpu_time"
+VALUE = "value"
+EXTRA = "extra"
+RANGE = "range"
 
 gbenchmarks = {}
 
@@ -131,7 +134,12 @@ def pytest_configure(config):
 def gbenchmark():
     def _load(json_path, label, test_name=None):
         if test_name is None:
-            test_name = os.environ.get("PYTEST_CURRENT_TEST").split(" ")[0]
+            test_name = (
+                os.environ.get("PYTEST_CURRENT_TEST")
+                .split(" ")[0]
+                .replace("[", "_")
+                .replace("]", "")
+            )
 
         with open(json_path, "r") as f:
             data = json.load(f)
@@ -142,6 +150,7 @@ def gbenchmark():
                 TIME_UNIT: "",
                 REAL_TIME: [],
                 CPU_TIME: [],
+                RANGE: "logarithmic",
             }
 
         for benchmark in data["benchmarks"]:
@@ -155,10 +164,43 @@ def gbenchmark():
     return _load
 
 
+@pytest.fixture
+def gmeasurement():
+    def _record(value, label, unit, extra="", test_name=None, range=None):
+        if test_name is None:
+            test_name = (
+                os.environ.get("PYTEST_CURRENT_TEST")
+                .split(" ")[0]
+                .replace("[", "_")
+                .replace("]", "")
+            )
+
+        gbenchmarks[test_name] = {
+            LABEL: label,
+            TIME_UNIT: unit,
+            VALUE: value,
+            EXTRA: extra,
+            RANGE: range,
+        }
+
+    return _record
+
+
 def _get_benchmark(name, separator):
     data = gbenchmarks.get(name)
     if data is None:
         return None
+
+    if VALUE in data:
+        benchmark = {
+            "name": data[LABEL],
+            "unit": data[TIME_UNIT],
+            "value": data[VALUE],
+            "extra": data[EXTRA],
+        }
+        if data[RANGE] is not None:
+            benchmark[RANGE] = data[RANGE]
+        return benchmark
 
     unit = data[TIME_UNIT]
     real_time = data[REAL_TIME] if data[REAL_TIME] else []
@@ -168,22 +210,29 @@ def _get_benchmark(name, separator):
         f"Min {min(real_time):.3f}{unit}",
         f"Max {max(real_time):.3f}{unit}",
         f"Mean {statistics.mean(real_time):.3f}{unit}",
-        f"StdDev {statistics.stdev(real_time):.3f}{unit}",
+    ]
+    if len(real_time) > 1:
+        extra += [f"StdDev {statistics.stdev(real_time):.3f}{unit}"]
+    extra += [
         f"Median {statistics.median(real_time):.3f}{unit}",
         f"CPU {statistics.mean(cpu_time):.3f}{unit}" if sys.platform != "win32" else "",
     ]
 
-    return {
+    benchmark = {
         "name": data[LABEL],
         "unit": unit,
         "value": statistics.median(real_time),
         "extra": separator.join(e for e in extra if e),
     }
+    if data.get(RANGE) is not None:
+        benchmark[RANGE] = data[RANGE]
+    return benchmark
 
 
 def pytest_report_teststatus(report, config):
     if report.when == "call" and report.passed:
-        benchmark = _get_benchmark(report.nodeid, ", ")
+        test_name = report.nodeid.replace("[", "_").replace("]", "")
+        benchmark = _get_benchmark(test_name, ", ")
         if benchmark:
             return (
                 "passed",
@@ -202,6 +251,12 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 def pytest_sessionstart(session):
+    if is_wine:
+        # Keep Wine diagnostics from obscuring test output.
+        os.environ.setdefault("WINEDEBUG", "-all")
+        # Prevent intentional crashes from opening WineDbg and fresh prefixes
+        # from prompting to install Wine Mono.
+        os.environ.setdefault("WINEDLLOVERRIDES", "winedbg.exe=d;mscoree=d")
     if has_sccache:
         subprocess.run(["sccache", "--zero-stats"], capture_output=True)
 

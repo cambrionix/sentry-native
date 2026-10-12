@@ -21,14 +21,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: make style
 
   build-ios-inproc:
     name: Xcode Build for inproc on iOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: "recursive"
       - run: |
@@ -39,7 +39,7 @@ jobs:
     name: Xcode Build for breakpad on iOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: "recursive"
       - run: |
@@ -91,6 +91,16 @@ jobs:
             os: ubuntu-24.04
             CC: gcc-14
             CXX: g++-14
+          - name: Linux (GCC 14 + analyzer)
+            os: ubuntu-24.04
+            CC: gcc-14
+            CXX: g++-14
+            RUN_ANALYZER: gcc
+          - name: Linux (GCC 15 + runtime curl)
+            os: ubuntu-26.04
+            CC: gcc-15
+            CXX: g++-15
+            CMAKE_DEFINES: -DSENTRY_LINK_CURL=OFF
           - name: Linux Arm64 (GCC 14.2.0 + tsan)
             os: ubuntu-24.04-arm
             CC: gcc-14
@@ -135,35 +145,35 @@ jobs:
             CXX: clang++-20
             ERROR_ON_WARNINGS: 1
             RUN_ANALYZER: kcov
-          - name: Linux (GCC 13.3.0 + code-checker + valgrind)
+          - name: Linux (GCC 13.3.0 + valgrind)
             CC: gcc-13
             CXX: g++-13
             os: ubuntu-24.04
-            RUN_ANALYZER: code-checker,valgrind
+            RUN_ANALYZER: valgrind
           - name: Linux (GCC + musl + libunwind)
             os: ubuntu-latest
-            container: ghcr.io/getsentry/sentry-native-alpine:3.23
+            container: ghcr.io/getsentry/sentry-native-alpine:3.24
             CC: gcc
             CXX: g++
             SYSTEM_PYTHON: 1
             CMAKE_DEFINES: -DSENTRY_LIBUNWIND_SYSTEM=ON
           - name: Linux (clang + musl + libunwind)
             os: ubuntu-latest
-            container: ghcr.io/getsentry/sentry-native-alpine:3.23
+            container: ghcr.io/getsentry/sentry-native-alpine:3.24
             CC: clang
             CXX: clang++
             SYSTEM_PYTHON: 1
             CMAKE_DEFINES: -DSENTRY_LIBUNWIND_SYSTEM=ON
-          - name: macOS 14 (xcode llvm)
-            os: macos-14
+          - name: macOS 15 (xcode llvm)
+            os: macos-15
             ERROR_ON_WARNINGS: 1
             SYSTEM_VERSION_COMPAT: 0
           - name: macOS 26 (xcode llvm)
             os: macos-26
             ERROR_ON_WARNINGS: 1
             SYSTEM_VERSION_COMPAT: 0
-          - name: macOS 14 (xcode llvm + universal)
-            os: macos-14
+          - name: macOS 15 (xcode llvm + universal)
+            os: macos-15
             ERROR_ON_WARNINGS: 1
             SYSTEM_VERSION_COMPAT: 0
             CMAKE_DEFINES: -DCMAKE_OSX_ARCHITECTURES=arm64;x86_64
@@ -184,6 +194,9 @@ jobs:
             TEST_X86: 1
           - name: Windows (latest)
             os: windows-latest
+          - name: Windows (MSVC analyzer)
+            os: windows-2022
+            RUN_ANALYZER: msvc
           - name: Windows arm64
             os: windows-11-arm
           - name: Windows (latest, UTF-8 paths)
@@ -192,15 +205,21 @@ jobs:
           - name: Windows (latest, ninja + sccache)
             os: windows-latest
             USE_SCCACHE: 1
-          - name: Windows ClangCL (2022)
+          - name: Windows ClangCL (2022 + llvm-cov)
             os: windows-2022
             VS_GENERATOR_TOOLSET: ClangCL
+            RUN_ANALYZER: llvm-cov
           - name: LLVM-Mingw
             os: windows-latest
             TEST_MINGW: 1
             MINGW_PKG_PREFIX: x86_64-w64-mingw32
             MINGW_ASM_MASM_COMPILER: llvm-ml
             MINGW_ASM_MASM_FLAGS: -m64
+          - name: Wine (Clang 21 + MinGW-w64)
+            os: ubuntu-26.04
+            CC: clang-21
+            CXX: clang++-21
+            TEST_WINE: 1
           - name: Android (API 21, NDK 23)
             os: ubuntu-latest
             ANDROID_API: 21
@@ -221,6 +240,12 @@ jobs:
             ANDROID_API: 35
             ANDROID_NDK: 29.0.14206865
             ANDROID_ARCH: x86_64
+          - name: Android (API 36, NDK 30 + asan)
+            os: ubuntu-latest
+            ANDROID_API: 36
+            ANDROID_NDK: 30.0.16138531
+            ANDROID_ARCH: x86_64
+            RUN_ANALYZER: asan
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -231,6 +256,7 @@ jobs:
       CXX: ${{ matrix.CXX }}
       TEST_X86: ${{ matrix.TEST_X86 }}
       TEST_MINGW: ${{ matrix.TEST_MINGW }}
+      TEST_WINE: ${{ matrix.TEST_WINE }}
       TEST_ARM32: ${{ matrix.TEST_ARM32 }}
       TEST_QEMU: ${{ matrix.TEST_QEMU }}
       USE_SCCACHE: ${{ matrix.USE_SCCACHE }}
@@ -248,7 +274,7 @@ jobs:
       SENTRY_TEST_OOM_LIMIT: "4095" # ~4GB, to speed up OOM tests
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
@@ -257,7 +283,7 @@ jobs:
         run: |
           echo "Runner arch: $(uname -m)"
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ !env['SYSTEM_PYTHON'] && '3.12' || '' }}
           cache: "pip"
@@ -278,10 +304,27 @@ jobs:
             sudo apt install "${CC}" "${CXX}"
           elif [[ "$CC" == clang-* ]]; then
             sudo apt install "${CC}"
+            if [[ "$RUN_ANALYZER" == *llvm-cov* ]]; then
+              llvm_version="${CC#clang-}"
+              sudo apt install "llvm-${llvm_version}"
+              echo "LLVM_PROFDATA=llvm-profdata-${llvm_version}" >> "$GITHUB_ENV"
+              echo "LLVM_COV=llvm-cov-${llvm_version}" >> "$GITHUB_ENV"
+            fi
           else
             echo "Unknown CC: $CC" >&2
             exit 1
           fi
+
+      - name: Installing Wine Dependencies
+        if: ${{ env['TEST_WINE'] }}
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo curl -fsSL -o /etc/apt/keyrings/winehq-archive.asc https://dl.winehq.org/wine-builds/winehq.key
+          sudo curl -fsSL -o /etc/apt/sources.list.d/winehq-resolute.sources https://dl.winehq.org/wine-builds/ubuntu/dists/resolute/winehq-resolute.sources
+          sudo sed -i 's|winehq-archive\.key|winehq-archive.asc|' /etc/apt/sources.list.d/winehq-resolute.sources
+          sudo apt-get update
+          sudo apt-get install --install-recommends winehq-stable mingw-w64 lld
+          wine --version
 
       - name: Installing kcov dependencies
         if: ${{ contains(env['RUN_ANALYZER'], 'kcov') }}
@@ -305,6 +348,7 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt update
           sudo apt install cmake "${CC}-multilib" "${CXX}-multilib" zlib1g-dev:i386 libssl-dev:i386 libcurl4-openssl-dev:i386 liblzma-dev:i386
+          echo "PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Installing Linux arm32 Dependencies
         if: ${{ runner.os == 'Linux' && env['TEST_ARM32'] && !matrix.container }}
@@ -341,10 +385,6 @@ jobs:
           echo "$HOME/.dotnet" >> $GITHUB_PATH
           echo "DOTNET_ROOT=$HOME/.dotnet" >> $GITHUB_ENV
 
-      - name: Installing CodeChecker
-        if: ${{ contains(env['RUN_ANALYZER'], 'code-checker') }}
-        run: sudo snap install codechecker --classic
-
       - name: Expose llvm@15 PATH for Mac
         if: ${{ runner.os == 'macOS' }}
         run: echo $(brew --prefix llvm@15)/bin >> $GITHUB_PATH
@@ -356,6 +396,15 @@ jobs:
       - name: Set macOS SDKROOT
         if: ${{ runner.os == 'macOS' }}
         run: echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+
+      - name: Set VS LLVM tools for ClangCL
+        if: ${{ runner.os == 'Windows' && env['VS_GENERATOR_TOOLSET'] == 'ClangCL' && contains(env['RUN_ANALYZER'], 'llvm-cov') }}
+        shell: powershell
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $llvm = Join-Path $vs "VC\Tools\Llvm\x64\bin"
+          "LLVM_PROFDATA=$llvm\llvm-profdata.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LLVM_COV=$llvm\llvm-cov.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Remove Strawberry Perl from PATH
         if: ${{ runner.os == 'Windows' }}
@@ -396,22 +445,22 @@ jobs:
 
       - name: Setup sccache
         if: ${{ env['USE_SCCACHE'] }}
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Setup Java Version
         if: ${{ env['ANDROID_API'] }}
-        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Setup Gradle
         if: ${{ env['ANDROID_API'] }}
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # pin@v6.2.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # pin@v6.3.0
 
       - name: Setup .NET for Android
         if: ${{ env['ANDROID_API'] }}
-        uses: actions/setup-dotnet@9a946fdbd5fb07b82b2f5a4466058b876ab72bb2 # v5
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v5
         with:
           dotnet-version: '10.0.x'
 
@@ -449,7 +498,7 @@ jobs:
 
       - name: Test (Android)
         if: ${{ env['ANDROID_API'] }}
-        uses: reactivecircus/android-emulator-runner@e89f39f1abbbd05b1113a29cf4db69e7540cae5a # v2.37.0
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: ${{ env.ANDROID_API }}
           ndk: ${{ env.ANDROID_NDK }}
@@ -459,6 +508,7 @@ jobs:
           script: |
             # Sync emulator clock with host to avoid timestamp assertion failures
             adb shell cmd alarm set-time $(date +%s000) || adb shell su root date $(date -u +%m%d%H%M%Y.%S)
+            scripts/setup-android-sanitizer.sh "$RUN_ANALYZER"
             pip install --upgrade --requirement tests/requirements.txt
             pytest --capture=no --verbose tests
             (cd ndk && ./gradlew :sentry-native-ndk:connectedDebugAndroidTest --stacktrace)
@@ -477,33 +527,58 @@ jobs:
 
       - name: "Upload to codecov.io"
         if: ${{ contains(env['RUN_ANALYZER'], 'cov') }}
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # pin@v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # pin@v7.1.1
         with:
           directory: coverage
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
           verbose: true
 
+  codechecker:
+    name: CodeChecker
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install cmake clang clang-tidy cppcheck gcc-13 g++-13 zlib1g-dev libcurl4-openssl-dev
+          python -m pip install codechecker==6.28.2
+
+      - name: Analyze
+        run: python scripts/run-codechecker.py
+
   archive:
     name: Create Release Archive
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, codechecker]
     # only run this on pushes, combined with the CI triggers, this will only
     # run on master or the release branch
-    if: ${{ needs.test.result == 'success' && github.event_name == 'push' }}
+    if: ${{ needs.test.result == 'success' && needs.codechecker.result == 'success' && github.event_name == 'push' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
       - name: Setup Java Version
-        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # pin@v6.2.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # pin@v6.3.0
 
       - name: Create source archive
         run: |

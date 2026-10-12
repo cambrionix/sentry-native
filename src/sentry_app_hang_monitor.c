@@ -81,7 +81,7 @@ app_hang_capture(uint64_t hang_time_ms, uint64_t tid)
         return false;
     }
     sentry_value_t event = sentry__app_hang_make_event(ips, n, hang_time_ms);
-    sentry__capture_event(event, NULL);
+    sentry__capture_event(event, NULL, NULL);
     return true;
 }
 
@@ -99,6 +99,9 @@ worker(void *arg)
         if (!sentry__app_hang_is_active()) {
             break;
         }
+        if (sentry__app_hang_is_paused()) {
+            continue;
+        }
 
         const sentry_app_hang_latch_t latch = sentry__app_hang_current_latch();
         uint64_t now = sentry__monotonic_time();
@@ -107,6 +110,9 @@ worker(void *arg)
             // Bail if disarmed. Keeps duplicate reporting window minimal
             if (!sentry__app_hang_is_active()) {
                 break;
+            }
+            if (sentry__app_hang_is_paused()) {
+                continue;
             }
             // Only mark this freeze as fired when an event was actually
             // captured. A transient stackwalk failure (0 frames) must not
@@ -134,6 +140,7 @@ sentry__app_hang_monitor_start(const sentry_options_t *options)
     sentry__app_hang_set_active(true);
     if (sentry__thread_spawn(&g_thread, worker, NULL) != 0) {
         sentry__app_hang_set_active(false);
+        sentry__cond_free(&g_wait_cond);
         SENTRY_WARN("app-hang: failed to spawn watchdog thread");
         return 1;
     }
@@ -155,6 +162,7 @@ sentry__app_hang_monitor_stop(void)
     sentry__mutex_unlock(&g_wait_mutex);
     sentry__thread_join(g_thread);
     sentry__thread_free(&g_thread);
+    sentry__cond_free(&g_wait_cond);
     sentry__app_hang_latch_reset();
     g_running = false;
     // g_timeout_ms are intentionally NOT cleared here: the worker
