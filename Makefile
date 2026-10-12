@@ -8,11 +8,12 @@ update-test-discovery:
 	@perl -ne 'print if s/SENTRY_TEST\(([^)]+)\).*/XX(\1)/' tests/unit/*.c | LC_ALL=C sort | grep -v define | uniq > tests/unit/tests.inc
 .PHONY: update-test-discovery
 
-build/Makefile: CMakeLists.txt
+build/Makefile configure: CMakeLists.txt
 	@mkdir -p build
-	@cd build; cmake ..
+	@cmake -S . -B build $(if $(SENTRY_BACKEND),-DSENTRY_BACKEND=$(SENTRY_BACKEND)) $(if $(SENTRY_TRANSPORT),-DSENTRY_TRANSPORT=$(SENTRY_TRANSPORT))
+.PHONY: configure
 
-build: build/Makefile
+build: configure
 	@cmake --build build --parallel
 .PHONY: build
 
@@ -40,17 +41,33 @@ test-leaks: update-test-discovery CMakeLists.txt
 		-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(PWD)/leak-build \
 		-DSENTRY_BACKEND=none \
 		-DWITH_ASAN_OPTION=ON \
-		-DCMAKE_C_COMPILER=/usr/local/opt/llvm/bin/clang \
-		-DCMAKE_CXX_COMPILER=/usr/local/opt/llvm/bin/clang++ \
-		-DCMAKE_LINKER=/usr/local/opt/llvm/bin/clang \
+		-DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
+		-DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+		-DCMAKE_LINKER=/opt/homebrew/opt/llvm/bin/clang \
 		..
 	@cmake --build leak-build --target sentry_test_unit --parallel
-	@ASAN_OPTIONS=detect_leaks=1 ./leak-build/sentry_test_unit
+	@LSAN_OPTIONS=suppressions=$(PWD)/tests/leaks.txt:print_suppressions=0 ASAN_OPTIONS=detect_leaks=1 ./leak-build/sentry_test_unit
 .PHONY: test-leaks
 
 benchmark: setup-venv
 	$(VENV_BIN)/pytest tests/benchmark.py --verbose
 .PHONY: benchmark
+
+stack-frames:
+	@cmake -E remove_directory stack-frames-build/CMakeFiles/sentry.dir
+	@cmake -S . -B stack-frames-build \
+		-DCMAKE_C_FLAGS=-fstack-usage \
+		-DCMAKE_CXX_FLAGS=-fstack-usage \
+		$(if $(SENTRY_BACKEND),-DSENTRY_BACKEND=$(SENTRY_BACKEND),-U SENTRY_BACKEND) \
+		-DSENTRY_BUILD_TESTS=OFF
+	@cmake --build stack-frames-build \
+		--target sentry --parallel
+	@# reoder bytes first for sorting ("<file>:<line>:<column>:<function>\t<bytes>\t<qualifiers>")
+	@find stack-frames-build/CMakeFiles/sentry.dir -name '*.su' \
+		-exec awk -F '\t' -v OFS='\t' -v root="$(CURDIR)/" '{ print $$2, substr($$1, length(root) + 1), $$3 }' {} + \
+		| sort -k1,1nr -k2,2 \
+		| head -n $(or $(N),20)
+.PHONY: stack-frames
 
 clean: build/Makefile
 	@$(MAKE) -C build clean

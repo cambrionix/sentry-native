@@ -719,7 +719,7 @@ write_thread_context(
             // Copy control/status words
             context.float_save.control_word = fpregs.cwd;
             context.float_save.status_word = fpregs.swd;
-            context.float_save.tag_word = fpregs.ftw;
+            context.float_save.tag_word = (uint8_t)fpregs.ftw;
             context.float_save.error_opcode = fpregs.fop;
             // On x86_64, FPU IP/DP are 64-bit. The FXSAVE format splits them
             // across offset (low 32) and selector (high 16) fields.
@@ -863,33 +863,13 @@ write_thread_context(
 }
 
 /**
- * Quickly verify a file is an ELF binary by reading its magic bytes.
- * Used to filter out non-ELF mappings (e.g. files under /dev/shm, deleted
- * files, sentry-native's own IPC shared memory) from the module list — LLDB and
- * other consumers can choke on entries that look like modules but aren't.
- */
-static bool
-is_elf_file(const char *path)
-{
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-    unsigned char magic[SELFMAG];
-    bool is_elf = read(fd, magic, SELFMAG) == (ssize_t)SELFMAG
-        && memcmp(magic, ELFMAG, SELFMAG) == 0;
-    close(fd);
-    return is_elf;
-}
-
-/**
  * Extract Build ID from ELF file
  * Returns the Build ID length, or 0 if not found
  */
 static size_t
 extract_elf_build_id(const char *elf_path, uint8_t *build_id, size_t max_len)
 {
-    int fd = open(elf_path, O_RDONLY);
+    int fd = sentry__elf_open(elf_path);
     if (fd < 0) {
         return 0;
     }
@@ -956,45 +936,16 @@ extract_elf_build_id(const char *elf_path, uint8_t *build_id, size_t max_len)
             if (lseek(fd, sections[i].sh_offset, SEEK_SET)
                     == (off_t)sections[i].sh_offset
                 && read(fd, note_buf, note_size) == (ssize_t)note_size) {
-
-                // Parse notes
-                uint8_t *ptr = (uint8_t *)note_buf;
-                uint8_t *end = ptr + note_size;
-
-                while (ptr + 12 <= end) {
-#    if defined(__x86_64__) || defined(__aarch64__)
-                    Elf64_Nhdr *nhdr = (Elf64_Nhdr *)ptr;
-#    else
-                    Elf32_Nhdr *nhdr = (Elf32_Nhdr *)ptr;
-#    endif
-                    ptr += sizeof(*nhdr);
-
-                    // Use aligned sizes in bounds check since pointer advances
-                    // by aligned amounts. Also check for zero advancement to
-                    // prevent infinite loop on malformed notes (e.g., overflow
-                    // on 32-bit when n_namesz/n_descsz are near UINT32_MAX)
-                    size_t aligned_namesz = ((nhdr->n_namesz + 3) & ~3);
-                    size_t aligned_descsz = ((nhdr->n_descsz + 3) & ~3);
-                    if (aligned_namesz == 0 && aligned_descsz == 0)
-                        break; // Prevent infinite loop
-                    if (ptr + aligned_namesz + aligned_descsz > end)
-                        break;
-
-                    // Check if this is GNU Build ID (type 3, name "GNU\0")
-                    if (nhdr->n_type == 3 && nhdr->n_namesz == 4
-                        && memcmp(ptr, "GNU", 4) == 0) {
-
-                        ptr += aligned_namesz;
-                        size_t len = nhdr->n_descsz < max_len ? nhdr->n_descsz
-                                                              : max_len;
-                        memcpy(build_id, ptr, len);
-                        build_id_len = len;
-                        sentry_free(note_buf);
-                        goto done;
-                    }
-
-                    ptr += aligned_namesz;
-                    ptr += aligned_descsz;
+                // Find the GNU build-id note. SHT_NOTE uses 4-byte alignment.
+                size_t desc_size = 0;
+                const uint8_t *desc = sentry__elf_find_note(note_buf, note_size,
+                    4, NT_GNU_BUILD_ID, "GNU", 4, &desc_size);
+                if (desc) {
+                    size_t len = desc_size < max_len ? desc_size : max_len;
+                    memcpy(build_id, desc, len);
+                    build_id_len = len;
+                    sentry_free(note_buf);
+                    goto done;
                 }
             }
 
@@ -1019,7 +970,7 @@ done:
 static uint64_t
 compute_elf_size_from_phdrs(const char *elf_path)
 {
-    int fd = open(elf_path, O_RDONLY);
+    int fd = sentry__elf_open(elf_path);
     if (fd < 0) {
         return 0;
     }
@@ -1099,7 +1050,7 @@ compute_elf_size_from_phdrs(const char *elf_path)
 static bool
 read_elf_soname(const char *elf_path, char *soname_buf, size_t soname_buf_size)
 {
-    int fd = open(elf_path, O_RDONLY);
+    int fd = sentry__elf_open(elf_path);
     if (fd < 0) {
         return false;
     }
@@ -1172,45 +1123,25 @@ read_elf_soname(const char *elf_path, char *soname_buf, size_t soname_buf_size)
     }
 
     // Read .dynstr
-    size_t dynstr_size = dynstr_shdr->sh_size;
-    if (dynstr_size > 1024 * 1024) { // Sanity: max 1MB
-        sentry_free(shdr_buf);
-        close(fd);
-        return false;
-    }
-    char *dynstr = sentry_malloc(dynstr_size);
+    char *dynstr = sentry__elf_read_metadata_section(
+        fd, dynstr_shdr->sh_offset, dynstr_shdr->sh_size);
     if (!dynstr) {
         sentry_free(shdr_buf);
         close(fd);
         return false;
     }
-    if (lseek(fd, dynstr_shdr->sh_offset, SEEK_SET)
-            != (off_t)dynstr_shdr->sh_offset
-        || read(fd, dynstr, dynstr_size) != (ssize_t)dynstr_size) {
-        sentry_free(dynstr);
-        sentry_free(shdr_buf);
-        close(fd);
-        return false;
-    }
+    size_t dynstr_size = (size_t)dynstr_shdr->sh_size;
 
     // Read .dynamic entries and find DT_SONAME
-    size_t dyn_size = dynamic_shdr->sh_size;
-    void *dyn_buf = sentry_malloc(dyn_size);
+    void *dyn_buf = sentry__elf_read_metadata_section(
+        fd, dynamic_shdr->sh_offset, dynamic_shdr->sh_size);
     if (!dyn_buf) {
         sentry_free(dynstr);
         sentry_free(shdr_buf);
         close(fd);
         return false;
     }
-    if (lseek(fd, dynamic_shdr->sh_offset, SEEK_SET)
-            != (off_t)dynamic_shdr->sh_offset
-        || read(fd, dyn_buf, dyn_size) != (ssize_t)dyn_size) {
-        sentry_free(dyn_buf);
-        sentry_free(dynstr);
-        sentry_free(shdr_buf);
-        close(fd);
-        return false;
-    }
+    size_t dyn_size = (size_t)dynamic_shdr->sh_size;
 
     DynT *dyn_entries = (DynT *)dyn_buf;
     size_t dyn_count = dyn_size / sizeof(DynT);
@@ -1285,7 +1216,7 @@ write_cv_record(minidump_writer_t *writer, const char *module_path,
  */
 static minidump_rva_t
 write_thread_stack(minidump_writer_t *writer, uint64_t stack_pointer,
-    size_t *stack_size_out, uint64_t *stack_start_out)
+    pid_t thread_id, size_t *stack_size_out, uint64_t *stack_start_out)
 {
     SENTRY_DEBUGF(
         "write_thread_stack: SP=0x%llx", (unsigned long long)stack_pointer);
@@ -1346,13 +1277,22 @@ write_thread_stack(minidump_writer_t *writer, uint64_t stack_pointer,
     if (capture_start < stack_start) {
         capture_start = stack_start;
     }
+    // Limit to 1MB by default
+    size_t max_size = SENTRY_CRASH_MAX_STACK_SIZE;
+    if (thread_id != writer->crash_ctx->crashed_tid
+        && writer->crash_ctx->max_stack_capture_size) {
+        max_size = writer->crash_ctx->max_stack_capture_size;
+    }
+    // Omit the red zone to include SP
+    if (max_size <= stack_pointer - capture_start) {
+        capture_start = stack_pointer;
+    }
 
     // Capture from adjusted SP to end of stack (upwards)
     size_t stack_size = stack_end - capture_start;
 
-    // Limit to 1MB
-    if (stack_size > SENTRY_CRASH_MAX_STACK_SIZE) {
-        stack_size = SENTRY_CRASH_MAX_STACK_SIZE;
+    if (stack_size > max_size) {
+        stack_size = max_size;
     }
 
     void *stack_buffer = sentry_malloc(stack_size);
@@ -1448,7 +1388,7 @@ ptrace_capture_thread(
 #    elif defined(__aarch64__)
     ptrace_sp = ptrace_ctx.uc_mcontext.sp;
 #    elif defined(__i386__)
-    ptrace_sp = ptrace_ctx.uc_mcontext.gregs[REG_ESP];
+    ptrace_sp = (uint32_t)ptrace_ctx.uc_mcontext.gregs[REG_ESP];
 #    elif defined(__arm__)
     ptrace_sp = ptrace_ctx.uc_mcontext.arm_sp;
 #    endif
@@ -1456,8 +1396,8 @@ ptrace_capture_thread(
     if (ptrace_sp != 0) {
         size_t stack_size = 0;
         uint64_t stack_start = 0;
-        thread->stack.memory.rva
-            = write_thread_stack(writer, ptrace_sp, &stack_size, &stack_start);
+        thread->stack.memory.rva = write_thread_stack(
+            writer, ptrace_sp, thread->thread_id, &stack_size, &stack_start);
         thread->stack.memory.size = stack_size;
         thread->stack.start_address = stack_start;
         record_thread_stack(writer, thread);
@@ -1535,7 +1475,7 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
 #    elif defined(__aarch64__)
             sp = uctx->uc_mcontext.sp;
 #    elif defined(__i386__)
-            sp = uctx->uc_mcontext.gregs[REG_ESP];
+            sp = (uint32_t)uctx->uc_mcontext.gregs[REG_ESP];
 #    elif defined(__arm__)
             sp = uctx->uc_mcontext.arm_sp;
 #    endif
@@ -1546,8 +1486,8 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
             if (sp != 0) {
                 size_t stack_size = 0;
                 uint64_t stack_start = 0;
-                thread->stack.memory.rva
-                    = write_thread_stack(writer, sp, &stack_size, &stack_start);
+                thread->stack.memory.rva = write_thread_stack(
+                    writer, sp, thread->thread_id, &stack_size, &stack_start);
                 thread->stack.memory.size = stack_size;
                 thread->stack.start_address = stack_start;
                 record_thread_stack(writer, thread);
@@ -1691,7 +1631,7 @@ resolve_modules(const minidump_writer_t *writer, resolved_module_t *modules,
         // First time we see this file — confirm it's actually an ELF before
         // adding it as a module. This drops sentry-native's own IPC shm,
         // deleted semaphores, and any other non-ELF named mapping.
-        if (!is_elf_file(mapping->name)) {
+        if (!sentry__elf_is_file(mapping->name)) {
             if (skip_count < SENTRY_CRASH_MAX_MODULES) {
                 skip_names[skip_count++] = mapping->name;
             }
@@ -2684,6 +2624,8 @@ write_linux_dso_debug_stream(
             break;
         case AT_BASE:
             at_base = auxv[i].a_un.a_val;
+            break;
+        default:
             break;
         }
     }

@@ -8,9 +8,8 @@ extern "C" {
 #include "sentry_core.h"
 #include "sentry_database.h"
 #include "sentry_envelope.h"
+#include "sentry_hint.h"
 #include "sentry_logger.h"
-#include "sentry_logs.h"
-#include "sentry_metrics.h"
 #include "sentry_options.h"
 #ifdef SENTRY_PLATFORM_WINDOWS
 #    include "sentry_os.h"
@@ -20,10 +19,10 @@ extern "C" {
 #include "sentry_session_replay.h"
 #include "sentry_string.h"
 #include "sentry_sync.h"
+#include "sentry_telemetry.h"
 #include "sentry_tracing.h"
 #include "sentry_transport.h"
 #include "sentry_unix_pageallocator.h"
-#include "transports/sentry_disk_transport.h"
 }
 
 #ifdef __GNUC__
@@ -114,6 +113,7 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
     sentry__page_allocator_enable();
     (void)!sentry__enter_signal_handler();
 #endif
+    sentry__enter_crash_handler();
 
     sentry_path_t *dump_path = nullptr;
 #ifdef SENTRY_PLATFORM_WINDOWS
@@ -142,6 +142,10 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
 
         sentry_value_t transaction
             = sentry__trace_finish(SENTRY_SPAN_STATUS_ABORTED);
+        sentry_uuid_t event_id = sentry_uuid_nil();
+
+        sentry_hint_t hint;
+        sentry__hint_init(&hint);
 
         bool should_handle = true;
 
@@ -161,19 +165,14 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
             uctx = &uctx_data;
 #endif
 
-            SENTRY_SIGNAL_SAFE_LOG("DEBUG invoking `on_crash` hook");
-            sentry_value_t result
-                = options->on_crash_func(uctx, event, options->on_crash_data);
-            should_handle = !sentry_value_is_null(result);
+            event = sentry__invoke_on_crash(options, uctx, event, &hint);
+            should_handle = !sentry_value_is_null(event);
         }
 
+        sentry__transport_suspend(options->transport);
+
         // Flush logs and metrics in a crash-safe manner before crash handling
-        if (options->enable_logs) {
-            sentry__logs_flush_crash_safe();
-        }
-        if (options->enable_metrics) {
-            sentry__metrics_flush_crash_safe();
-        }
+        sentry__telemetry_flush_crash_safe();
 
         if (should_handle) {
             bool capture_screenshot = options->attach_screenshot;
@@ -187,8 +186,18 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
             }
 #endif
 
-            sentry_envelope_t *envelope = sentry__prepare_event(
-                options, event, nullptr, !options->on_crash_func, nullptr);
+            event = sentry__prepare_event(options, event, nullptr);
+            if (!options->on_crash_func) {
+                event = sentry__invoke_before_send(options, event, &hint);
+            }
+            sentry_value_t attachments
+                = sentry__hint_resolve_attachments(&hint);
+            sentry_envelope_t *envelope
+                = sentry__enclose_event(options, event, nullptr, attachments);
+            sentry_value_decref(attachments);
+            if (envelope) {
+                event_id = sentry__envelope_get_event_id(envelope);
+            }
             sentry_session_t *session = sentry__end_current_session_with_status(
                 SENTRY_SESSION_STATUS_CRASHED);
             sentry__envelope_add_session(envelope, session);
@@ -204,17 +213,19 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
                 sentry__envelope_item_set_header(item, "filename",
                     sentry_value_new_string(sentry__path_filename(dump_path)));
             } else if (options->enable_large_attachments) {
-                sentry_attachment_t tmp = {};
-                tmp.path = dump_path;
-                tmp.type = (char *)SENTRY_ATTACHMENT_TYPE_MINIDUMP;
-                if (!sentry__cache_attachment_ref(
-                        envelope, &tmp, options->run->cache_path, nullptr)) {
+                sentry_value_t attachment
+                    = sentry__attachment_from_file(dump_path->path);
+                sentry_attachment_set_type(
+                    attachment, SENTRY_ATTACHMENT_TYPE_MINIDUMP);
+                if (!sentry__cache_attachment_ref(envelope, attachment,
+                        options->run->cache_path, nullptr)) {
                     SENTRY_SIGNAL_SAFE_LOG(
                         "WARN failed to cache minidump attachment-ref");
                     sentry__client_report_discard(
                         SENTRY_DISCARD_REASON_SEND_ERROR,
                         SENTRY_DATA_CATEGORY_ATTACHMENT, 1);
                 }
+                sentry_value_decref(attachment);
             } else {
                 SENTRY_SIGNAL_SAFE_LOG(
                     "WARN failed to add minidump attachment");
@@ -223,56 +234,48 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
             }
 
             if (capture_screenshot) {
-                sentry_attachment_t *screenshot = sentry__attachment_from_path(
-                    sentry__screenshot_get_path(options));
-                if (screenshot
-                    && sentry__screenshot_capture(screenshot->path, 0)) {
+                sentry_path_t *path = sentry__screenshot_get_path(options);
+                sentry_value_t screenshot
+                    = sentry_attachment_from_file(path ? path->path : nullptr);
+                if (!sentry_value_is_null(screenshot)
+                    && sentry__screenshot_capture(path, 0)) {
                     sentry__envelope_add_attachment(envelope, screenshot);
                 }
-                sentry__attachment_free(screenshot);
+                sentry_value_decref(screenshot);
+                sentry__path_free(path);
             }
 
             if (options->attach_session_replay) {
-                sentry_attachment_t *replay = sentry__attachment_from_path(
-                    sentry__session_replay_get_path(options));
-                if (replay
+                sentry_path_t *path = sentry__session_replay_get_path(options);
+                sentry_value_t replay
+                    = sentry_attachment_from_file(path ? path->path : nullptr);
+                if (!sentry_value_is_null(replay)
                     && sentry__session_replay_capture(
-                        replay->path, options->session_replay_duration, 0)) {
+                        path, options->session_replay_duration, 0)) {
                     sentry__envelope_add_attachment(envelope, replay);
                 }
-                sentry__attachment_free(replay);
+                sentry_value_decref(replay);
+                sentry__path_free(path);
             }
 
             if (envelope && sentry__session_replay_has_pending(options)) {
                 sentry_value_t crash_event
                     = sentry_envelope_get_event(envelope);
-                sentry_transport_t *replay_transport
-                    = sentry_new_disk_transport(options->run);
-                if (replay_transport) {
-                    sentry__session_replay_flush_pending(
-                        options, replay_transport, crash_event);
-                    sentry__transport_dump_queue(
-                        replay_transport, options->run);
-                    sentry_transport_free(replay_transport);
-                }
+                sentry__session_replay_flush_pending(
+                    options, options->transport, crash_event);
             }
 
             if (!sentry__launch_external_crash_reporter(options, envelope)) {
-                // capture the envelopes with the disk transport
-                sentry_transport_t *disk_transport
-                    = sentry_new_disk_transport(options->run);
                 if (!sentry_value_is_null(transaction)) {
                     sentry_envelope_t *tx_envelope
                         = sentry__prepare_transaction(
                             options, transaction, nullptr);
                     if (tx_envelope) {
-                        sentry__capture_envelope(
-                            disk_transport, tx_envelope, options);
+                        sentry__submit_envelope(
+                            options->transport, tx_envelope, options);
                     }
                 }
-                sentry__capture_envelope(disk_transport, envelope, options);
-                sentry__transport_dump_queue(disk_transport, options->run);
-                sentry_transport_free(disk_transport);
+                sentry__submit_envelope(options->transport, envelope, options);
             } else {
                 sentry_value_decref(transaction);
             }
@@ -287,14 +290,20 @@ breakpad_backend_callback(const google_breakpad::MinidumpDescriptor &descriptor,
             sentry_value_decref(event);
             sentry_value_decref(transaction);
         }
+        sentry__hint_deinit(&hint);
 
         // after capturing the crash event, try to dump all the in-flight
         // data of the previous transports
         sentry__transport_dump_queue(options->transport, options->run);
+        if (!sentry_uuid_is_nil(&event_id)
+            && !sentry__run_write_crash_marker(options->run, &event_id)) {
+            SENTRY_SIGNAL_SAFE_LOG("WARN writing run crash marker failed");
+        }
         // and restore the old transport
     }
     SENTRY_SIGNAL_SAFE_LOG("INFO crash has been captured");
 
+    sentry__exit_crash_handler();
 #ifndef SENTRY_PLATFORM_WINDOWS
     sentry__leave_signal_handler();
 #endif

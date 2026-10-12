@@ -293,8 +293,8 @@ SENTRY_TEST(transport_sampling_transactions_set_trace)
 
     uint64_t sent_transactions = 0;
     for (int i = 0; i < 100; i++) {
-        // regenerate trace to re-roll `sample_rand`
-        sentry_regenerate_trace();
+        // start a new trace to re-roll `sample_rand`
+        sentry_start_new_trace();
         sentry_transaction_context_t *tx_ctx
             = sentry_transaction_context_new("honk", "beep");
         sentry_transaction_t *tx
@@ -348,7 +348,7 @@ SENTRY_TEST(transport_sampling_transactions)
 }
 
 static sentry_value_t
-before_send(sentry_value_t event, void *UNUSED(hint), void *data)
+before_send(sentry_value_t event, sentry_hint_t *UNUSED(hint), void *data)
 {
     uint64_t *called = data;
     *called += 1;
@@ -398,6 +398,16 @@ before_transport(sentry_envelope_t *envelope, void *data)
     sentry_envelope_free(envelope);
 }
 
+static sentry_value_t
+load_scope_span_or_transaction(void)
+{
+    sentry_value_t value = sentry_value_new_null();
+    SENTRY_WITH_SCOPE (scope) {
+        value = sentry__scope_load_span_or_transaction(scope);
+    }
+    return value;
+}
+
 SENTRY_TEST(multiple_transactions)
 {
     uint64_t called_transport = 0;
@@ -420,12 +430,14 @@ SENTRY_TEST(multiple_transactions)
         = sentry_transaction_start(tx_ctx, sentry_value_new_null());
     sentry_set_transaction_object(tx);
 
-    sentry_value_t scope_tx = sentry__scope_get_span_or_transaction();
+    sentry_value_t scope_tx = load_scope_span_or_transaction();
     CHECK_STRING_PROPERTY(scope_tx, "transaction", "wow!");
+    sentry_value_decref(scope_tx);
 
     sentry_uuid_t event_id = sentry_transaction_finish(tx);
-    scope_tx = sentry__scope_get_span_or_transaction();
+    scope_tx = load_scope_span_or_transaction();
     TEST_CHECK(sentry_value_is_null(scope_tx));
+    sentry_value_decref(scope_tx);
     TEST_CHECK(!sentry_uuid_is_nil(&event_id));
 
     // Set transaction on scope twice, back-to-back without finishing the first
@@ -437,13 +449,14 @@ SENTRY_TEST(multiple_transactions)
     tx_ctx = sentry_transaction_context_new("wowee!", NULL);
     tx = sentry_transaction_start(tx_ctx, sentry_value_new_null());
     sentry_set_transaction_object(tx);
-    scope_tx = sentry__scope_get_span_or_transaction();
-    CHECK_STRING_PROPERTY(scope_tx, "transaction", "wowee!");
+    scope_tx = load_scope_span_or_transaction();
     event_id = sentry_transaction_finish(tx);
     TEST_CHECK(!sentry_uuid_is_nil(&event_id));
 
     sentry_close();
 
+    CHECK_STRING_PROPERTY(scope_tx, "transaction", "wowee!");
+    sentry_value_decref(scope_tx);
     TEST_CHECK_INT_EQUAL(called_transport, 2);
 }
 
@@ -520,20 +533,21 @@ SENTRY_TEST(spans_on_scope)
 
     // Peek into the transaction's span list and make sure everything is
     // good
-    sentry_value_t scope_tx = sentry__scope_get_span_or_transaction();
-    const char *trace_id
-        = sentry_value_as_string(sentry_value_get_by_key(scope_tx, "trace_id"));
-    const char *parent_span_id
-        = sentry_value_as_string(sentry_value_get_by_key(scope_tx, "span_id"));
+    sentry_value_t scope_tx = load_scope_span_or_transaction();
+    char *trace_id = sentry__string_clone(
+        sentry_value_as_string(sentry_value_get_by_key(scope_tx, "trace_id")));
+    char *parent_span_id = sentry__string_clone(
+        sentry_value_as_string(sentry_value_get_by_key(scope_tx, "span_id")));
     // Don't track the span yet
     TEST_CHECK(IS_NULL(scope_tx, "spans"));
+    sentry_value_decref(scope_tx);
 
     // Sanity check that child isn't finished yet
     TEST_CHECK(IS_NULL(child, "timestamp"));
 
     sentry_span_finish(opaque_child);
 
-    scope_tx = sentry__scope_get_span_or_transaction();
+    scope_tx = load_scope_span_or_transaction();
     TEST_CHECK(!IS_NULL(scope_tx, "spans"));
     sentry_value_t spans = sentry_value_get_by_key(scope_tx, "spans");
     TEST_CHECK_INT_EQUAL(sentry_value_get_length(spans), 1);
@@ -546,6 +560,9 @@ SENTRY_TEST(spans_on_scope)
     CHECK_STRING_PROPERTY(stored_child, "description", "goose");
     // Should be finished
     TEST_CHECK(!IS_NULL(stored_child, "timestamp"));
+    sentry_value_decref(scope_tx);
+    sentry_free(trace_id);
+    sentry_free(parent_span_id);
 
     sentry__transaction_decref(opaque_tx);
 
@@ -763,6 +780,38 @@ SENTRY_TEST(unsampled_spans)
     sentry_close();
 }
 
+SENTRY_TEST(unsampled_span_finish_unbinds_from_scope)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_traces_sample_rate(options, 1.0);
+    sentry_init(options);
+
+    sentry_transaction_context_t *tx_ctx
+        = sentry_transaction_context_new("unsampled", NULL);
+    sentry_transaction_context_set_sampled(tx_ctx, 0);
+    sentry_transaction_t *tx
+        = sentry_transaction_start(tx_ctx, sentry_value_new_null());
+    sentry_span_t *span = sentry_transaction_start_child(tx, "op", "desc");
+    sentry_set_span(span);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_span_t *scope_span = sentry__scope_ref_span(scope);
+        TEST_CHECK(scope_span == span);
+        sentry__span_decref(scope_span);
+    }
+
+    sentry_span_finish(span);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_span_t *scope_span = sentry__scope_ref_span(scope);
+        TEST_CHECK(scope_span == NULL);
+        sentry__span_decref(scope_span);
+    }
+
+    sentry_transaction_finish(tx);
+    sentry_close();
+}
+
 static void
 check_spans(sentry_envelope_t *envelope, void *data)
 {
@@ -852,7 +901,9 @@ SENTRY_TEST(trace_finish)
     // Scope still points at the (finished) span so a subsequent crash event
     // inherits its trace context.
     SENTRY_WITH_SCOPE (scope) {
-        TEST_CHECK(scope->span != NULL);
+        sentry_span_t *scope_span = sentry__scope_ref_span(scope);
+        TEST_CHECK(scope_span != NULL);
+        sentry__span_decref(scope_span);
     }
 
     sentry__span_decref(grand);
@@ -910,6 +961,96 @@ SENTRY_TEST(drop_unfinished_spans)
     sentry_close();
 
     TEST_CHECK_INT_EQUAL(called_transport, 1);
+}
+
+SENTRY_TEST(discard_transaction)
+{
+    uint64_t called = 0;
+
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
+    sentry_options_set_auto_session_tracking(options, 0);
+    sentry_options_set_traces_sample_rate(options, 1.0);
+
+    sentry_transport_t *transport = sentry_transport_new(count_envelope);
+    sentry_transport_set_state(transport, &called);
+    sentry_options_set_transport(options, transport);
+
+    sentry_init(options);
+
+    sentry_transaction_context_t *tx_ctx
+        = sentry_transaction_context_new("discarded", "op");
+    sentry_transaction_t *tx
+        = sentry_transaction_start(tx_ctx, sentry_value_new_null());
+    sentry_set_transaction_object(tx);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_transaction_t *scope_tx
+            = sentry__scope_ref_transaction_object(scope);
+        TEST_CHECK(scope_tx == tx);
+        sentry__transaction_decref(scope_tx);
+    }
+
+    sentry_transaction_discard(tx);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_transaction_t *scope_tx
+            = sentry__scope_ref_transaction_object(scope);
+        TEST_CHECK(scope_tx == NULL);
+        sentry__transaction_decref(scope_tx);
+    }
+
+    sentry_close();
+    TEST_CHECK_INT_EQUAL(called, 0);
+}
+
+SENTRY_TEST(discard_span)
+{
+    uint64_t called = 0;
+
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
+    sentry_options_set_auto_session_tracking(options, 0);
+    sentry_options_set_traces_sample_rate(options, 1.0);
+
+    sentry_transport_t *transport = sentry_transport_new(count_envelope);
+    sentry_transport_set_state(transport, &called);
+    sentry_options_set_transport(options, transport);
+
+    sentry_init(options);
+
+    sentry_transaction_context_t *tx_ctx
+        = sentry_transaction_context_new("kept", "op");
+    sentry_transaction_t *tx
+        = sentry_transaction_start(tx_ctx, sentry_value_new_null());
+    sentry_span_t *span = sentry_transaction_start_child(tx, "dropped", "span");
+    sentry_set_span(span);
+    sentry_value_t value = load_scope_span_or_transaction();
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_span_t *scope_span = sentry__scope_ref_span(scope);
+        TEST_CHECK(scope_span == span);
+        sentry__span_decref(scope_span);
+    }
+
+    sentry_span_discard(span);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_span_t *scope_span = sentry__scope_ref_span(scope);
+        TEST_CHECK(scope_span == NULL);
+        sentry__span_decref(scope_span);
+    }
+    TEST_CHECK_INT_EQUAL(
+        sentry_value_get_length(sentry_value_get_by_key(tx->inner, "spans")),
+        0);
+
+    sentry_uuid_t event_id = sentry_transaction_finish(tx);
+    TEST_CHECK(!sentry_uuid_is_nil(&event_id));
+
+    sentry_close();
+    CHECK_STRING_PROPERTY(value, "description", "span");
+    sentry_value_decref(value);
+    TEST_CHECK_INT_EQUAL(called, 1);
 }
 
 static void
@@ -1489,7 +1630,7 @@ SENTRY_TEST(set_trace)
 
     SENTRY_WITH_SCOPE (scope) {
         sentry_value_t propagation_trace_context
-            = sentry_value_get_by_key(scope->propagation_context, "trace");
+            = sentry__scope_load_trace_context(scope);
         TEST_CHECK(!sentry_value_is_null(propagation_trace_context));
 
         CHECK_STRING_PROPERTY(propagation_trace_context, "type", "trace");
@@ -1502,9 +1643,44 @@ SENTRY_TEST(set_trace)
             sentry_value_get_by_key(propagation_trace_context, "span_id"));
         TEST_ASSERT(!!span_id);
         TEST_CHECK(strlen(span_id) > 0);
+        sentry_value_decref(propagation_trace_context);
     }
 
     sentry_close();
+}
+
+static void
+check_trace_omits_parent(const char *parent_span_id, size_t parent_span_id_len)
+{
+    SENTRY_TEST_OPTIONS_NEW(options);
+    sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
+    sentry_init(options);
+
+    const char *trace_id = "2674eb52d5874b13b560236d6c79ce8a";
+    sentry_set_trace_n(
+        trace_id, strlen(trace_id), parent_span_id, parent_span_id_len);
+
+    SENTRY_WITH_SCOPE (scope) {
+        sentry_value_t propagation_trace_context
+            = sentry__scope_load_trace_context(scope);
+        CHECK_STRING_PROPERTY(propagation_trace_context, "trace_id", trace_id);
+
+        char *json = sentry_value_to_json(propagation_trace_context);
+        TEST_ASSERT(!!json);
+        TEST_CHECK(strstr(json, "parent_span_id") == NULL);
+        sentry_free(json);
+        sentry_value_decref(propagation_trace_context);
+    }
+
+    sentry_close();
+}
+
+SENTRY_TEST(set_trace_without_parent)
+{
+    check_trace_omits_parent(NULL, 0);
+    // A caller can pass a non-NULL parent span ID with length 0.
+    // Treat that the same as NULL.
+    check_trace_omits_parent("", 0);
 }
 
 sentry_value_t
@@ -1890,7 +2066,7 @@ SENTRY_TEST(propagation_context_init)
     apply_scope_and_check_trace_context(options, tx_trace_id, "", true);
 
     // now manually generate a new trace which should be different from before
-    sentry_regenerate_trace();
+    sentry_start_new_trace();
     sentry_value_t regenerated_trace = apply_scope_for_trace_context(options);
     char *regenerated_trace_id = sentry__string_clone(sentry_value_as_string(
         sentry_value_get_by_key(regenerated_trace, "trace_id")));
@@ -2349,12 +2525,12 @@ SENTRY_TEST(strict_continuation_no_baggage_forks)
 
     // Scope propagation follows the fork: no lingering upstream trace_id.
     SENTRY_WITH_SCOPE (scope) {
-        const char *scope_trace_id
-            = sentry_value_as_string(sentry_value_get_by_key(
-                sentry_value_get_by_key(scope->propagation_context, "trace"),
-                "trace_id"));
+        sentry_value_t trace_context = sentry__scope_load_trace_context(scope);
+        const char *scope_trace_id = sentry_value_as_string(
+            sentry_value_get_by_key(trace_context, "trace_id"));
         TEST_CHECK(strcmp(scope_trace_id, UPSTREAM_TRACE_ID) != 0);
         TEST_CHECK_STRING_EQUAL(scope_trace_id, trace_id);
+        sentry_value_decref(trace_context);
     }
 
     sentry_transaction_finish(tx);
@@ -2399,16 +2575,20 @@ SENTRY_TEST(set_trace_rebuilds_dsc_sample_rand)
 
     double init_sample_rand = 0.0;
     SENTRY_WITH_SCOPE (scope) {
-        init_sample_rand = sentry_value_as_double(sentry_value_get_by_key(
-            scope->dynamic_sampling_context, "sample_rand"));
+        sentry_value_t dsc = sentry__scope_load_dsc(scope);
+        init_sample_rand = sentry_value_as_double(
+            sentry_value_get_by_key(dsc, "sample_rand"));
+        sentry_value_decref(dsc);
     }
 
     sentry_set_trace("11112222333344445555666677778888", "1234567812345678");
 
     double new_sample_rand = -1.0;
     SENTRY_WITH_SCOPE (scope) {
-        new_sample_rand = sentry_value_as_double(sentry_value_get_by_key(
-            scope->dynamic_sampling_context, "sample_rand"));
+        sentry_value_t dsc = sentry__scope_load_dsc(scope);
+        new_sample_rand = sentry_value_as_double(
+            sentry_value_get_by_key(dsc, "sample_rand"));
+        sentry_value_decref(dsc);
     }
     // sample_rand is regenerated for the new trace, so the DSC must reflect
     // the fresh value, not the init-time one.

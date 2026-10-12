@@ -89,6 +89,12 @@ void sentry__jsonwriter_write_double(sentry_jsonwriter_t *jw, double val);
 void sentry__jsonwriter_write_str(sentry_jsonwriter_t *jw, const char *val);
 
 /**
+ * Write a string with an explicit byte length.
+ */
+void sentry__jsonwriter_write_str_n(
+    sentry_jsonwriter_t *jw, const char *val, size_t val_len);
+
+/**
  * Write a UUID as a JSON string.
  * See `sentry_uuid_as_string`.
  */
@@ -129,13 +135,5 @@ void sentry__jsonwriter_write_object_start(sentry_jsonwriter_t *jw);
  * End the previously started JSON object.
  */
 void sentry__jsonwriter_write_object_end(sentry_jsonwriter_t *jw);
-
-/**
- * Parse the given JSON string into a new Value.
- *
- * Exported via `SENTRY_API` so the Android JNI bridge can link against.
- */
-SENTRY_API sentry_value_t sentry__value_from_json(
-    const char *buf, size_t buflen);
 
 #endif

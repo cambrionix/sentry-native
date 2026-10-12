@@ -1,8 +1,11 @@
+#include <android/log.h>
+#include <errno.h>
 #include <jni.h>
 #include <sentry.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define ENSURE(Expr)                                                           \
     if (!(Expr))                                                               \
@@ -115,6 +118,26 @@ Java_io_sentry_ndk_NativeScope_nativeRemoveExtra(
 }
 
 JNIEXPORT void JNICALL
+Java_io_sentry_ndk_NativeScope_nativeSetEnvironment(
+    JNIEnv *env, jclass cls, jstring environment)
+{
+    if (!environment) {
+        sentry_set_environment(NULL);
+        return;
+    }
+
+    const char *charEnvironment
+        = (*env)->GetStringUTFChars(env, environment, 0);
+    if (!charEnvironment) {
+        return;
+    }
+
+    sentry_set_environment(charEnvironment);
+
+    (*env)->ReleaseStringUTFChars(env, environment, charEnvironment);
+}
+
+JNIEXPORT void JNICALL
 Java_io_sentry_ndk_NativeScope_nativeSetUser(JNIEnv *env, jclass cls,
     jstring id, jstring email, jstring ipAddress, jstring username)
 {
@@ -165,9 +188,6 @@ Java_io_sentry_ndk_NativeScope_nativeSetTrace(
     (*env)->ReleaseStringUTFChars(env, trace_id, charTraceId);
     (*env)->ReleaseStringUTFChars(env, parent_span_id, charParentSpanId);
 }
-
-// sentry_json.h
-extern sentry_value_t sentry__value_from_json(const char *buf, size_t buflen);
 
 JNIEXPORT void JNICALL
 Java_io_sentry_ndk_NativeScope_nativeAddBreadcrumb(JNIEnv *env, jclass cls,
@@ -224,7 +244,7 @@ Java_io_sentry_ndk_NativeScope_nativeAddBreadcrumb(JNIEnv *env, jclass cls,
         // JSON object string. Parse it back into a value so it's not a raw
         // string.
         sentry_value_t dataObject
-            = sentry__value_from_json(charData, strlen(charData));
+            = sentry_value_from_json(charData, strlen(charData));
         if (!sentry_value_is_null(dataObject)) {
             sentry_value_set_by_key(crumb, "data", dataObject);
         }
@@ -247,7 +267,7 @@ Java_io_sentry_ndk_NativeScope_nativeAddAttachment(
         return;
     }
 
-    // The returned sentry_attachment_t* is intentionally discarded.
+    // The returned sentry_uuid_t is intentionally discarded.
     // We are not tracking it across the JNI boundary for individual removals.
     // Use sentry_clear_attachments() for bulk removal.
     sentry_attach_file(charPath);
@@ -273,7 +293,7 @@ Java_io_sentry_ndk_NativeScope_nativeAddAttachmentBytes(
         return;
     }
 
-    // The returned sentry_attachment_t* is intentionally discarded.
+    // The returned sentry_uuid_t is intentionally discarded.
     // We are not tracking it across the JNI boundary for individual removals.
     // Use sentry_clear_attachments() for bulk removal.
     sentry_attach_bytes((const char *)buf, (size_t)bufLen, charFilename);
@@ -288,6 +308,38 @@ Java_io_sentry_ndk_NativeScope_nativeClearAttachments(JNIEnv *env, jclass cls)
     sentry_clear_attachments();
 }
 
+// sentry-native's path helpers are internal to the core library and not
+// exported from the shared object we link against, so we create the outbox
+// ourselves. Android is always POSIX, so mkdir(2) is all we need.
+static int
+create_dir_all(const char *path)
+{
+    char *buf = sentry_malloc(strlen(path) + 1);
+    if (!buf) {
+        return -1;
+    }
+    strcpy(buf, path);
+
+    int rv = 0;
+    for (char *p = buf; *p; p++) {
+        if (*p == '/' && p != buf) {
+            *p = '\0';
+            if (mkdir(buf, 0700) != 0 && errno != EEXIST && errno != EINVAL) {
+                rv = -1;
+                goto done;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(buf, 0700) != 0 && errno != EEXIST && errno != EINVAL) {
+        rv = -1;
+    }
+
+done:
+    sentry_free(buf);
+    return rv;
+}
+
 static void
 send_envelope(sentry_envelope_t *envelope, void *data)
 {
@@ -296,6 +348,14 @@ send_envelope(sentry_envelope_t *envelope, void *data)
 
     sentry_uuid_t envelope_id = sentry_uuid_new_v4();
     sentry_uuid_as_string(&envelope_id, envelope_id_str);
+
+    // The head SDK may create the outbox lazily, so ensure it exists before
+    // writing into it; the underlying file write does not create parent
+    // directories and would otherwise silently fail.
+    if (create_dir_all(outbox_path) != 0) {
+        __android_log_print(ANDROID_LOG_ERROR, "sentry-native",
+            "failed to create outbox directory \"%s\"", outbox_path);
+    }
 
     size_t outbox_len = strlen(outbox_path);
     size_t final_len = outbox_len + 42; // "/" + envelope_id_str + "\0" = 42
@@ -313,6 +373,9 @@ send_envelope(sentry_envelope_t *envelope, void *data)
 
 // sentry_backend.h
 extern void sentry__backend_preload(void);
+
+// sentry_database.h
+extern void sentry__retain_crash_marker(sentry_options_t *options);
 
 JNIEXPORT void JNICALL
 Java_io_sentry_ndk_SentryNdk_preloadSentryNative(JNIEnv *env, jclass cls)
@@ -369,6 +432,10 @@ Java_io_sentry_ndk_SentryNdk_initSentryNative(
 
     options = sentry_options_new();
     ENSURE_OR_FAIL(options);
+
+    // Android SDK needs to retain the marker timestamp for session finalization
+    // and cleans it up when appropriate
+    sentry__retain_crash_marker(options);
 
     // session tracking is enabled by default, but the Android SDK already
     // handles it

@@ -43,8 +43,8 @@ sentry_envelope_t *sentry__envelope_from_path(const sentry_path_t *path);
 
 /**
  * This returns the UUID of the event associated with this envelope.
- * If there is no event inside this envelope, the empty nil UUID will be
- * returned.
+ * If `envelope` is NULL or there is no event inside it, the empty nil UUID will
+ * be returned.
  */
 sentry_uuid_t sentry__envelope_get_event_id(const sentry_envelope_t *envelope);
 
@@ -85,10 +85,10 @@ sentry_envelope_item_t *sentry__envelope_add_metrics(
     sentry_envelope_t *envelope, sentry_value_t metrics);
 
 /**
- * Add a user feedback to this envelope.
+ * Add a feedback event to this envelope.
  */
-sentry_envelope_item_t *sentry__envelope_add_user_feedback(
-    sentry_envelope_t *envelope, sentry_value_t user_feedback);
+sentry_envelope_item_t *sentry__envelope_add_feedback_event(
+    sentry_envelope_t *envelope, sentry_value_t feedback_event);
 
 /**
  * Add a session to this envelope.
@@ -100,13 +100,13 @@ sentry_envelope_item_t *sentry__envelope_add_session(
  * Add an attachment to this envelope.
  */
 sentry_envelope_item_t *sentry__envelope_add_attachment(
-    sentry_envelope_t *envelope, const sentry_attachment_t *attachment);
+    sentry_envelope_t *envelope, sentry_value_t attachment);
 
 /**
  * Add normal (non-attachment-ref) attachments to this envelope.
  */
 void sentry__envelope_add_attachments(sentry_envelope_t *envelope,
-    const sentry_attachment_t *attachments, const sentry_options_t *options);
+    sentry_value_t attachments, const sentry_options_t *options);
 
 /**
  * Add an attachment-ref item with standard item headers to this envelope.
@@ -170,6 +170,12 @@ void sentry__envelope_item_set_header(
  */
 char *sentry_envelope_serialize_ratelimited(const sentry_envelope_t *envelope,
     const sentry_rate_limiter_t *rl, size_t *size_out, bool *owned_out);
+
+/**
+ * Check whether an item or its parent event is rate limited.
+ */
+bool sentry__envelope_item_is_ratelimited(const sentry_envelope_t *envelope,
+    const sentry_envelope_item_t *item, const sentry_rate_limiter_t *rl);
 
 /**
  * Serialize a complete envelope with all its items into the given string

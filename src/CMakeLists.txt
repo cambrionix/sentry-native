@@ -24,6 +24,7 @@ sentry_target_sources_cwd(sentry
 	sentry_hint.c
 	sentry_hint.h
 	sentry_info.c
+	sentry_integration.h
 	sentry_json.c
 	sentry_json.h
 	sentry_logger.c
@@ -58,6 +59,8 @@ sentry_target_sources_cwd(sentry
 	sentry_symbolizer.h
 	sentry_sync.c
 	sentry_sync.h
+	sentry_telemetry.c
+	sentry_telemetry.h
 	sentry_thread_stackwalk.h
 	sentry_transport.c
 	sentry_transport.h
@@ -74,8 +77,6 @@ sentry_target_sources_cwd(sentry
 	path/sentry_path.c
 	screenshot/sentry_screenshot.c
 	session_replay/sentry_session_replay.c
-	transports/sentry_disk_transport.c
-	transports/sentry_disk_transport.h
 	transports/sentry_function_transport.c
 	transports/sentry_http_transport.c
 	transports/sentry_http_transport.h
@@ -172,37 +173,8 @@ elseif(SENTRY_BACKEND_NATIVE)
 	sentry_target_sources_cwd(sentry
 		backends/sentry_backend_native.c
 		backends/native/sentry_crash_ipc.c
-		backends/native/sentry_crash_daemon.c
 		backends/native/sentry_crash_handler.c
-		backends/native/minidump/sentry_minidump_format.h
-		backends/native/minidump/sentry_minidump_writer.h
 	)
-
-	# Remote unwinding (Linux only — uses libunwind ptrace accessors)
-	if(LINUX)
-		sentry_target_sources_cwd(sentry
-			unwinder/sentry_unwinder_libunwind_remote.c
-		)
-	endif()
-
-	# Platform-specific minidump writers
-	if(LINUX OR ANDROID)
-		sentry_target_sources_cwd(sentry
-			backends/native/minidump/sentry_minidump_common.c
-			backends/native/minidump/sentry_minidump_indirect.c
-			backends/native/minidump/sentry_minidump_linux.c
-		)
-	elseif(APPLE)
-		sentry_target_sources_cwd(sentry
-			backends/native/minidump/sentry_minidump_common.c
-			backends/native/minidump/sentry_minidump_indirect.c
-			backends/native/minidump/sentry_minidump_macos.c
-		)
-	elseif(WIN32)
-		sentry_target_sources_cwd(sentry
-			backends/native/minidump/sentry_minidump_windows.c
-		)
-	endif()
 
 	# Add include directory for native backend headers
 	target_include_directories(sentry PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backends/native)
@@ -304,6 +276,13 @@ if(SENTRY_INTEGRATION_QT)
 	sentry_target_sources_cwd(sentry
 		integrations/sentry_integration_qt.cpp
 		integrations/sentry_integration_qt.h
+	)
+endif()
+if(SENTRY_INTEGRATION_WER AND WIN32)
+	target_compile_definitions(sentry PRIVATE SENTRY_INTEGRATION_WER)
+	sentry_target_sources_cwd(sentry
+		integrations/sentry_integration_wer.c
+		integrations/sentry_integration_wer.h
 	)
 endif()
 

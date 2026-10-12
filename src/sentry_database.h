@@ -38,13 +38,15 @@ void sentry__run_load_user_consent(
 
 /**
  * Loads or creates the persisted installation ID. The file
- * `<database>/installation_id` stores a UUIDv4 on line 1 and the given
- * `public_key` on line 2. If the stored key matches, the UUID is reused;
- * otherwise a new one is generated and the file is rewritten. A NULL
- * `public_key` is treated as an empty string.
+ * `<database>/installation_id` stores a UUID on line 1 and the DSN's public key
+ * on line 2. If the stored key matches, the UUID is reused; otherwise a new one
+ * is generated and the file is rewritten.
+ *
+ * An ID that has to be created comes from the first integration providing
+ * `installation_id_func`, or is a random UUIDv4 if none does.
  */
-void sentry__run_load_installation_id(sentry_run_t *run,
-    const sentry_path_t *database_path, const char *public_key);
+void sentry__run_load_installation_id(
+    sentry_run_t *run, const sentry_options_t *options);
 
 /**
  * This creates a new application run including its associated directory and
@@ -53,6 +55,14 @@ void sentry__run_load_installation_id(sentry_run_t *run,
  * * `<database>/<uuid>.run.lock`
  */
 sentry_run_t *sentry__run_new(const sentry_path_t *database_path);
+
+/**
+ * This creates a run object for a crash daemon that adopts an existing run
+ * directory. The daemon holds a separate lock so old-run processing waits for
+ * both the process and its daemon to finish.
+ */
+sentry_run_t *sentry__run_adopt(
+    const sentry_path_t *database_path, const sentry_path_t *run_path);
 
 /**
  * Increment the refcount and return the run pointer.
@@ -90,14 +100,14 @@ bool sentry__run_write_envelope(
  * that directory; pass NULL to always copy.
  */
 bool sentry__cache_attachment_ref(sentry_envelope_t *envelope,
-    const sentry_attachment_t *attachment, const sentry_path_t *cache_path,
+    sentry_value_t attachment, const sentry_path_t *cache_path,
     const sentry_path_t *run_path);
 
 /**
  * Cache every attachment that should be represented as an attachment-ref.
  */
 void sentry__cache_attachment_refs(sentry_envelope_t *envelope,
-    const sentry_attachment_t *attachments, const sentry_options_t *options,
+    sentry_value_t attachments, const sentry_options_t *options,
     const sentry_path_t *cache_path, const sentry_path_t *run_path);
 
 /**
@@ -161,6 +171,19 @@ void sentry__process_old_runs(
     const sentry_options_t *options, uint64_t last_crash);
 
 /**
+ * Captures and removes all envelope files from a run directory.
+ */
+void sentry__process_run_envelopes(
+    const sentry_options_t *options, const sentry_path_t *run_path);
+
+/**
+ * Writes `<event-uuid>.crash` into `run` after verifying that the matching
+ * `<event-uuid>.envelope` exists.
+ */
+bool sentry__run_write_crash_marker(
+    const sentry_run_t *run, const sentry_uuid_t *event_id);
+
+/**
  * Parses a cache filename in either form:
  *   - `<uuid>.envelope` sets `*ts_out = 0`, `*count_out = -1`.
  *   - `<ts>-<count>-<uuid>.envelope` is retry form, count >= 0.
@@ -198,6 +221,13 @@ bool sentry__write_crash_marker(const sentry_options_t *options);
  * This will check whether the `<database>/last_crash` file exists.
  */
 bool sentry__has_crash_marker(const sentry_options_t *options);
+
+/**
+ * Prevents sentry_init() from clearing `<database>/last_crash`.
+ *
+ * Exported for the Android NDK integration.
+ */
+SENTRY_API void sentry__retain_crash_marker(sentry_options_t *options);
 
 /**
  * This will remove the `<database>/last_crash` file.

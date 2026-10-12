@@ -1,5 +1,5 @@
 import os
-import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -18,17 +18,20 @@ from . import (
     is_logs_envelope,
     is_feedback_envelope,
     is_replay_envelope,
+    lib_name,
     REPLAY_ID,
 )
-from .conditions import has_crashpad, has_oom
+from .conditions import has_crashpad, has_files, has_oom
 from .proxy import (
     setup_proxy_env_vars,
     cleanup_proxy_env_vars,
-    start_mitmdump,
+    start_proxy,
     proxy_test_finally,
 )
 from .assertions import (
     assert_breadcrumb,
+    assert_crash_timestamp,
+    assert_no_crash_timestamp,
     assert_crashpad_upload,
     assert_meta,
     assert_minidump,
@@ -37,6 +40,7 @@ from .assertions import (
     assert_gzip_file_header,
     assert_logs,
     assert_user_feedback,
+    wait_for,
     wait_for_file,
 )
 
@@ -47,6 +51,28 @@ pytestmark = pytest.mark.skipif(
 
 # Windows and Linux are currently able to flush all the state on crash
 flushes_state = sys.platform != "darwin"
+
+
+def _minidump_stream(minidump, stream_type):
+    stream_count, directory_rva = struct.unpack_from("<II", minidump, 8)
+    for stream in range(stream_count):
+        stream_offset = directory_rva + stream * 12
+        current_type, size, rva = struct.unpack_from("<III", minidump, stream_offset)
+        if current_type == stream_type:
+            return minidump[rva : rva + size]
+    raise AssertionError(f"stream {stream_type} not found in minidump")
+
+
+def _minidump_modules(minidump):
+    modules = _minidump_stream(minidump, 4)
+    module_count = struct.unpack_from("<I", modules)[0]
+    for module in range(module_count):
+        offset = 4 + module * 108
+        name_rva = struct.unpack_from("<I", modules, offset + 20)[0]
+        name_size = struct.unpack_from("<I", minidump, name_rva)[0]
+        name = minidump[name_rva + 4 : name_rva + 4 + name_size].decode("utf-16-le")
+        record_size, record_rva = struct.unpack_from("<II", modules, offset + 76)
+        yield name, minidump[record_rva : record_rva + record_size]
 
 
 def test_crashpad_capture(cmake, httpserver):
@@ -64,9 +90,133 @@ def test_crashpad_capture(cmake, httpserver):
     assert len(httpserver.log) == 2
 
 
+def test_crashpad_on_crashed_last_run(cmake):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
+    args = ["log", "on-crashed-last-run"]
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [*args, "initial-scope", "no-setup", "crash"],
+        expect_failure=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # no first-chance handler nor crash marker on macOS
+    if sys.platform != "darwin":
+        assert_crash_timestamp(has_files, tmp_path)
+
+    assert not list((tmp_path / ".sentry-native").glob("*.run/*.crash"))
+
+    restarted = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # no first-chance handler nor crash marker on macOS
+    if sys.platform != "darwin":
+        assert_no_crash_timestamp(has_files, tmp_path)
+    callbacks = [
+        line
+        for line in restarted.stdout.splitlines()
+        if line.startswith(b"CRASHED_LAST_RUN:")
+    ]
+    assert len(callbacks) == 1
+    assert len(callbacks[0].partition(b":")[2]) == 36
+    assert b"CRASHED_LAST_RUN_INITIAL_TAG:initial-value" in restarted.stdout
+    assert b"CRASHED_LAST_RUN_INITIAL_CONTEXT:bar" in restarted.stdout
+    assert b"CRASHED_LAST_RUN_INITIAL_USER:1" in restarted.stdout
+
+    restarted_again = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert b"CRASHED_LAST_RUN:" not in restarted_again.stdout
+
+
+def test_crashpad_codeview(cmake, httpserver):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
+
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            ["log", "crashpad-wait-for-upload", "crash"],
+            expect_failure=True,
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+        )
+
+    assert waiting.result
+    assert len(httpserver.log) == 1
+    attachments = assert_crashpad_upload(httpserver.log[0][0])
+    codeviews = {
+        name.replace("\\", "/").rsplit("/", 1)[-1]: codeview
+        for name, codeview in _minidump_modules(attachments.minidump)
+    }
+    codeview = codeviews[lib_name("sentry")]
+    signature = codeview[:4]
+    if sys.platform == "linux":
+        assert signature == b"LEpB"
+        identifier = codeview[4:]
+    else:
+        assert signature == b"RSDS"
+        identifier = codeview[4:20]
+
+    assert any(identifier)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or bool(os.environ.get("TEST_MINGW")),
+    reason="fast-fail is only available in MSVC Windows builds",
+)
+@pytest.mark.with_wer
+def test_crashpad_initial_scope_fastfail(cmake, httpserver):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
+
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            [
+                "initial-scope",
+                "initial-scope-payload",
+                "crashpad-wait-for-upload",
+                "no-setup",
+                "fastfail",
+            ],
+            expect_failure=True,
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+        )
+
+    assert waiting.result
+    assert len(httpserver.log) == 1
+    attachments = assert_crashpad_upload(
+        httpserver.log[0][0],
+        expect_attachment=True,
+        expect_breadcrumbs=False,
+        expect_default_scope=False,
+    )
+    assert any(
+        breadcrumb.get("message") == "initial scope breadcrumb"
+        for breadcrumb in attachments.breadcrumb1
+    )
+    assert attachments.event["tags"]["test.initial-tag"] == "initial-value"
+    assert attachments.event["contexts"]["initial"]["foo"] == "bar"
+    assert attachments.event["user"]["id"] == "1"
+
+
 def _setup_crashpad_proxy_test(cmake, httpserver, proxy):
     if proxy:
-        proxy_process, port = start_mitmdump(proxy)
+        proxy_process, port = start_proxy(proxy)
     else:
         proxy_process, port = None, None
 
@@ -81,9 +231,6 @@ def _setup_crashpad_proxy_test(cmake, httpserver, proxy):
 
 
 def test_crashpad_crash_proxy_env(cmake, httpserver):
-    if not shutil.which("mitmdump"):
-        pytest.skip("mitmdump is not installed")
-
     proxy_process = None  # store the proxy process to terminate it later
     try:
         env, proxy_process, tmp_path, port = _setup_crashpad_proxy_test(
@@ -108,9 +255,6 @@ def test_crashpad_crash_proxy_env(cmake, httpserver):
 
 
 def test_crashpad_crash_proxy_env_port_incorrect(cmake, httpserver):
-    if not shutil.which("mitmdump"):
-        pytest.skip("mitmdump is not installed")
-
     proxy_process = None  # store the proxy process to terminate it later
     try:
         env, proxy_process, tmp_path, port = _setup_crashpad_proxy_test(
@@ -135,9 +279,6 @@ def test_crashpad_crash_proxy_env_port_incorrect(cmake, httpserver):
 
 
 def test_crashpad_proxy_set_empty(cmake, httpserver):
-    if not shutil.which("mitmdump"):
-        pytest.skip("mitmdump is not installed")
-
     proxy_process = None  # store the proxy process to terminate it later
     try:
         env, proxy_process, tmp_path, port = _setup_crashpad_proxy_test(
@@ -165,9 +306,6 @@ def test_crashpad_proxy_set_empty(cmake, httpserver):
 
 
 def test_crashpad_proxy_https_not_http(cmake, httpserver):
-    if not shutil.which("mitmdump"):
-        pytest.skip("mitmdump is not installed")
-
     proxy_process = None  # store the proxy process to terminate it later
     # we start the proxy but expect it to remain unused (dsn is http, so shouldn't use https proxy)
     try:
@@ -207,9 +345,6 @@ def test_crashpad_proxy_https_not_http(cmake, httpserver):
 )
 @pytest.mark.parametrize("proxy_running", [True, False])
 def test_crashpad_crash_proxy(cmake, httpserver, run_args, proxy_running):
-    if not shutil.which("mitmdump"):
-        pytest.skip("mitmdump is not installed")
-
     proxy_process = None  # store the proxy process to terminate it later
     expected_logsize = 0
 
@@ -343,6 +478,7 @@ def wait_for_no_werfault(timeout=30.0, poll_interval=0.5):
         (["fastfail"]),
         (["fastfail", "discarding-before-send"]),
         (["fastfail", "discarding-on-crash"]),
+        (["invalid-parameter"]),
     ],
 )
 def test_crashpad_wer_crash(cmake, httpserver, run_args):
@@ -465,11 +601,19 @@ def test_crashpad_dumping_crash(cmake, httpserver, run_args, build_args):
 
     envelope = Envelope.deserialize(session)
     assert_session(envelope, {"status": "crashed", "errors": 1})
+    expect_attachments = not any(
+        arg in run_args for arg in ("before-send", "on-crash", "clear-attachments")
+    )
     attachments = assert_crashpad_upload(
         multipart,
-        expect_attachment="clear-attachments" not in run_args,
-        expect_view_hierarchy="clear-attachments" not in run_args,
+        expect_attachment=expect_attachments,
+        expect_view_hierarchy=expect_attachments,
     )
+    callback = next(
+        (arg for arg in run_args if arg in ("before-send", "on-crash")), None
+    )
+    expected_callback = callback.replace("-", "_").encode() if callback else None
+    assert attachments.callback == expected_callback
     event_id = attachments.event["event_id"]
     if sys.platform == "win32":
         minidump = tmp_path / ".sentry-native" / "reports" / f"{event_id}.dmp"
@@ -483,7 +627,7 @@ def test_crashpad_dumping_crash(cmake, httpserver, run_args, build_args):
     [
         None,  # uses default of 64KiB
         pytest.param(
-            "16",
+            "24",
             marks=pytest.mark.skipif(
                 sys.platform != "win32",
                 reason="handler stack size parameterization tests stack guarantee on windows only",
@@ -498,6 +642,7 @@ def test_crashpad_dumping_crash(cmake, httpserver, run_args, build_args):
         ),
     ],
 )
+@flaky(max_runs=3)
 def test_crashpad_dumping_stack_overflow(cmake, httpserver, stack_size):
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "crashpad"})
 
@@ -516,6 +661,7 @@ def test_crashpad_dumping_stack_overflow(cmake, httpserver, stack_size):
                 "start-session",
                 "attachment",
                 "attach-view-hierarchy",
+                "crashpad-wait-for-upload",
                 "stack-overflow",
             ],
             expect_failure=True,
@@ -839,6 +985,110 @@ def test_crashpad_external_crash_reporter(cmake, httpserver, run_args):
     assert_user_feedback(envelope)
 
 
+def test_crashpad_external_crash_reporter_consent_revoked(cmake, httpserver):
+    """With consent revoked, Crashpad must not launch the external reporter."""
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "crashpad"}
+    )
+    db_path = tmp_path / ".sentry-native"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "crashpad-wait-for-upload",
+            "cache-keep",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    pending_dir = db_path / ("reports" if sys.platform == "win32" else "pending")
+    assert wait_for_file(pending_dir / "*.dmp")
+
+
+def test_crashpad_external_crash_reporter_consent_revoked_no_cache(cmake, httpserver):
+    """With consent revoked and no cache_keep, Crashpad must not upload."""
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "crashpad"}
+    )
+    cache_dir = tmp_path / ".sentry-native" / "cache"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "crashpad-wait-for-upload",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    assert not cache_dir.exists() or not any(cache_dir.glob("*.envelope"))
+
+
+def test_crashpad_external_crash_reporter_consent_flush(cmake, httpserver):
+    """Pending crash report uploads once consent is given."""
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "crashpad"}
+    )
+    db_path = tmp_path / ".sentry-native"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "crashpad-wait-for-upload",
+            "cache-keep",
+            "http-retry",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        expect_failure=True,
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    pending_dir = db_path / ("reports" if sys.platform == "win32" else "pending")
+    assert wait_for_file(pending_dir / "*.dmp")
+
+    httpserver.expect_oneshot_request("/api/123456/minidump/").respond_with_data("OK")
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            [
+                "log",
+                "cache-keep",
+                "http-retry",
+                "require-user-consent",
+                "user-consent-give",
+            ],
+            env=env,
+        )
+    assert waiting.result
+    completed_dir = db_path / ("reports" if sys.platform == "win32" else "completed")
+    assert wait_for_file(completed_dir / "*.dmp")
+
+
 @pytest.mark.skipif(
     sys.platform != "win32",
     reason="Test covers Windows-specific crashes which can only be covered via the Crashpad WER module",
@@ -1135,3 +1385,21 @@ def test_crashpad_restart_on_crash(cmake, httpserver):
     assert len(httpserver.log) == 2
     for req in httpserver.log:
         assert_crashpad_upload(req[0])
+
+
+def test_crashpad_early_init(cmake):
+    tmp_path = cmake(
+        ["sentry_early_init"],
+        {
+            "SENTRY_BACKEND": "crashpad",
+            "SENTRY_TRANSPORT": "none",
+            "BUILD_SHARED_LIBS": "OFF",
+        },
+    )
+
+    result = run(
+        tmp_path,
+        "sentry_early_init",
+        [],
+    )
+    assert result.returncode == 0

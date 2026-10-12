@@ -14,21 +14,44 @@ import socket
 sourcedir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
+def lib_name(name):
+    if sys.platform == "win32":
+        prefix = "lib" if os.environ.get("TEST_MINGW") else ""
+        return prefix + name + ".dll"
+    elif sys.platform == "darwin":
+        return "lib" + name + ".dylib"
+    return "lib" + name + ".so"
+
+
 def adb(*args, **kwargs):
     return subprocess.run(
         ["{}/platform-tools/adb".format(os.environ["ANDROID_HOME"]), *args], **kwargs
     )
 
 
+def exe_name(name):
+    if sys.platform == "win32" or os.environ.get("TEST_WINE"):
+        return f"{name}.exe"
+    return name
+
+
+def run_command(name):
+    name = exe_name(name)
+    if os.environ.get("TEST_WINE"):
+        return ["wine", name]
+    return [name]
+
+
 # https://docs.pytest.org/en/latest/assert.html#assert-details
 pytest.register_assert_rewrite("tests.assertions")
 
-SENTRY_VERSION = "0.15.3"
+SENTRY_VERSION = "0.17.2"
 
 # must match the fixed id set by the example's "replay-context" arg
 REPLAY_ID = "deadbeefdeadbeefdeadbeefdeadbeef"
 
 from .assertions import wait_for_daemon as _wait_for_daemon
+from .conditions import is_asan
 
 
 def make_dsn(httpserver, auth="uiaeosnrtdy", id=123456, proxy_host=False):
@@ -190,11 +213,19 @@ def run(
             )
         return child
 
-    cmd = [
-        "./{}".format(exe) if sys.platform != "win32" else "{}\\{}.exe".format(cwd, exe)
-    ]
+    executable = (
+        "./{}".format(exe) if sys.platform != "win32" else "{}\\{}".format(cwd, exe)
+    )
+    cmd = run_command(executable)
     if "asan" in os.environ.get("RUN_ANALYZER", ""):
-        env["ASAN_OPTIONS"] = "detect_leaks=1:detect_invalid_join=0"
+        asan_options = env.get("ASAN_OPTIONS", "")
+        if "detect_leaks" not in asan_options:
+            env["ASAN_OPTIONS"] = ":".join(
+                filter(
+                    None,
+                    [asan_options, "detect_leaks=1:detect_invalid_join=0"],
+                )
+            )
         env["LSAN_OPTIONS"] = "suppressions={}".format(
             os.path.join(sourcedir, "tests", "leaks.txt")
         )
@@ -241,6 +272,32 @@ def run(
                 cmd=" ".join(cmd), args=" ".join(args)
             )
         ) from None
+
+
+def run_crash(tmp_path, exe, args, env, **kwargs):
+    """
+    Run a crash test.
+
+    When running under ASAN, we configure it to not intercept crash signals
+    so that our native crash handler can run and capture the crash.
+    """
+    # When running under ASAN, disable ASAN's signal handling so our crash
+    # handler can run. ASAN would otherwise intercept SIGSEGV/SIGABRT/etc
+    # and terminate the process before our handler completes.
+    if is_asan:
+        # Preserve existing ASAN_OPTIONS and add signal handling overrides
+        asan_opts = env.get("ASAN_OPTIONS", "")
+        # Disable handling of crash signals so our handler can run
+        asan_signal_opts = (
+            "handle_segv=0:handle_sigbus=0:handle_abort=0:"
+            "handle_sigfpe=0:handle_sigill=0:allow_user_segv_handler=1"
+        )
+        if asan_opts:
+            env = dict(env, ASAN_OPTIONS=f"{asan_opts}:{asan_signal_opts}")
+        else:
+            env = dict(env, ASAN_OPTIONS=asan_signal_opts)
+
+    run(tmp_path, exe, args, expect_failure=True, env=env, **kwargs)
 
 
 def check_output(*args, **kwargs):

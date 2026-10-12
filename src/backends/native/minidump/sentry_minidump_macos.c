@@ -850,10 +850,9 @@ write_thread_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
  * `pth_name[64]` field set by pthread_setname_np(). This works cross-process,
  * so we can use it from the daemon as long as we have a valid task port.
  *
- * Fallback path (no task_for_pid): the signal-handler-captured snapshot in
- * ``ctx->platform.threads[]`` does not currently include names, so those
- * entries get an empty string — but the stream is still emitted with the
- * correct tid list so consumers see a non-empty thread_names list.
+ * Fallback path (no task_for_pid, e.g. sandboxed apps where the daemon
+ * inherits the sandbox): uses the names the signal handler snapshotted into
+ * ``ctx->platform.threads[].name`` via THREAD_EXTENDED_INFO at crash time.
  */
 static int
 write_thread_names_stream(minidump_writer_t *writer, minidump_directory_t *dir)
@@ -941,18 +940,18 @@ write_thread_names_stream(minidump_writer_t *writer, minidump_directory_t *dir)
         }
         for (uint32_t i = 0; i < thread_count; i++) {
             uint32_t tid = 0;
+            const char *name = "";
             if (i < num_captured) {
-                tid = (uint32_t)writer->crash_ctx->platform.threads[i].tid;
+                const sentry_thread_context_darwin_t *snapshot
+                    = &writer->crash_ctx->platform.threads[i];
+                tid = (uint32_t)snapshot->tid;
+                name = snapshot->name;
             } else if (writer->crash_ctx) {
-                // Last-resort single-thread path.
+                // Last-resort single-thread path, no name available.
                 tid = writer->crash_ctx->crashed_tid;
             }
             name_tids[i] = tid;
-            // No names are captured in the signal handler on macOS today, so
-            // emit an empty string. The stream is still useful: consumers can
-            // see the tid list, and the absence of names is consistent with
-            // "we couldn't task_for_pid and didn't snapshot names".
-            name_rvas[i] = write_minidump_string(writer, "");
+            name_rvas[i] = write_minidump_string(writer, name);
             if (!name_rvas[i]) {
                 sentry_free(name_rvas);
                 sentry_free(name_tids);
@@ -1315,14 +1314,14 @@ write_module_headers_from_capture(minidump_writer_t *writer,
 {
     const size_t HEADER_PAGE_SIZE = 4096;
 
-    // Build path: {database_path}/__sentry-modheaders
-    const char *db_path = writer->crash_ctx->database_path;
-    size_t db_len = strlen(db_path);
+    // Build path: {run_path}/__sentry-modheaders
+    const char *run_path = writer->crash_ctx->run_path;
+    size_t run_len = strlen(run_path);
     char hdr_path[SENTRY_CRASH_MAX_PATH];
-    if (db_len + 22 >= sizeof(hdr_path)) {
+    if (run_len + 22 >= sizeof(hdr_path)) {
         return 0;
     }
-    snprintf(hdr_path, sizeof(hdr_path), "%s/__sentry-modheaders", db_path);
+    snprintf(hdr_path, sizeof(hdr_path), "%s/__sentry-modheaders", run_path);
 
     int fd = open(hdr_path, O_RDONLY);
     if (fd < 0) {
@@ -1673,12 +1672,12 @@ write_memory_list_stream(minidump_writer_t *writer, minidump_directory_t *dir)
 
         // Clean up the capture file written by the signal handler since
         // we used VM regions instead.
-        const char *db_path = writer->crash_ctx->database_path;
-        size_t db_len = strlen(db_path);
+        const char *run_path = writer->crash_ctx->run_path;
+        size_t run_len = strlen(run_path);
         char hdr_path[SENTRY_CRASH_MAX_PATH];
-        if (db_len + 22 < sizeof(hdr_path)) {
+        if (run_len + 22 < sizeof(hdr_path)) {
             snprintf(
-                hdr_path, sizeof(hdr_path), "%s/__sentry-modheaders", db_path);
+                hdr_path, sizeof(hdr_path), "%s/__sentry-modheaders", run_path);
             unlink(hdr_path);
         }
 

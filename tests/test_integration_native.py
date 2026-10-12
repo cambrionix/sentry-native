@@ -5,36 +5,46 @@ Tests crash handling, minidump generation, Build ID/UUID extraction,
 multi-thread capture, and FPU/SIMD register capture on all platforms.
 """
 
+import json
 import os
 import subprocess
 import sys
 import time
 import struct
 
+import msgpack
 import pytest
 
 from . import (
     is_feedback_envelope,
     is_replay_envelope,
+    lib_name,
     make_dsn,
     run,
+    run_crash,
     stage_replay,
+    run_command,
     Envelope,
     split_log_request_cond,
     REPLAY_ID,
 )
 from .assertions import (
+    assert_attachment,
     assert_breadcrumb,
+    assert_crash_timestamp,
+    assert_no_crash_timestamp,
     assert_debug_meta_images_do_not_overlap,
     assert_meta,
     assert_native_crash,
     assert_replay_envelope,
     assert_session,
     is_valid_hex,
+    wait_for,
     wait_for_file,
     assert_user_feedback,
 )
-from .conditions import has_native, has_oom, is_asan, is_tsan, is_qemu
+from .conditions import has_files
+from .conditions import has_native, has_oom, is_asan, is_tsan, is_qemu, is_wine
 
 pytestmark = pytest.mark.skipif(
     not has_native or is_qemu,
@@ -45,31 +55,10 @@ pytestmark = pytest.mark.skipif(
 # timeout the native daemon used before it respected the SDK shutdown timeout.
 SANITIZER_ARGS = ["shutdown-timeout", "10000"] if is_asan or is_tsan else []
 
-
-def run_crash(tmp_path, exe, args, env, **kwargs):
-    """
-    Run a crash test.
-
-    When running under ASAN, we configure it to not intercept crash signals
-    so that our native crash handler can run and capture the crash.
-    """
-    # When running under ASAN, disable ASAN's signal handling so our crash
-    # handler can run. ASAN would otherwise intercept SIGSEGV/SIGABRT/etc
-    # and terminate the process before our handler completes.
-    if is_asan:
-        # Preserve existing ASAN_OPTIONS and add signal handling overrides
-        asan_opts = env.get("ASAN_OPTIONS", "")
-        # Disable handling of crash signals so our handler can run
-        asan_signal_opts = (
-            "handle_segv=0:handle_sigbus=0:handle_abort=0:"
-            "handle_sigfpe=0:handle_sigill=0:allow_user_segv_handler=1"
-        )
-        if asan_opts:
-            env["ASAN_OPTIONS"] = f"{asan_opts}:{asan_signal_opts}"
-        else:
-            env["ASAN_OPTIONS"] = asan_signal_opts
-
-    run(tmp_path, exe, args, expect_failure=True, env=env, **kwargs)
+STATUS_STACK_OVERFLOW = 0xC00000FD
+STATUS_STACK_BUFFER_OVERRUN = 0xC0000409
+STATUS_HEAP_CORRUPTION = 0xC0000374
+STATUS_FAIL_FAST_EXCEPTION = 0xC0000602
 
 
 def test_native_capture_crash(cmake, httpserver):
@@ -92,6 +81,120 @@ def test_native_capture_crash(cmake, httpserver):
     assert_native_crash(envelope)
 
 
+@pytest.mark.parametrize("callback", ["before-send", "on-crash"])
+def test_native_crash_hint_attachments(cmake, httpserver, callback):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run_crash(
+            tmp_path,
+            "sentry_example",
+            ["log", "attachment", callback, "crash"],
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+        )
+    assert waiting.result
+
+    assert len(httpserver.log) >= 1
+    envelope = Envelope.deserialize(httpserver.log[0][0].get_data())
+    assert not any(
+        item.headers.get("filename") == "CMakeCache.txt" for item in envelope
+    )
+    assert any(
+        item.headers.get("filename") == "callback.txt"
+        and item.payload.bytes == callback.replace("-", "_").encode()
+        for item in envelope
+    )
+
+
+def test_native_on_crashed_last_run(cmake, httpserver):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+    args = ["log", "on-crashed-last-run"]
+
+    with httpserver.wait(timeout=10) as waiting:
+        run_crash(
+            tmp_path,
+            "sentry_example",
+            [
+                *args,
+                "initial-scope",
+                "initial-scope-payload",
+                "no-setup",
+                "crash",
+            ],
+            env=env,
+            wait_for_daemon=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    assert waiting.result
+    assert len(httpserver.log) == 1
+
+    crash_envelope = Envelope.deserialize(httpserver.log[0][0].get_data())
+    assert_native_crash(crash_envelope)
+    crash_event = crash_envelope.get_event()
+    assert any(
+        breadcrumb.get("message") == "initial scope breadcrumb"
+        for breadcrumb in crash_event["breadcrumbs"]
+    )
+    assert any(
+        item.headers.get("filename") == "CMakeCache.txt"
+        and b"This is the CMakeCache file." in item.payload.bytes
+        for item in crash_envelope
+    )
+    assert any(
+        item.headers.get("filename") == "bytes.bin"
+        and item.payload.bytes == b"\xc0\xff\xee"
+        for item in crash_envelope
+    )
+    event_id = crash_envelope.headers["event_id"]
+    assert_crash_timestamp(has_files, tmp_path)
+
+    db_dir = tmp_path / ".sentry-native"
+    run_dirs = list(db_dir.glob("*.run"))
+    assert len(run_dirs) == 1
+    assert {path.name for path in run_dirs[0].glob("*.envelope")} == {
+        "__sentry-crash.envelope"
+    }
+    assert not list(run_dirs[0].glob("*.crash"))
+
+    restarted = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert_no_crash_timestamp(has_files, tmp_path)
+    callbacks = [
+        line
+        for line in restarted.stdout.splitlines()
+        if line.startswith(b"CRASHED_LAST_RUN:")
+    ]
+    assert callbacks == [f"CRASHED_LAST_RUN:{event_id}".encode()]
+    assert b"CRASHED_LAST_RUN_INITIAL_TAG:initial-value" in restarted.stdout
+    assert b"CRASHED_LAST_RUN_INITIAL_CONTEXT:bar" in restarted.stdout
+    assert b"CRASHED_LAST_RUN_INITIAL_USER:1" in restarted.stdout
+    assert len(httpserver.log) == 1
+    assert not list(db_dir.glob("*.run"))
+    assert not list(db_dir.glob("*.run*.lock"))
+
+    restarted_again = run(
+        tmp_path,
+        "sentry_example",
+        [*args, "no-setup"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert b"CRASHED_LAST_RUN:" not in restarted_again.stdout
+    assert len(httpserver.log) == 1
+
+
 @pytest.mark.skipif(
     sys.platform != "win32" or bool(os.environ.get("TEST_MINGW")),
     reason="WER crash tests are only available in MSVC Windows builds",
@@ -100,8 +203,18 @@ def test_native_capture_crash(cmake, httpserver):
 @pytest.mark.parametrize(
     "crash_arg,exception_code",
     [
-        pytest.param("fastfail", 0xC0000602, id="fastfail"),
-        pytest.param("stack-buffer-overrun", 0xC0000409, id="stack-buffer-overrun"),
+        pytest.param("fastfail", STATUS_FAIL_FAST_EXCEPTION, id="fastfail"),
+        pytest.param(
+            "invalid-parameter",
+            STATUS_STACK_BUFFER_OVERRUN,
+            id="invalid-parameter",
+        ),
+        pytest.param("heap-corruption", STATUS_HEAP_CORRUPTION, id="heap-corruption"),
+        pytest.param(
+            "stack-buffer-overrun",
+            STATUS_STACK_BUFFER_OVERRUN,
+            id="stack-buffer-overrun",
+        ),
     ],
 )
 def test_native_wer_crash(cmake, httpserver, crash_arg, exception_code):
@@ -141,6 +254,51 @@ def test_native_oom(cmake, httpserver):
     assert waiting.result
 
 
+@pytest.mark.parametrize(
+    "stack_size",
+    [
+        None,  # uses default of 64KiB
+        pytest.param(
+            "24",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32",
+                reason="handler stack size parameterization tests stack guarantee on windows only",
+            ),
+        ),
+        pytest.param(
+            "32",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32",
+                reason="handler stack size parameterization tests stack guarantee on windows only",
+            ),
+        ),
+    ],
+)
+@pytest.mark.skipif(is_wine, reason="Wine does not terminate after stack overflow")
+def test_native_stack_overflow(cmake, httpserver, stack_size):
+    """Test stack overflow crash capture with native backend"""
+    env = dict(os.environ)
+    if stack_size:
+        env["SENTRY_HANDLER_STACK_SIZE"] = stack_size
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run_crash(
+            tmp_path,
+            "sentry_example",
+            ["log", "stdout", "stack-overflow"] + SANITIZER_ARGS,
+            env=dict(env, SENTRY_DSN=make_dsn(httpserver)),
+        )
+    assert waiting.result
+
+    assert len(httpserver.log) >= 1
+    envelope = Envelope.deserialize(httpserver.log[0][0].get_data())
+    exception_code = STATUS_STACK_OVERFLOW if sys.platform == "win32" else None
+    assert_native_crash(envelope, exception_code=exception_code)
+
+
 def test_native_capture_minidump_generated(cmake, httpserver):
     """Test that minidump file is generated"""
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
@@ -157,12 +315,17 @@ def test_native_capture_minidump_generated(cmake, httpserver):
         )
     assert waiting.result
 
-    # Check for minidump file in database directory
+    # Check for minidump file in run directory
     db_dir = tmp_path / ".sentry-native"
     assert db_dir.exists()
 
-    assert wait_for_file(db_dir / "*.dmp"), "Minidump file should be generated"
-    minidump_files = list(db_dir.glob("*.dmp"))
+    assert wait_for_file(
+        db_dir / "*.run/__sentry-crash.dmp"
+    ), "Minidump file should be generated"
+    minidump_files = list(db_dir.glob("*.run/__sentry-crash.dmp"))
+    assert not list(db_dir.glob("*.dmp"))
+    assert not list(db_dir.glob("sentry-daemon.log"))
+    assert not list(db_dir.glob("sentry-envelope-*"))
 
     # Verify minidump has correct header
     minidump_path = minidump_files[0]
@@ -181,6 +344,16 @@ def test_native_capture_minidump_generated(cmake, httpserver):
             # Windows minidumps have a different version format
             # Just verify it's non-zero
             assert version != 0, "Minidump should have non-zero version"
+
+    # The next SDK launch owns cleanup of the completed crash run.
+    run(
+        tmp_path,
+        "sentry_example",
+        ["log", "no-setup"],
+        env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+    )
+    assert not list(db_dir.glob("*.run"))
+    assert not list(db_dir.glob("*.run*.lock"))
 
 
 # Both daemon envelope writers merge the breadcrumb ring files: the native
@@ -254,6 +427,92 @@ def test_native_overflow_breadcrumbs(cmake, httpserver, crash_mode):
 
     assert len(breadcrumbs) == 100
     assert any(b.get("message") == "100" for b in breadcrumbs)
+
+
+def test_native_attachment_manifest_is_current(cmake, httpserver):
+    """The attachment manifest must reflect the live attachment state (#1933).
+
+    The daemon builds hard-crash envelopes from `<run>/__sentry-attachments`,
+    which the backend only rewrites on a scope flush. `sentry_add_attachment`
+    adds the fully configured attachment before that flush, so the manifest
+    must contain all its metadata immediately.
+
+    Asserting on the manifest rather than on a crash envelope keeps this
+    deterministic: the in-process crash handler happens to flush the scope (via
+    `sentry__trace_finish`), which repairs the manifest before the daemon reads
+    it, but out-of-process paths such as WER never run that handler.
+    """
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+
+    cmd = run_command(str(tmp_path / "sentry_example"))
+    child = subprocess.Popen(
+        [*cmd, "log", "attach-custom-filename", "sleep"],
+        cwd=tmp_path,
+        env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+    )
+    db_dir = tmp_path / ".sentry-native"
+
+    last_manifest = None
+
+    def manifest_is_current():
+        # Validate the complete expected state against a single snapshot
+        # instead of waiting on one field and re-reading the file.
+        nonlocal last_manifest
+        paths = list(db_dir.glob("*.run/__sentry-attachments"))
+        if not paths:
+            return False
+        try:
+            unpacker = msgpack.Unpacker(raw=False)
+            unpacker.feed(paths[0].read_bytes())
+            manifest = list(unpacker)
+        except (OSError, msgpack.UnpackException):
+            # rewritten in place, so a read can catch a partial file
+            return False
+        last_manifest = manifest
+        return (
+            len(manifest) == 1
+            and manifest[0].get("filename") == "custom-name.log"
+            and manifest[0].get("content_type") == "application/zstd"
+            and manifest[0].get("path", "").endswith("CMakeCache.txt")
+        )
+
+    try:
+        up_to_date = wait_for(manifest_is_current)
+    finally:
+        child.terminate()
+        child.wait()
+
+    assert (
+        up_to_date
+    ), f"attachment manifest does not reflect the live attachment state: {last_manifest}"
+
+
+def test_native_byte_attachment_is_confined(cmake, unreachable_dsn):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+
+    cmd = run_command(str(tmp_path / "sentry_example"))
+    child = subprocess.Popen(
+        [*cmd, "log", "attachment", "sleep"],
+        cwd=tmp_path,
+        env=dict(os.environ, SENTRY_DSN=unreachable_dsn),
+    )
+    outside_path = tmp_path / ".sentry-byte-attachment"
+    confined_paths = []
+
+    def attachment_was_written():
+        nonlocal confined_paths
+        confined_paths = list((tmp_path / ".sentry-native").glob("*.run/*/bytes.bin"))
+        return outside_path.exists() or bool(confined_paths)
+
+    try:
+        assert wait_for(attachment_was_written)
+    finally:
+        child.terminate()
+        child.wait()
+
+    assert not outside_path.exists()
+    assert len(confined_paths) == 1
+    assert confined_paths[0].read_bytes() == b"\xc0\xff\xee"
 
 
 def test_native_session_tracking(cmake, httpserver):
@@ -426,7 +685,7 @@ def test_native_noncrashing_thread_unwind(cmake, httpserver):
         run_crash(
             tmp_path,
             "sentry_example",
-            ["log", "stdout", "crash"] + SANITIZER_ARGS,
+            ["log", "crash"] + SANITIZER_ARGS,
             env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
         )
     assert waiting.result
@@ -597,8 +856,8 @@ def test_native_minidump_streams(cmake, httpserver):
 
     # Find minidump
     db_dir = tmp_path / ".sentry-native"
-    assert wait_for_file(db_dir / "*.dmp")
-    minidump_files = list(db_dir.glob("*.dmp"))
+    assert wait_for_file(db_dir / "*.run/__sentry-crash.dmp")
+    minidump_files = list(db_dir.glob("*.run/__sentry-crash.dmp"))
     assert len(minidump_files) > 0
 
     dump = _parse_minidump(minidump_files[0])
@@ -747,6 +1006,10 @@ def _codesign_for_task_for_pid(*paths):
         )
 
 
+@pytest.mark.skipif(
+    is_wine,
+    reason="Wine does not capture indirectly referenced minidump memory",
+)
 def test_native_smart_mode_captures_indirect_heap_memory(cmake, httpserver):
     """
     Verify SMART minidump mode captures memory regions referenced by the
@@ -764,8 +1027,8 @@ def test_native_smart_mode_captures_indirect_heap_memory(cmake, httpserver):
         appends a chunk around each writable-heap hit to
         MemoryListStream.
       * Windows: the native backend passes
-        ``MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs``
-        to ``MiniDumpWriteDump`` so the OS does the equivalent scan.
+        ``MiniDumpWithIndirectlyReferencedMemory`` to
+        ``MiniDumpWriteDump`` so the OS does the equivalent scan.
 
     The minimal-mode fallback on macOS (when ``task_for_pid`` is
     blocked by the sandbox) silently breaks the SMART-mode contract by
@@ -804,8 +1067,8 @@ def test_native_smart_mode_captures_indirect_heap_memory(cmake, httpserver):
     assert waiting.result
 
     db_dir = tmp_path / ".sentry-native"
-    assert wait_for_file(db_dir / "*.dmp")
-    minidump_files = list(db_dir.glob("*.dmp"))
+    assert wait_for_file(db_dir / "*.run/__sentry-crash.dmp")
+    minidump_files = list(db_dir.glob("*.run/__sentry-crash.dmp"))
     assert len(minidump_files) > 0
 
     dump = _parse_minidump(minidump_files[0])
@@ -853,6 +1116,40 @@ def test_native_smart_mode_captures_indirect_heap_memory(cmake, httpserver):
     )
 
 
+def test_native_uses_existing_run(cmake):
+    """The daemon adopts the existing run instead of creating root artifacts."""
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+    cmd = run_command(str(tmp_path / "sentry_example"))
+    child = subprocess.Popen(
+        [*cmd, "log", "sleep"],
+        cwd=tmp_path,
+        env=dict(os.environ, SENTRY_DSN="https://foo@sentry.invalid/42"),
+    )
+    db_dir = tmp_path / ".sentry-native"
+
+    try:
+        assert wait_for(
+            lambda: len(list(db_dir.glob("*.run/sentry-daemon.log"))) == 1
+            and len(list(db_dir.glob("*.run.daemon.lock"))) == 1
+        )
+        run_dirs = list(db_dir.glob("*.run"))
+        daemon_logs = list(db_dir.glob("*.run/sentry-daemon.log"))
+
+        assert len(run_dirs) == 1
+        assert daemon_logs[0].parent == run_dirs[0]
+        assert len(list(db_dir.glob("*.run.daemon.lock"))) == 1
+        assert not list(db_dir.glob("sentry-daemon.log"))
+        assert not list(db_dir.glob("sentry-minidump-*"))
+        assert not list(db_dir.glob("sentry-envelope-*"))
+        assert not list(db_dir.glob("__sentry-stack*"))
+        assert not list(db_dir.glob("__sentry-modheaders"))
+    finally:
+        child.terminate()
+        child.wait()
+        # Windows cannot remove the run until the orphaned daemon releases it.
+        assert wait_for(lambda: not list(db_dir.glob("*.run.daemon.lock")))
+
+
 def test_native_cleanup(cmake):
     """Test that cleanup works properly"""
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
@@ -867,6 +1164,10 @@ def test_native_cleanup(cmake):
     # Database should exist
     db_dir = tmp_path / ".sentry-native"
     assert db_dir.exists()
+    assert not list(db_dir.glob("*.run"))
+    assert not list(db_dir.glob("*.run*.lock"))
+    assert not list(db_dir.glob("sentry-daemon.log"))
+    assert not list(db_dir.glob("sentry-minidump-*"))
 
 
 def test_native_no_dsn_no_crash(cmake):
@@ -884,7 +1185,7 @@ def test_native_no_dsn_no_crash(cmake):
     # Should not create database
     db_dir = tmp_path / ".sentry-native"
     if db_dir.exists():
-        minidump_files = list(db_dir.glob("*.dmp"))
+        minidump_files = list(db_dir.glob("*.run/*.dmp"))
         # Minidumps might still be generated for debugging
         # but won't be uploaded
 
@@ -920,12 +1221,120 @@ def test_native_external_crash_reporter(cmake, httpserver):
 
     # Verify it's a minidump crash report and user feedback
     envelope = Envelope.deserialize(crash)
-    assert envelope.headers["cache_dir"] == str(cache_dir)
+    actual_cache_dir = envelope.headers["cache_dir"]
+    if is_wine:
+        actual_cache_dir = subprocess.check_output(
+            ["winepath", "-u", actual_cache_dir], text=True
+        ).strip()
+    assert actual_cache_dir == str(cache_dir)
     assert_meta(envelope, integration="native")
     assert_breadcrumb(envelope)
 
     envelope = Envelope.deserialize(feedback)
     assert_user_feedback(envelope)
+
+
+def test_native_external_crash_reporter_consent_revoked(cmake, httpserver):
+    """With consent revoked, the daemon must not launch the external reporter.
+
+    Before the fix, crash-reporter + user-consent-revoke still spawned
+    sentry_crash_reporter, which uploaded via HTTP. Consent should block that
+    the same way it blocks the normal transport path.
+    """
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "native"}
+    )
+    cache_dir = tmp_path / ".sentry-native" / "cache"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run_crash(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "cache-keep",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        env=env,
+    )
+
+    assert len(httpserver.log) == 0
+    assert wait_for_file(cache_dir / "*.envelope")
+    assert len(list(cache_dir.glob("*.envelope"))) == 1
+
+
+def test_native_external_crash_reporter_consent_revoked_no_cache(cmake, httpserver):
+    """With consent revoked and no cache_keep, the daemon discards the crash envelope."""
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "native"}
+    )
+    cache_dir = tmp_path / ".sentry-native" / "cache"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run_crash(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        env=env,
+        wait_for_daemon=True,
+    )
+
+    assert len(httpserver.log) == 0
+    assert not cache_dir.exists() or len(list(cache_dir.glob("*.envelope"))) == 0
+
+
+def test_native_external_crash_reporter_consent_flush(cmake, httpserver):
+    """Cached crash envelope uploads once consent is given."""
+    tmp_path = cmake(
+        ["sentry_example", "sentry_crash_reporter"], {"SENTRY_BACKEND": "native"}
+    )
+    cache_dir = tmp_path / ".sentry-native" / "cache"
+    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+
+    run_crash(
+        tmp_path,
+        "sentry_example",
+        [
+            "log",
+            "crash-reporter",
+            "cache-keep",
+            "http-retry",
+            "require-user-consent",
+            "user-consent-revoke",
+            "crash",
+        ],
+        env=env,
+    )
+
+    assert wait_for_file(cache_dir / "*.envelope")
+    assert len(list(cache_dir.glob("*.envelope"))) == 1
+    assert len(httpserver.log) == 0
+
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+    with httpserver.wait(timeout=10) as waiting:
+        run(
+            tmp_path,
+            "sentry_example",
+            [
+                "log",
+                "cache-keep",
+                "http-retry",
+                "require-user-consent",
+                "user-consent-give",
+            ],
+            env=env,
+        )
+    assert waiting.result
+    assert len(list(cache_dir.glob("*.envelope"))) == 0
 
 
 def test_crash_mode_minidump_only(cmake, httpserver):
@@ -955,6 +1364,14 @@ def test_crash_mode_minidump_only(cmake, httpserver):
     assert has_minidump, "Minidump mode should include minidump"
 
 
+@pytest.mark.xfail(
+    bool(os.environ.get("TEST_MINGW")),
+    reason="DbgHelp cannot read MinGW DWARF symbols",
+    raises=pytest.RaisesExc(
+        AssertionError, match="^missing symbolicated function names"
+    ),
+    strict=True,
+)
 def test_crash_mode_native_only(cmake, httpserver):
     """Mode 2: Should produce envelope with native stacktrace, no minidump"""
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
@@ -994,11 +1411,10 @@ def test_crash_mode_native_only(cmake, httpserver):
     for frame in exc["stacktrace"]["frames"]:
         assert "instruction_addr" in frame
 
-    if sys.platform == "win32" or sys.platform == "linux":
-        # At least some frames should have symbolicated function names
-        assert any(
-            frame.get("function") is not None for frame in exc["stacktrace"]["frames"]
-        )
+    # At least some frames should have symbolicated function names
+    assert any(
+        frame.get("function") is not None for frame in exc["stacktrace"]["frames"]
+    ), "missing symbolicated function names"
 
     # Should have debug_meta
     assert "debug_meta" in event
@@ -1007,6 +1423,14 @@ def test_crash_mode_native_only(cmake, httpserver):
         assert_debug_meta_images_do_not_overlap(event)
 
 
+@pytest.mark.xfail(
+    bool(os.environ.get("TEST_MINGW")),
+    reason="DbgHelp cannot read MinGW DWARF symbols",
+    raises=pytest.RaisesExc(
+        AssertionError, match="^missing symbolicated function names"
+    ),
+    strict=True,
+)
 def test_crash_mode_native_with_minidump(cmake, httpserver):
     """Mode 3 (default): Should have both native stacktrace AND minidump"""
     tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
@@ -1041,11 +1465,11 @@ def test_crash_mode_native_with_minidump(cmake, httpserver):
     assert exc["mechanism"]["type"] == "signalhandler"
     assert "stacktrace" in exc
     assert len(exc["stacktrace"]["frames"]) > 0
-    if sys.platform == "win32" or sys.platform == "linux":
-        # At least some frames should have symbolicated function names
-        assert any(
-            frame.get("function") is not None for frame in exc["stacktrace"]["frames"]
-        )
+
+    # At least some frames should have symbolicated function names
+    assert any(
+        frame.get("function") is not None for frame in exc["stacktrace"]["frames"]
+    ), "missing symbolicated function names"
 
     # Should have debug_meta
     assert "debug_meta" in event
@@ -1053,77 +1477,79 @@ def test_crash_mode_native_with_minidump(cmake, httpserver):
         assert_debug_meta_images_do_not_overlap(event)
 
 
-def test_native_cache_consent(cmake, httpserver):
-    """Daemon honors revoked consent: envelope is cached, not sent. Giving
-    consent in a subsequent run flushes the cached envelope."""
-    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
-    cache_dir = tmp_path / ".sentry-native" / "cache"
-    env = dict(os.environ, SENTRY_DSN=make_dsn(httpserver))
+@pytest.mark.skipif(
+    sys.platform != "win32" or bool(os.environ.get("TEST_MINGW")),
+    reason="PDB tests are only available in MSVC Windows builds",
+)
+@pytest.mark.parametrize(
+    "build_args",
+    [
+        {},  # with PDBs
+        {
+            # without PDBs (remove CMake's MSVC /debug defaults to disable PDBs)
+            "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "",
+            "CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO": "",
+        },
+    ],
+)
+@pytest.mark.parametrize(
+    "run_args",
+    [
+        ["capture-event", "add-stacktrace"],
+        ["log", "crash"],
+    ],
+)
+def test_native_pdb(cmake, httpserver, build_args, run_args):
+    build_args.update({"SENTRY_BACKEND": "native"})
+    tmp_path = cmake(["sentry_example"], build_args)
 
-    # 1) Crash while consent is revoked. Envelope is cached, no upload.
-    run_crash(
-        tmp_path,
-        "sentry_example",
-        [
-            "log",
-            "stdout",
-            "cache-keep",
-            "http-retry",
-            "require-user-consent",
-            "user-consent-revoke",
-            "crash",
-        ],
-        env=env,
-    )
+    has_pdb = build_args.get("CMAKE_SHARED_LINKER_FLAGS_DEBUG") != ""
+    if has_pdb:
+        assert (tmp_path / "sentry.pdb").is_file()
+    else:
+        assert not (tmp_path / "sentry.pdb").is_file()
 
-    assert wait_for_file(cache_dir / "*.envelope")
-    assert len(list(cache_dir.glob("*.envelope"))) == 1
-    assert len(httpserver.log) == 0
-
-    # 2) Give consent. The cached envelope should be flushed to the server.
     httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
     with httpserver.wait(timeout=10) as waiting:
-        run(
+        runner = run_crash if "crash" in run_args else run
+        runner(
             tmp_path,
             "sentry_example",
-            [
-                "log",
-                "cache-keep",
-                "http-retry",
-                "require-user-consent",
-                "user-consent-give",
-            ],
-            env=env,
+            run_args,
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
         )
     assert waiting.result
-    assert len(list(cache_dir.glob("*.envelope"))) == 0
 
-
-@pytest.mark.parametrize("cache_keep", [True, False])
-def test_native_cache_keep(cmake, cache_keep, unreachable_dsn):
-    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
-    db_dir = tmp_path / ".sentry-native"
-    cache_dir = db_dir / "cache"
-    env = dict(os.environ, SENTRY_DSN=unreachable_dsn)
-
-    # crash -> daemon sends via HTTP -> unreachable -> cache
-    run_crash(
-        tmp_path,
-        "sentry_example",
-        ["log", "stdout", "crash"] + (["cache-keep"] if cache_keep else []),
-        env=env,
-        wait_for_daemon=not cache_keep,
+    envelope = Envelope.deserialize(httpserver.log[0][0].get_data())
+    event = envelope.get_event()
+    stacks = [
+        value.get("stacktrace", {})
+        for value in (
+            event.get("threads", {}).get("values", [])
+            + event.get("exception", {}).get("values", [])
+        )
+    ]
+    assert stacks
+    image = next(
+        image
+        for image in event["debug_meta"]["images"]
+        if image["code_file"].lower().endswith("\\" + lib_name("sentry"))
     )
-
-    if cache_keep:
-        assert wait_for_file(cache_dir / "*.envelope")
-        cache_files = list(cache_dir.glob("*.envelope"))
-        assert len(cache_files) == 1
-        dmp_files = list(cache_dir.glob("*.dmp"))
-        assert len(dmp_files) == 1
-        assert cache_files[0].stem == dmp_files[0].stem
+    start = int(image["image_addr"], 16)
+    end = start + image["image_size"]
+    frames = [
+        frame
+        for stack in stacks
+        for frame in stack.get("frames", [])
+        if start <= int(frame["instruction_addr"], 16) < end
+    ]
+    assert frames
+    if has_pdb:
+        assert any("function" in frame for frame in frames), frames
+        assert any("symbol_addr" in frame for frame in frames), frames
     else:
-        assert len(list(cache_dir.glob("*.envelope"))) == 0
+        assert all("function" not in frame for frame in frames), frames
+        assert all("symbol_addr" not in frame for frame in frames), frames
 
 
 def test_native_restart_on_crash(cmake, httpserver):
@@ -1206,3 +1632,45 @@ def test_native_replay_orphan_not_flushed(cmake, httpserver):
         assert not is_replay_envelope(req.get_data())
     assert (replays / f"replay-{REPLAY_ID}.mp4").exists()
     assert (replays / f"replay-{REPLAY_ID}.json").exists()
+
+
+def test_native_early_init(cmake):
+    tmp_path = cmake(
+        ["sentry_early_init"],
+        {
+            "SENTRY_BACKEND": "native",
+            "SENTRY_TRANSPORT": "none",
+            "BUILD_SHARED_LIBS": "OFF",
+        },
+    )
+
+    result = run(
+        tmp_path,
+        "sentry_early_init",
+        [],
+    )
+    assert result.returncode == 0
+
+
+@pytest.mark.parametrize("crash_arg", ["crash", "abort"])
+def test_native_reinstall(cmake, httpserver, crash_arg):
+    tmp_path = cmake(["sentry_example"], {"SENTRY_BACKEND": "native"})
+
+    httpserver.expect_oneshot_request("/api/123456/envelope/").respond_with_data("OK")
+
+    with httpserver.wait(timeout=10) as waiting:
+        run_crash(
+            tmp_path,
+            "sentry_example",
+            ["log", "attachment", "reinstall", crash_arg, *SANITIZER_ARGS],
+            env=dict(os.environ, SENTRY_DSN=make_dsn(httpserver)),
+        )
+    assert waiting.result
+
+    assert len(httpserver.log) == 1
+    envelope = Envelope.deserialize(httpserver.log[0][0].get_data())
+    assert_native_crash(envelope)
+    assert_breadcrumb(envelope)
+    assert_attachment(envelope)
+    breadcrumbs = envelope.get_event()["breadcrumbs"]
+    assert sum(crumb.get("message") == "debug crumb" for crumb in breadcrumbs) == 1

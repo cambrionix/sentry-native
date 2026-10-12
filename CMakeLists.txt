@@ -49,6 +49,16 @@ if(NOT SENTRY_VERSION_FULL OR NOT SENTRY_VERSION_BASE OR SENTRY_VERSION_MAJOR ST
     message(FATAL_ERROR "Parsed Sentry SDK version '${SENTRY_VERSION_FULL}' does not match expected semver format")
 endif()
 
+# Set -m32 before project() so CMake detects i386 library paths.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+	option(SENTRY_BUILD_FORCE32 "Force a 32bit compile on a 64bit host" OFF)
+	if(SENTRY_BUILD_FORCE32)
+		set(CMAKE_C_FLAGS_INIT    "${CMAKE_C_FLAGS_INIT} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
+		set(CMAKE_CXX_FLAGS_INIT  "${CMAKE_CXX_FLAGS_INIT} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
+		set(CMAKE_ASM_FLAGS_INIT  "${CMAKE_ASM_FLAGS_INIT} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
+	endif()
+endif()
+
 project(Sentry-Native
 	LANGUAGES C CXX
 	VERSION ${SENTRY_VERSION_BASE}
@@ -115,6 +125,9 @@ option(SENTRY_BUILD_TESTS "Build sentry-native tests" "${SENTRY_MAIN_PROJECT}")
 option(SENTRY_BUILD_EXAMPLES "Build sentry-native example(s)" "${SENTRY_MAIN_PROJECT}")
 option(SENTRY_BUILD_BENCHMARKS "Build sentry-native benchmarks" OFF)
 
+option(SENTRY_INTEGRATION_PLATFORM
+	"Enable the downstream-provided platform integration" OFF)
+
 # Platform version embedding options
 option(SENTRY_EMBED_INFO "Embed version information in binary" OFF)
 set(SENTRY_BUILD_PLATFORM "${CMAKE_SYSTEM_NAME}" CACHE STRING "Platform name for embedded version (e.g., switch, playstation, xbox)")
@@ -149,15 +162,9 @@ if(MSVC)
 	set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} /utf-8")
 endif()
 
-if(LINUX)
-	option(SENTRY_BUILD_FORCE32 "Force a 32bit compile on a 64bit host" OFF)
-	if(SENTRY_BUILD_FORCE32)
-		set(CMAKE_C_FLAGS    "${CMAKE_C_FLAGS} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
-		set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
-		set(CMAKE_ASM_FLAGS  "${CMAKE_ASM_FLAGS} -m32 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE64_SOURCE")
-		set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS OFF)
-		set(CMAKE_SYSTEM_PROCESSOR "i686")
-	endif()
+if(LINUX AND SENTRY_BUILD_FORCE32)
+	set_property(GLOBAL PROPERTY FIND_LIBRARY_USE_LIB64_PATHS OFF)
+	set(CMAKE_SYSTEM_PROCESSOR "i686")
 endif()
 
 # CMAKE_POSITION_INDEPENDENT_CODE must be set BEFORE adding any libraries (including subprojects)
@@ -264,8 +271,6 @@ elseif(SENTRY_BACKEND STREQUAL "inproc")
 elseif(SENTRY_BACKEND STREQUAL "breakpad")
 	set(SENTRY_BACKEND_BREAKPAD TRUE)
 elseif(SENTRY_BACKEND STREQUAL "native")
-	message(WARNING "The 'native' backend is experimental and under active development. "
-		"It may have incomplete features or unexpected behavior.")
 	set(SENTRY_BACKEND_NATIVE TRUE)
 elseif(SENTRY_BACKEND STREQUAL "none")
 	set(SENTRY_BACKEND_NONE TRUE)
@@ -284,6 +289,12 @@ endif()
 
 set(SENTRY_SDK_NAME "" CACHE STRING "The SDK name to report when sending events.")
 set(SENTRY_HANDLER_STACK_SIZE 64 CACHE STRING "The stack size (in KiB) that should be reserved for the crash handler.")
+set(SENTRY_BATCHER_BUFFER_COUNT 3 CACHE STRING "Number of 100-item telemetry buffers (2-10).")
+if(NOT SENTRY_BATCHER_BUFFER_COUNT MATCHES "^[0-9]+$"
+	OR SENTRY_BATCHER_BUFFER_COUNT LESS 2
+	OR SENTRY_BATCHER_BUFFER_COUNT GREATER 10)
+	message(FATAL_ERROR "SENTRY_BATCHER_BUFFER_COUNT must be an integer between 2 and 10")
+endif()
 if (WIN32)
 	set(SENTRY_THREAD_STACK_GUARANTEE_FACTOR 10 CACHE STRING "The factor by which a threads stack should be larger than the stack guarantee for its handler.")
 	option(SENTRY_THREAD_STACK_GUARANTEE_AUTO_INIT "Automatically sets the thread stack guarantee for each thread via `DllMain` or for the `sentry_init()` when building statically" ON)
@@ -294,7 +305,9 @@ message(STATUS "SENTRY_TRANSPORT=${SENTRY_TRANSPORT}")
 message(STATUS "SENTRY_BACKEND=${SENTRY_BACKEND}")
 message(STATUS "SENTRY_LIBRARY_TYPE=${SENTRY_LIBRARY_TYPE}")
 message(STATUS "SENTRY_SDK_NAME=${SENTRY_SDK_NAME}")
+message(STATUS "SENTRY_INTEGRATION_PLATFORM=${SENTRY_INTEGRATION_PLATFORM}")
 message(STATUS "SENTRY_HANDLER_STACK_SIZE=${SENTRY_HANDLER_STACK_SIZE}")
+message(STATUS "SENTRY_BATCHER_BUFFER_COUNT=${SENTRY_BATCHER_BUFFER_COUNT}")
 if (WIN32)
 	message(STATUS "SENTRY_THREAD_STACK_GUARANTEE_FACTOR=${SENTRY_THREAD_STACK_GUARANTEE_FACTOR}")
 	message(STATUS "SENTRY_THREAD_STACK_GUARANTEE_AUTO_INIT=${SENTRY_THREAD_STACK_GUARANTEE_AUTO_INIT}")
@@ -367,7 +380,7 @@ endfunction()
 
 # ===== sentry library =====
 
-add_library(sentry ${SENTRY_LIBRARY_TYPE} "${PROJECT_SOURCE_DIR}/vendor/mpack.c")
+add_library(sentry ${SENTRY_LIBRARY_TYPE} "${PROJECT_SOURCE_DIR}/src/sentry_mpack.c")
 if (XBOX)
 	set_target_properties(sentry PROPERTIES VS_USER_PROPS gdk_build.props)
 endif()
@@ -414,7 +427,12 @@ endif()
 
 add_subdirectory(src)
 
+if(SENTRY_INTEGRATION_PLATFORM)
+	target_compile_definitions(sentry PRIVATE SENTRY_INTEGRATION_PLATFORM)
+endif()
+
 target_compile_definitions(sentry PRIVATE SENTRY_HANDLER_STACK_SIZE=${SENTRY_HANDLER_STACK_SIZE})
+target_compile_definitions(sentry PRIVATE SENTRY_BATCHER_BUFFER_COUNT=${SENTRY_BATCHER_BUFFER_COUNT})
 if(WIN32)
 	target_compile_definitions(sentry PRIVATE SENTRY_THREAD_STACK_GUARANTEE_FACTOR=${SENTRY_THREAD_STACK_GUARANTEE_FACTOR})
 	if (SENTRY_THREAD_STACK_GUARANTEE_AUTO_INIT)
@@ -488,12 +506,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "OS400")
 	target_link_libraries(sentry PRIVATE util)
 endif()
 
+set(SENTRY_LINK_CURL "AUTO" CACHE STRING "Link curl library")
+set_property(CACHE SENTRY_LINK_CURL PROPERTY STRINGS AUTO ON OFF)
+
+set(_SENTRY_LINK_CURL ${SENTRY_LINK_CURL})
+if(_SENTRY_LINK_CURL STREQUAL "AUTO")
+	set(_SENTRY_LINK_CURL ON)
+elseif(NOT _SENTRY_LINK_CURL STREQUAL "ON" AND NOT _SENTRY_LINK_CURL STREQUAL "OFF")
+	message(FATAL_ERROR "SENTRY_LINK_CURL must be one of AUTO, ON, or OFF.")
+endif()
+
+function(sentry_target_link_curl TARGET LINK_CURL)
+	if(LINK_CURL)
+		target_compile_definitions(${TARGET} PRIVATE SENTRY_LINK_CURL)
+		target_link_libraries(${TARGET} PRIVATE CURL::libcurl)
+	else()
+		target_include_directories(${TARGET} PRIVATE
+			$<TARGET_PROPERTY:CURL::libcurl,INTERFACE_INCLUDE_DIRECTORIES>
+			${CURL_INCLUDE_DIRS}
+		)
+	endif()
+endfunction()
+
 if(SENTRY_TRANSPORT_CURL)
 	if(NOT TARGET CURL::libcurl) # Some other lib might bring libcurl already
 		find_package(CURL REQUIRED)
 	endif()
 
-	target_link_libraries(sentry PRIVATE CURL::libcurl)
+	sentry_target_link_curl(sentry ${_SENTRY_LINK_CURL})
 endif()
 
 if(SENTRY_TRANSPORT_COMPRESSION)
@@ -524,7 +564,7 @@ if(MSVC)
 	endif()
 	# ignore all warnings for mpack
 	set_source_files_properties(
-		"${PROJECT_SOURCE_DIR}/vendor/mpack.c"
+		"${PROJECT_SOURCE_DIR}/src/sentry_mpack.c"
 		PROPERTIES
 		COMPILE_FLAGS
 		"/W0"
@@ -567,7 +607,7 @@ else()
 	endif()
 	# ignore all warnings for mpack
 	set_source_files_properties(
-		"${PROJECT_SOURCE_DIR}/vendor/mpack.c"
+		"${PROJECT_SOURCE_DIR}/src/sentry_mpack.c"
 		PROPERTIES
 		COMPILE_FLAGS
 		"-w"
@@ -621,6 +661,11 @@ if(ANDROID)
 	set(_SENTRY_PLATFORM_LIBS "dl" "log")
 elseif(LINUX)
 	set(_SENTRY_PLATFORM_LIBS "dl" "rt")
+	sentry_find_atomic_library(_SENTRY_ATOMIC_LIBRARY)
+	if(_SENTRY_ATOMIC_LIBRARY)
+		list(APPEND _SENTRY_PLATFORM_LIBS "${_SENTRY_ATOMIC_LIBRARY}")
+	endif()
+	unset(_SENTRY_ATOMIC_LIBRARY)
 elseif(WIN32)
 	if (XBOX)
 		set(_SENTRY_PLATFORM_LIBS "version")
@@ -832,12 +877,46 @@ elseif(SENTRY_BACKEND_NATIVE)
 	# Build sentry-crash executable for native backend
 	# Get all sources that were added to sentry target
 	get_target_property(SENTRY_SOURCES sentry SOURCES)
+	# Exclude integrations that are not needed in the daemon
+	list(FILTER SENTRY_SOURCES EXCLUDE REGEX "[/\\\\]integrations[/\\\\]")
 
-	# Create daemon executable with same sources (already includes
-	# sentry_crash_daemon.c and sentry_crash_ipc.c from src/CMakeLists.txt)
+	# Create daemon executable with same SDK sources
 	add_executable(sentry-crash
 		${SENTRY_SOURCES}
 	)
+
+	# Add daemon-only sources not built into libsentry.so
+	sentry_target_sources_cwd(sentry-crash SUBDIR src
+		backends/native/sentry_crash_daemon.c
+		backends/native/minidump/sentry_minidump_format.h
+		backends/native/minidump/sentry_minidump_writer.h
+	)
+
+	# Remote unwinding (Linux only — uses libunwind ptrace accessors)
+	if(LINUX)
+		sentry_target_sources_cwd(sentry-crash SUBDIR src
+			unwinder/sentry_unwinder_libunwind_remote.c
+		)
+	endif()
+
+	# Platform-specific minidump writers
+	if(LINUX OR ANDROID)
+		sentry_target_sources_cwd(sentry-crash SUBDIR src
+			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_indirect.c
+			backends/native/minidump/sentry_minidump_linux.c
+		)
+	elseif(APPLE)
+		sentry_target_sources_cwd(sentry-crash SUBDIR src
+			backends/native/minidump/sentry_minidump_common.c
+			backends/native/minidump/sentry_minidump_indirect.c
+			backends/native/minidump/sentry_minidump_macos.c
+		)
+	elseif(WIN32)
+		sentry_target_sources_cwd(sentry-crash SUBDIR src
+			backends/native/minidump/sentry_minidump_windows.c
+		)
+	endif()
 
 	# Copy all compile definitions from sentry target so shared sources
 	# compile under identical preprocessor conditions (backend, transport,
@@ -845,7 +924,8 @@ elseif(SENTRY_BACKEND_NATIVE)
 	get_target_property(SENTRY_COMPILE_DEFS sentry COMPILE_DEFINITIONS)
 	if(SENTRY_COMPILE_DEFS)
 		# The daemon is always a static executable, never a shared library
-		list(REMOVE_ITEM SENTRY_COMPILE_DEFS "SENTRY_BUILD_SHARED")
+		list(REMOVE_ITEM SENTRY_COMPILE_DEFS "SENTRY_BUILD_SHARED" "SENTRY_LINK_CURL")
+		list(FILTER SENTRY_COMPILE_DEFS EXCLUDE REGEX "^SENTRY_INTEGRATION_")
 		target_compile_definitions(sentry-crash PRIVATE ${SENTRY_COMPILE_DEFS})
 	endif()
 
@@ -879,7 +959,11 @@ elseif(SENTRY_BACKEND_NATIVE)
 
 	# Transport-specific libraries
 	if(SENTRY_TRANSPORT_CURL)
-		target_link_libraries(sentry-crash PRIVATE CURL::libcurl)
+		set(_SENTRY_CRASH_LINK_CURL ${_SENTRY_LINK_CURL})
+		if(SENTRY_LINK_CURL STREQUAL "AUTO" AND UNIX)
+			set(_SENTRY_CRASH_LINK_CURL OFF)
+		endif()
+		sentry_target_link_curl(sentry-crash ${_SENTRY_CRASH_LINK_CURL})
 	endif()
 
 	if(SENTRY_TRANSPORT_WINHTTP)
@@ -952,6 +1036,14 @@ if(SENTRY_INTEGRATION_QT)
 	target_link_libraries(sentry PRIVATE Qt${Qt_VERSION_MAJOR}::Core)
 endif()
 
+option(SENTRY_INTEGRATION_WER "Build WER (Windows Error Reporting) integration")
+if(SENTRY_INTEGRATION_WER AND WIN32
+		AND (SENTRY_BACKEND_BREAKPAD OR SENTRY_BACKEND_CRASHPAD))
+	message(WARNING
+		"SENTRY_BACKEND=${SENTRY_BACKEND} is not compatible with WER. "
+		"Use SENTRY_BACKEND=none, inproc, or native with SENTRY_INTEGRATION_WER.")
+endif()
+
 include(CMakePackageConfigHelpers)
 configure_package_config_file(sentry-config.cmake.in sentry-config.cmake
 	INSTALL_DESTINATION "${CMAKE_INSTALL_CMAKEDIR}")
@@ -986,12 +1078,20 @@ endif()
 if(SENTRY_BUILD_TESTS)
 	add_subdirectory(tests/unit)
 	add_subdirectory(tests/fixtures/crash_reporter)
+	add_subdirectory(tests/fixtures/early_init)
+	if(SENTRY_INTEGRATION_PLATFORM AND SENTRY_MAIN_PROJECT)
+		add_subdirectory(tests/fixtures/test_platform)
+	endif()
 	add_subdirectory(tests/fixtures/screenshot)
+	if(WIN32 AND NOT XBOX)
+		add_subdirectory(tests/fixtures/appx)
+	endif()
 	if(SENTRY_BUILD_BENCHMARKS)
 		set(BENCHMARK_ENABLE_TESTING OFF)
 		set(BENCHMARK_ENABLE_GTEST_TESTS OFF)
 		add_subdirectory(external/benchmark)
 		add_subdirectory(tests/benchmark)
+		add_subdirectory(tests/fixtures/stack_usage)
 	endif()
 endif()
 

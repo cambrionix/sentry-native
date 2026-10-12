@@ -21,6 +21,37 @@ sentry__path_from_str(const char *s)
     return s ? sentry__path_from_str_n(s, strlen(s)) : NULL;
 }
 
+const char *
+sentry__path_filename_from_str_n(const char *path, size_t path_len)
+{
+    if (!path) {
+        return NULL;
+    }
+
+    const char *filename = path;
+#ifdef SENTRY_PLATFORM_WINDOWS
+    if (path_len > 1 && path[1] == ':') {
+        filename = path + 2;
+    }
+#endif
+    for (size_t i = 0; i < path_len; i++) {
+        if (path[i] == '/'
+#ifdef SENTRY_PLATFORM_WINDOWS
+            || path[i] == '\\'
+#endif
+        ) {
+            filename = path + i + 1;
+        }
+    }
+    return filename;
+}
+
+const char *
+sentry__path_filename_from_str(const char *path)
+{
+    return sentry__path_filename_from_str_n(path, sentry__guarded_strlen(path));
+}
+
 sentry_path_t *
 sentry__path_from_str_owned(char *s)
 {
@@ -102,13 +133,24 @@ sentry__path_unique(const sentry_path_t *dir, const char *basename)
             snprintf(
                 buf, sizeof(buf), "%.*s-%d%s", (int)stem_len, basename, n, ext);
         }
-        sentry_path_t *candidate = sentry__path_join_str(dir, buf);
+        sentry_path_t *candidate = sentry__path_join_filename(dir, buf);
         if (!candidate || !sentry__path_is_file(candidate)) {
             return candidate;
         }
         sentry__path_free(candidate);
     }
     return NULL;
+}
+
+sentry_path_t *
+sentry__path_join_filename(const sentry_path_t *dir, const char *filename)
+{
+    if (!dir || sentry__string_empty(filename)
+        || sentry__string_eq(filename, ".") || sentry__string_eq(filename, "..")
+        || sentry__path_filename_from_str(filename) != filename) {
+        return NULL;
+    }
+    return sentry__path_join_str(dir, filename);
 }
 
 sentry_filelock_t *

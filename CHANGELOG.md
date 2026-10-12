@@ -1,5 +1,290 @@
 # Changelog
 
+## 0.17.2
+
+**Features**:
+
+- Add `SENTRY_SDK_VERSION_MAJOR`, `SENTRY_SDK_VERSION_MINOR`, `SENTRY_SDK_VERSION_PATCH`, and `SENTRY_SDK_VERSION_AT_LEAST` for compile-time version checks. ([#2136](https://github.com/getsentry/sentry-native/pull/2136))
+- Let downstream platform integrations supply the installation ID. ([#2150](https://github.com/getsentry/sentry-native/pull/2150))
+- Native/Crashpad/Linux: Add `max_stack_capture_size` option to limit non-crashing thread stack capture size. ([#2137](https://github.com/getsentry/sentry-native/pull/2137), [crashpad#172](https://github.com/getsentry/crashpad/pull/172))
+- Add `sentry_value_from_json`, `sentry_value_from_msgpack`, and `sentry_value_from_msgpack_stream` alongside the existing JSON and MessagePack serialization APIs to provide public bidirectional APIs for serializing and deserializing sentry values as JSON and MessagePack. ([#2153](https://github.com/getsentry/sentry-native/pull/2153))
+
+**Fixes**:
+
+- Crashpad: avoid logging expected report lock contention ([crashpad#171](https://github.com/getsentry/crashpad/pull/171), [#2138](https://github.com/getsentry/sentry-native/pull/2138))
+- Start telemetry pool and batcher threads on demand, avoiding unnecessary worker threads for applications that do not send logs or metrics. ([#2144](https://github.com/getsentry/sentry-native/pull/2144), [#2145](https://github.com/getsentry/sentry-native/pull/2145))
+- Discard log and metric batches when the serialization pool is full instead of blocking the batcher threads with synchronous serialization. ([#2148](https://github.com/getsentry/sentry-native/pull/2148))
+- Restore the installation ID as the default `user.id` when removing the global user with `sentry_remove_user`. ([#2151](https://github.com/getsentry/sentry-native/pull/2151))
+- Unbind a finished span from the scope even when the span is dropped. ([#2158](https://github.com/getsentry/sentry-native/pull/2158))
+- Native: fix `sentry_reinstall_backend` to reinstall crash handlers without restarting the backend. ([#2159](https://github.com/getsentry/sentry-native/pull/2159))
+- Validate attachment reference paths before TUS upload and cleanup to prevent path traversal and unintended file uploads or deletions. ([#2165](https://github.com/getsentry/sentry-native/pull/2165))
+
+**Thank you**:
+
+- [IanHollow](https://github.com/IanHollow)
+- [cerisier](https://github.com/cerisier)
+
+## 0.17.1
+
+**Fixes**:
+
+- Fix crash context missing from PlayStation crash reports when an `on_crash` callback is set. ([#2133](https://github.com/getsentry/sentry-native/pull/2133))
+
+## 0.17.0
+
+**Breaking / Important behavior changes**:
+
+- Attachment APIs now use `sentry_value_t` and `sentry_uuid_t` instead of `sentry_attachment_t *` handles. Most attachment APIs, function names and arguments, are otherwise unchanged. ([#1974](https://github.com/getsentry/sentry-native/pull/1974))
+- `sentry_init()` now consumes `<db>/last_crash` after caching its value, aligning crashed-last-run behavior with other Sentry SDKs. ([#2023](https://github.com/getsentry/sentry-native/pull/2023))
+- Change the `hint` parameter of `before_send` callbacks (`sentry_event_function_t`) from `void *` to `sentry_hint_t *`. Update callbacks registered with `sentry_options_set_before_send` to use the new parameter type. ([#2099](https://github.com/getsentry/sentry-native/pull/2099))
+- Add a `sentry_hint_t *hint` argument to `on_crash` callbacks. ([#2112](https://github.com/getsentry/sentry-native/pull/2112))
+- Add a `sentry_hint_t *hint` argument to `sentry_scope_capture_event`. Pass `NULL` if no hint is needed. ([#2099](https://github.com/getsentry/sentry-native/pull/2099))
+- Remove `sentry_options_get/set_enable_logs` and `sentry_options_get/set_enable_metrics`. ([#1980](https://github.com/getsentry/sentry-native/pull/1980))
+  > Structured logs and metrics have been enabled by default since `0.13`, and the options were deprecated and made no-ops in `0.16`.
+  >
+  > We recognize that this change may inconvenience applications that rely on the opt-out. Use `sentry_options_set_before_send_log` or `sentry_options_set_before_send_metric` to filter logs or metrics. We made this tradeoff deliberately because consistent behavior across SDK integrations will help most users successfully adopt these features.
+
+**Features**:
+
+- Add `sentry_attachment_from_file/bytes` (and their wide-string variants) for creating attachment values that can be fully configured before they are added. ([#2079](https://github.com/getsentry/sentry-native/pull/2079))
+- Add `sentry_add_attachment`, `sentry_scope_add_attachment`, and `sentry_hint_add_attachment` for adding configured attachments to the global scope, a specific scope, or a hint. These functions consume and freeze the attachment value. ([#2079](https://github.com/getsentry/sentry-native/pull/2079), [#1974](https://github.com/getsentry/sentry-native/pull/1974))
+- Add `sentry_start_new_trace()` as a clearer name for starting a new trace. ([#2095](https://github.com/getsentry/sentry-native/pull/2095))
+- Add hint support to `sentry_scope_capture_event` to pass event-specific attachments. The hint is also passed to `before_send` and `on_crash`, which can modify attachments before the event is sent. ([#2099](https://github.com/getsentry/sentry-native/pull/2099), [#2112](https://github.com/getsentry/sentry-native/pull/2112))
+- Add `sentry_hint_get_attachments`, `sentry_hint_remove_attachment`, and `sentry_hint_clear_attachments`. ([#2099](https://github.com/getsentry/sentry-native/pull/2099))
+
+**Fixes**:
+
+- Reduce lock contention for multi-threaded log and metric capture by allowing concurrent reads of scope data, and reusing a single options reference throughout each capture. ([#2091](https://github.com/getsentry/sentry-native/pull/2091), [#2094](https://github.com/getsentry/sentry-native/pull/2094))
+
+**Other changes**:
+
+- Promote structured logs and metrics APIs to stable. ([#2101](https://github.com/getsentry/sentry-native/pull/2101))
+
+**Deprecations**:
+
+- Deprecate `sentry_clear_crashed_last_run()` because `sentry_init()` now consumes the marker automatically. ([#2023](https://github.com/getsentry/sentry-native/pull/2023))
+- Deprecate `sentry_regenerate_trace()` in favor of `sentry_start_new_trace()`. ([#2095](https://github.com/getsentry/sentry-native/pull/2095))
+
+## 0.16.8
+
+**Features**:
+
+- Add `sentry_options_set_initial_scope` for configuring scope data before the crash backend is started, including out-of-process crash handlers. ([#2087](https://github.com/getsentry/sentry-native/pull/2087))
+
+**Fixes**:
+
+- Respect independent rate limits for feedback, logs, metrics, and attachments instead of dropping them during error backoff. ([#2109](https://github.com/getsentry/sentry-native/pull/2109))
+
+**Thank you**:
+
+- [nathan-white-mojang](https://github.com/nathan-white-mojang)
+
+## 0.16.7
+
+**Important**:
+
+This version was accidentally released from `master` and includes breaking changes intended for `0.17`. It is superseded by `0.16.8`, which restores compatibility with `0.16.6` and includes the intended hotfixes.
+
+See https://github.com/getsentry/sentry-native/releases/tag/0.16.7 for the original changelog.
+
+## 0.16.6
+
+**Features**:
+
+- Add `sentry_is_enabled` for checking whether the SDK has been initialized. ([#2045](https://github.com/getsentry/sentry-native/pull/2045))
+- Add `sentry_event_set_level` for setting the level of an individual event. ([#2038](https://github.com/getsentry/sentry-native/pull/2038))
+
+**Fixes**:
+
+- Native/Windows: prevent out-of-bounds PE debug-directory parsing. ([#2062](https://github.com/getsentry/sentry-native/pull/2062))
+- Native/Linux: parse minidump-writer ELF build-id notes with `sentry__elf_find_note`. ([#2055](https://github.com/getsentry/sentry-native/pull/2055))
+- Native/Linux: prevent malformed ELF metadata from bypassing module address bounds checks through integer overflow or underflow. ([#2064](https://github.com/getsentry/sentry-native/pull/2064))
+- Native: Read frame records at pointer width in the crash daemon's frame-pointer walk, so 32-bit targets no longer read two stack slots per pointer. ([#2052](https://github.com/getsentry/sentry-native/pull/2052))
+- Native: Report ARM32 registers for Linux crash events, and walk both r11-based ARM32 frame-record shapes (GCC's and clang's; Thumb r7 chains are not walked) in the crash daemon. ([#2053](https://github.com/getsentry/sentry-native/pull/2053))
+- Prevent backend state races when `sentry_reinstall_backend` runs concurrently with scope observer callbacks. ([#2041](https://github.com/getsentry/sentry-native/pull/2041))
+- Native: clean up stale envelopes after crashes with `SENTRY_TRANSPORT=none`. ([#2049](https://github.com/getsentry/sentry-native/pull/2049))
+- `sentry_set_trace` omits `parent_span_id` when the caller does not provide one, instead of serializing it as `null`. ([#2047](https://github.com/getsentry/sentry-native/pull/2047))
+- Native/Linux i386: write valid thread stack descriptors to minidumps when stack addresses use the upper half of the 32-bit address space. ([#2054](https://github.com/getsentry/sentry-native/pull/2054))
+- Native/Linux: cap ELF metadata section reads when resolving module SONAMEs. ([#2066](https://github.com/getsentry/sentry-native/pull/2066))
+- Linux/ARM32: fix builds on 32-bit ARM systems, including 32-bit Raspberry Pi OS installations running a 64-bit kernel. ([#2063](https://github.com/getsentry/sentry-native/pull/2063))
+- Guard size arithmetic when parsing envelopes and Linux OS release data, copying slices, and allocating memory during crash handling. ([#2059](https://github.com/getsentry/sentry-native/pull/2059))
+- macOS: prevent out-of-bounds reads while parsing Mach-O load commands. ([#2065](https://github.com/getsentry/sentry-native/pull/2065))
+- Prevent out-of-bounds reads when parsing JSON numbers from length-delimited buffers. ([#2067](https://github.com/getsentry/sentry-native/pull/2067))
+- Validate session replay IDs before accessing staged files to prevent path traversal and unintended file uploads or deletions. ([#2071](https://github.com/getsentry/sentry-native/pull/2071))
+- Native/Windows: resolve the WER module relative to `handler_path`, so it is found when the crash handler is installed outside the executable's directory. ([#2073](https://github.com/getsentry/sentry-native/pull/2073))
+- Native: prevent buffer attachments from being written outside their UUID run directory. ([#2072](https://github.com/getsentry/sentry-native/pull/2072))
+- Native/Windows: reject misleading export fallback symbols in stack traces when PDB files are unavailable. ([#2075](https://github.com/getsentry/sentry-native/pull/2075))
+
+**Thank you**:
+
+- [HuzaifaAbdulRehman](https://github.com/HuzaifaAbdulRehman)
+- [GLinnik21](https://github.com/GLinnik21)
+
+## 0.16.5
+
+**Important behavior changes**:
+
+- `sentry_options_set_enable_logs` and `sentry_options_set_enable_metrics` no longer have any effect. The corresponding getters always return true.
+  > Structured logs and metrics have been enabled by default since `0.13`.
+  >
+  > We recognize that this change may inconvenience applications that rely on the opt-out. Use `sentry_options_set_before_send_log` or `sentry_options_set_before_send_metric` to filter logs or metrics. We made this tradeoff deliberately because consistent behavior across SDK integrations will help most users successfully adopt these features.
+
+**Features**:
+
+- Add `sentry_crash` for deliberately crashing the current process to test its crash reporting configuration. ([#2013](https://github.com/getsentry/sentry-native/pull/2013))
+- Native: add `sentry_options_set_thread_stackwalk_mode` to limit client-side stackwalking to the crashed thread, which shortens crash processing for applications with a high thread count. ([#2026](https://github.com/getsentry/sentry-native/pull/2026))
+- Add `sentry_value_foreach_value` and `sentry_value_foreach_key_value` for iterating lists and objects. ([#2032](https://github.com/getsentry/sentry-native/issues/2032))
+
+**Fixes**:
+
+- Native/Linux: prevent the crash daemon from hanging when module discovery encounters device-backed memory mappings. ([#2025](https://github.com/getsentry/sentry-native/pull/2025))
+
+**Other changes**:
+
+- Promote the 68 performance monitoring and tracing functions from experimental to stable. ([#2012](https://github.com/getsentry/sentry-native/pull/2012))
+
+## 0.16.4
+
+**Features**:
+
+- Windows: report WINE and Proton metadata in a separate runtime context. ([#1995](https://github.com/getsentry/sentry-native/pull/1995))
+- Add a public custom HTTP transport client interface (`sentry_http_transport_new`) so applications can plug in their own HTTP client (e.g. platform-native ones) while sentry-native continues to own request queueing, retry/backoff, offline caching, rate-limiting, and client reports. The built-in curl and WinHTTP transports are now implemented against this same interface. ([#1987](https://github.com/getsentry/sentry-native/pull/1987))
+- Native/Windows: capture WER report ID and expose as `contexts.wer.report_id` in crash events when the WER integration is enabled. ([#1970](https://github.com/getsentry/sentry-native/pull/1970))
+- Add `sentry_set_tags` and `sentry_scope_set_tags` for updating multiple tags with a single scope flush, improving bulk-update performance. ([#1993](https://github.com/getsentry/sentry-native/pull/1993))
+- Add `on_crashed_last_run` callback for inspecting crash envelopes from previous runs. ([#1985](https://github.com/getsentry/sentry-native/pull/1985))
+- Add `sentry_get_last_event_id` and `sentry_scope_get_last_event_id` for retrieving the last event ID captured with the global or given scope, respectively. ([#1992](https://github.com/getsentry/sentry-native/pull/1992))
+- Native/Unix: The native crash daemon now loads `libcurl` dynamically at runtime by default when `SENTRY_LINK_CURL=AUTO`, avoiding `libcurl` linker work during process startup and significantly speeding up startup time. Explicitly set `SENTRY_LINK_CURL=ON` to link it directly. ([#1955](https://github.com/getsentry/sentry-native/pull/1955))
+- Add missing public scope mutators: `set_release`, `set_environment`, `set_transaction`, `remove_tag`, `remove_extra`, `remove_context`, and `remove_attachment`. ([#2011](https://github.com/getsentry/sentry-native/pull/2011))
+
+**Deprecations**:
+
+- Deprecate `sentry_options_get/set_enable_logs` and `sentry_options_get/set_enable_metrics`. ([#2000](https://github.com/getsentry/sentry-native/pull/2000))
+
+**Fixes**:
+
+- Native: store daemon logs, minidumps, crash envelopes, and scratch files in `.run` directories so they are cleaned up with the run instead of accumulating in the database root. Minidumps can still be retained with `cache_keep`, which stores `.dmp` sidecars alongside cached envelopes. ([#1976](https://github.com/getsentry/sentry-native/pull/1976))
+- Linux/ARM32: prevent recursive crashes when libunwind receives an unmapped initial instruction pointer during crash handling. ([#1977](https://github.com/getsentry/sentry-native/pull/1977))
+- Improve log and metric delivery when telemetry is captured faster than envelopes can be serialized by offloading serialization to an internal thread pool. ([#1946](https://github.com/getsentry/sentry-native/pull/1946))
+- Wine: fix OS version detection and cross-compiling Windows builds from Linux. ([#2001](https://github.com/getsentry/sentry-native/pull/2001))
+- Destroy condition variables as approriate when no longer needed. ([#2004](https://github.com/getsentry/sentry-native/pull/2004))
+- Crashpad/Windows: preserve module CodeView UUIDs for minimal PDB70 records with empty PDB filenames. ([#2003](https://github.com/getsentry/sentry-native/pull/2003))
+- Native/Windows: improve crash-processing performance for applications with many threads. ([#2018](https://github.com/getsentry/sentry-native/pull/2018))
+- Prevent a race between SDK reinitialization and cleanup of the previous curl client when libcurl is linked directly. ([#2015](https://github.com/getsentry/sentry-native/pull/2015))
+
+**Thank you**:
+
+- [GtechGovind](https://github.com/GtechGovind)
+- [HuzaifaAbdulRehman](https://github.com/HuzaifaAbdulRehman)
+
+## 0.16.3
+
+**Features**:
+
+- Forward `enable_logs` option through `NdkOptions` so the Android SDK can enable native structured logging. ([#1971](https://github.com/getsentry/sentry-native/pull/1971))
+- Report enabled Qt and WER integrations in event SDK metadata (`sdk.integrations`) alongside the configured crash backend. ([#1969](https://github.com/
+  getsentry/sentry-native/pull/1969))
+- Add `sentry_scope_set_span` and `sentry_scope_set_transaction_object` to bind a span or transaction to a given scope. ([#1981](https://github.com/getsentry/sentry-native/pull/1981))
+
+**Fixes**:
+
+- Remove the `serializing envelope into buffer` debug log that could flood logs on every scope flush when an external crash reporter is configured. ([#1988](https://github.com/getsentry/sentry-native/pull/1988))
+- Crashpad: avoid allocating while handling a crash. The backend built the attachment `base::FilePath` inside the crash handler; if the crash corrupted the heap (e.g. via an overridden `operator new`) that allocation faults again and the report is lost. The paths are now cached at startup. ([#1984](https://github.com/getsentry/sentry-native/pull/1984))
+- Crashpad: prevent external crash reporters from bypassing revoked user consent. ([#1972](https://github.com/getsentry/sentry-native/pull/1972), [crashpad#168](https://github.com/getsentry/crashpad/pull/168))
+- Native/Linux: improve startup time by avoiding zeroing a large shmem module array during crash context initialization. ([#1966](https://github.com/getsentry/sentry-native/pull/1966))
+- Preserve embedded `NUL` bytes in strings created with `sentry_value_new_string_n` during JSON and MessagePack serialization. `sentry_value_get_length` now returns the full byte length, which can exceed `strlen(sentry_value_as_string(value))`. ([#1968](https://github.com/getsentry/sentry-native/pull/1968))
+
+## 0.16.2
+
+**Features**:
+
+- Add `sentry_scope_remove_fingerprint` to remove a fingerprint set on a scope, matching the global `sentry_remove_fingerprint`. ([#1932](https://github.com/getsentry/sentry-native/pull/1932))
+- Add `sentry_options_set_before_send_feedback` to filter or enrich user feedback. Feedback does not go through `before_send`. ([#1923](https://github.com/getsentry/sentry-native/pull/1923))
+- Unix: Add `SENTRY_LINK_CURL` to control whether the curl transport links `libcurl` directly, loads it dynamically at runtime, or uses the default behavior. ([#1954](https://github.com/getsentry/sentry-native/pull/1954))
+
+**Fixes**:
+
+- Name `sentry-logs` and `sentry-metrics` telemetry batcher threads so they can be identified in debuggers, profilers, and crash reports. ([#1937](https://github.com/getsentry/sentry-native/pull/1937))
+- Linux: close descriptor `0` on failed module file mapping when that descriptor was returned by `open`, avoiding a file descriptor leak. ([#1924](https://github.com/getsentry/sentry-native/pull/1924))
+- `sentry_attachment_set_filename`, `sentry_attachment_set_type`, and `sentry_attachment_set_content_type` now flush the scope, so changes applied after `sentry_attach_file`/`sentry_attach_bytes` also apply to hard-crash events instead of only to normal events. ([#1934](https://github.com/getsentry/sentry-native/pull/1934))
+- Crashpad: fix a crash when calling `sentry_init` before C++ dynamic initializers have run. ([#1930](https://github.com/getsentry/sentry-native/issues/1930), [mini_chromium#8](https://github.com/getsentry/mini_chromium/pull/8))
+- Reduce the size of native-generated minidumps on Windows ([#1929](https://github.com/getsentry/sentry-native/pull/1929))
+
+**Thank you**:
+
+- [fallintoplace](https://github.com/fallintoplace)
+
+## 0.16.1
+
+**Features**:
+
+- Added `sentry_app_hang_pause` to allow pausing of the app hang detection mechanism. This is useful in settings where an app can be put in the background, causing the monitored thread to suspend execution. ([#1928](https://github.com/getsentry/sentry-native/pull/1928))
+
+**Fixes**:
+
+- Honor checks before launching crash reporter ([#1906](https://github.com/getsentry/sentry-native/pull/1906))
+
+## 0.16.0
+
+**Features**:
+
+- Native/Windows: add `sentry_options_set_minidump_flags` for configuring raw `MINIDUMP_TYPE` flags. ([#1911](https://github.com/getsentry/sentry-native/pull/1911))
+- Windows: add WER integration for syncing tags and attachments to WER. ([#1837](https://github.com/getsentry/sentry-native/pull/1837))
+- Report `cache_overflow` discards due to `cache_max_items` or `cache_max_size`. ([#1884](https://github.com/getsentry/sentry-native/pull/1884))
+- Crashpad/Windows: optimize scope flushes for crash events and external crash reports. ([#1841](https://github.com/getsentry/sentry-native/pull/1841))
+- User feedback now carries scope data, including release, environment, tags, user, and contexts with the trace, so feedback is connected to the same trace as errors from the same session. Attachments set on the scope are sent with the feedback as well, alongside any passed through a hint. This also fixed a memory leak when capturing user feedback before the SDK is initialized. ([#1915](https://github.com/getsentry/sentry-native/pull/1915))
+- Add `sentry_scope_capture_feedback` to capture user feedback against a given scope, matching `sentry_scope_capture_event` / `_log` / `_metric`. The feedback carries the scope's data layered on top of the global scope, including attachments set on that scope, accepts an optional hint for additional attachments, and returns the feedback's event ID. ([#1916](https://github.com/getsentry/sentry-native/pull/1916))
+
+**Fixes**:
+
+- Fix scope data loss from shared `sentry_value_t` containers while significantly improving scope merge performance with copy-on-write cloning. ([#1794](https://github.com/getsentry/sentry-native/pull/1794))
+- Fix a memory leak when JSON parsing rejects invalid input after partially parsed value. ([#1887](https://github.com/getsentry/sentry-native/pull/1887))
+- Crashpad: wait reliably for crash report uploads. ([#1885](https://github.com/getsentry/sentry-native/pull/1885))
+- Crashpad/Windows: flush Windows attachment IPC responses. ([#1895](https://github.com/getsentry/sentry-native/pull/1895))
+- Crashpad/Linux: terminate Linux handler re-entry. ([#1894](https://github.com/getsentry/sentry-native/pull/1894))
+- Android: create the outbox directory before writing NDK crash envelopes into it, so envelopes are not lost when the head SDK creates the outbox lazily. ([#1889](https://github.com/getsentry/sentry-native/pull/1889))
+- Native/Windows: let WER finish native crash reports to preserve WER custom metadata. ([#1904](https://github.com/getsentry/sentry-native/pull/1904))
+- Native/macOS: write signal-handler-captured thread names into the minidump's ThreadNames stream when `task_for_pid` fails (e.g. sandboxed apps), so thread names resolve in crash events from packaged apps. ([#1905](https://github.com/getsentry/sentry-native/pull/1905))
+- Native: don't dump the crash daemon's log to `stderr` on shutdown unless debug logging is enabled, so terminal applications stay quiet when `debug` is off. ([#1910](https://github.com/getsentry/sentry-native/pull/1910))
+- Native/Windows: capture heap corruption crashes reported as `STATUS_HEAP_CORRUPTION` (`0xC0000374`). ([#1909](https://github.com/getsentry/sentry-native/pull/1909))
+- Native/Linux: add support for `sentry_options_set_handler_strategy(SENTRY_HANDLER_STRATEGY_CHAIN_AT_START)`. ([#1912](https://github.com/getsentry/sentry-native/pull/1912))
+- Windows: the default thread stack guarantee is now actually applied in static builds and is also set by the native backend, so crash handling can run after a stack overflow. ([#1918](https://github.com/getsentry/sentry-native/pull/1918))
+- Include `before_send` attachments with local scopes. ([#1922](https://github.com/getsentry/sentry-native/pull/1922))
+
+**Thank you**:
+
+- [HuzaifaAbdulRehman](https://github.com/HuzaifaAbdulRehman)
+
+## 0.15.4
+
+**Features**:
+
+- Add reusable, user-owned scopes. `sentry_scope_new` creates a scope that `sentry_capture_event_with_scope` applies without consuming, so you can configure it once and reuse it across many captures instead of building a new local scope each time. `sentry_scope_clone` copies a scope, and `sentry_scope_free` releases it. ([#1855](https://github.com/getsentry/sentry-native/pull/1855))
+- Android: Expose setting the environment on the scope through the NDK bindings via `NativeScope.setEnvironment()`, so head SDKs can sync the environment at runtime. ([#1874](https://github.com/getsentry/sentry-native/pull/1874))
+- Embed the crash event's breadcrumbs into session replay recordings, so breadcrumbs from the replay window show up on the replay timeline. ([#1875](https://github.com/getsentry/sentry-native/pull/1875))
+- Add `sentry_transaction_discard` and `sentry_span_discard` for releasing unfinished transactions and spans without sending them. ([#1858](https://github.com/getsentry/sentry-native/pull/1858))
+- Add scope attributes. `sentry_scope_set_attribute` / `_n` set an attribute on a scope and `sentry_scope_remove_attribute` / `_n` remove one, while the new `sentry_scope_capture_log` and `sentry_scope_capture_metric` capture a log or metric against a given scope. Scope attributes and trace are applied to logs and metrics captured against it, resolving most-specific-first: per-call data, then the scope, then the global scope. ([#1861](https://github.com/getsentry/sentry-native/pull/1861))
+- Add `sentry_scope_clear` to reset a scope's data. ([#1881](https://github.com/getsentry/sentry-native/pull/1881))
+
+**Deprecations**:
+
+- Deprecate `sentry_capture_event_with_scope` in favor of `sentry_scope_capture_event` (scope first), which matches `sentry_scope_capture_log` / `sentry_scope_capture_metric`. ([#1882](https://github.com/getsentry/sentry-native/pull/1882))
+
+**Fixes**:
+
+- Apply the propagation context to events that already have contexts set, so that events captured with a local scope or with event-level contexts keep their trace. ([#1843](https://github.com/getsentry/sentry-native/pull/1843))
+- Crashpad: reject runtime control IPC from processes other than the one that started the handler. ([#1853](https://github.com/getsentry/sentry-native/pull/1853))
+- Native/macOS: resolve symbol names for crash stacktraces from Mach-O symbol tables and dSYM companions. ([#1856](https://github.com/getsentry/sentry-native/pull/1856))
+- Route libcurl debug output through the Sentry logger (`SENTRY_TRACE`) instead of writing to `stderr`. ([#1854](https://github.com/getsentry/sentry-native/pull/1854))
+  - NOTE: `sentry_options_set_debug(options, true)` no longer displays verbose libcurl debug output by default. To restore it, call `sentry_options_set_logger_level(options, SENTRY_LEVEL_TRACE)`.
+- Crashpad: route client logs through the Sentry logger to make actionable handler startup errors visible. ([#1859](https://github.com/getsentry/sentry-native/pull/1859))
+- Windows: fix symlink detection used to prevent database cleanup from following symlinks in run and cache directories. ([#1857](https://github.com/getsentry/sentry-native/pull/1857))
+- Linux: avoid unsafe `copy_file_range` at crash time. ([#1868](https://github.com/getsentry/sentry-native/pull/1868))
+- Increase the default telemetry batcher capacity from 2x100 to 3x100 items, and add `SENTRY_BATCHER_BUFFER_COUNT` to configure the number of rotating buffers used by log and metric batchers. ([#1867](https://github.com/getsentry/sentry-native/pull/1867))
+- Fix a lifetime issue when reading `sample_rand` from the scope propagation context. ([#1869](https://github.com/getsentry/sentry-native/pull/1869))
+- Linux: silence harmless compilation warnings in `sentry_modulefinder_linux.c` and `sentry_backend_inproc.c`. ([#1871](https://github.com/getsentry/sentry-native/pull/1871))
+- Fix per-call log and metric attributes to override same-named global attributes atomically, preventing fields such as `unit` from leaking from the global attribute when the per-call attribute does not define them. ([#1879](https://github.com/getsentry/sentry-native/pull/1879))
+- Prefix vendored mpack symbols to avoid symbol conflicts. ([#1880](https://github.com/getsentry/sentry-native/pull/1880))
+
 ## 0.15.3
 
 **Features**
@@ -90,6 +375,10 @@
 
 - Protect CMAKE_SYSTEM_VERSION to avoid empty values when cross-building. ([#1720](https://github.com/getsentry/sentry-native/pull/1720))
 
+**Thank you**:
+
+- [uilianries](https://github.com/uilianries)
+
 ## 0.14.1
 
 **Features**:
@@ -165,6 +454,10 @@
 - Native: build for 64-bit ARM on Linux with musl. ([#1665](https://github.com/getsentry/sentry-native/pull/1665))
 - Native/Linux: prevent shared memory leak on crash. ([#1664](https://github.com/getsentry/sentry-native/pull/1664))
 - Native: skip scope flush during crash handling. ([#1668](https://github.com/getsentry/sentry-native/pull/1668))
+
+**Thank you**:
+
+- [HrMathematiker](https://github.com/HrMathematiker)
 
 ## 0.13.7
 

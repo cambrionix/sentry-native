@@ -5,6 +5,7 @@
 
 #include "sentry_attachment.h"
 #include "sentry_database.h"
+#include "sentry_integration.h"
 #include "sentry_logger.h"
 #include "sentry_session.h"
 #include "sentry_utils.h"
@@ -34,6 +35,8 @@ struct sentry_options_s {
     sentry_path_t *database_path;
     sentry_path_t *handler_path;
     sentry_path_t *external_crash_reporter;
+    sentry_initial_scope_function_t initial_scope_func;
+    void *initial_scope_data;
     sentry_logger_t logger;
     size_t max_breadcrumbs;
     bool debug;
@@ -51,13 +54,14 @@ struct sentry_options_s {
     bool propagate_traceparent;
     bool strict_trace_continuation;
     bool crashpad_limit_stack_capture_to_sp;
+    uint32_t max_stack_capture_size;
     sentry_cache_keep_t cache_keep;
 
     time_t cache_max_age;
     size_t cache_max_size;
     size_t cache_max_items;
 
-    sentry_attachment_t *attachments;
+    sentry_value_t attachments;
     sentry_run_t *run;
 
     sentry_transport_t *transport;
@@ -65,12 +69,16 @@ struct sentry_options_s {
     void *before_send_data;
     sentry_crash_function_t on_crash_func;
     void *on_crash_data;
+    sentry_crashed_last_run_function_t on_crashed_last_run_func;
+    void *on_crashed_last_run_data;
     sentry_transaction_function_t before_transaction_func;
     void *before_transaction_data;
     sentry_before_send_log_function_t before_send_log_func;
     void *before_send_log_data;
     sentry_before_breadcrumb_function_t before_breadcrumb_func;
     void *before_breadcrumb_data;
+    sentry_before_send_feedback_function_t before_send_feedback_func;
+    void *before_send_feedback_data;
 
     /* Experimentally exposed */
     double traces_sample_rate;
@@ -78,11 +86,9 @@ struct sentry_options_s {
     void *traces_sampler_data;
     char *org_id;
     size_t max_spans;
-    bool enable_logs;
     // takes the first varg as a `sentry_value_t` object containing attributes
     // if no custom attributes are to be passed, use `sentry_value_new_object()`
     bool logs_with_attributes;
-    bool enable_metrics;
     sentry_before_send_metric_function_t before_send_metric_func;
     void *before_send_metric_data;
     bool enable_app_hang_tracking;
@@ -95,6 +101,9 @@ struct sentry_options_s {
        not exposed through the options API */
     struct sentry_backend_s *backend;
     sentry_session_t *session;
+    sentry_integration_t **integrations;
+    size_t num_integrations;
+    bool retain_crash_marker;
 
     long refcount;
     uint64_t shutdown_timeout;
@@ -102,9 +111,14 @@ struct sentry_options_s {
     sentry_handler_strategy_t handler_strategy;
     int minidump_mode; // 0=stack_only, 1=smart, 2=full (see
                        // sentry_crash_context.h)
+#ifdef SENTRY_PLATFORM_WINDOWS
+    int32_t minidump_flags;
+#endif
     int crash_reporting_mode; // 0=minidump, 1=native, 2=native_with_minidump
                               // (see sentry_crash_reporting_mode_t)
     int crash_upload_mode; // 0=sync, 1=async (see sentry_crash_upload_mode_t)
+    int thread_stackwalk_mode; // 0=crashed_only, 1=all (see
+                               // sentry_thread_stackwalk_mode_t)
 
 #ifdef SENTRY_PLATFORM_NX
     void (*network_connect_func)(void);
@@ -123,5 +137,22 @@ sentry_options_t *sentry__options_incref(sentry_options_t *options);
  * otherwise NULL.
  */
 const char *sentry__options_get_org_id(const sentry_options_t *options);
+
+/**
+ * Adds an integration to the options.
+ *
+ * Takes ownership of `integration`. If the integration owns `data`, it must
+ * provide `free_func`.
+ *
+ * Returns true if the integration was added.
+ */
+bool sentry__options_add_integration(
+    sentry_options_t *opts, sentry_integration_t *integration);
+
+/**
+ * Returns whether an integration with the given name has been added.
+ */
+bool sentry__options_has_integration(
+    const sentry_options_t *opts, const char *name);
 
 #endif

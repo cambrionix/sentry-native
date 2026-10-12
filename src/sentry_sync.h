@@ -9,6 +9,7 @@
 
 // This is a NOP for platforms that support static mutex initialization.
 #define SENTRY__MUTEX_INIT_DYN_ONCE(Mutex) ((void)0)
+#define SENTRY__RWLOCK_INIT_DYN_ONCE(Rwlock) ((void)0)
 
 #ifdef _MSC_VER
 #    define THREAD_FUNCTION_API __stdcall
@@ -93,15 +94,22 @@ InitializeConditionVariable_PREVISTA(
     ConditionVariable->ContinueEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
 }
 
+inline void
+DeleteConditionVariable_PREVISTA(PCONDITION_VARIABLE_PREVISTA ConditionVariable)
+{
+    CloseHandle(ConditionVariable->Semaphore);
+    CloseHandle(ConditionVariable->ContinueEvent);
+}
+
 inline BOOL
 SleepConditionVariableCS_PREVISTA(
     PCONDITION_VARIABLE_PREVISTA cv, PCRITICAL_SECTION cs, DWORD timeout)
 {
     DWORD result = 0;
 
+    InterlockedIncrement((LONG *)&cv->Waiters);
     LeaveCriticalSection(cs);
 
-    InterlockedIncrement((LONG *)&cv->Waiters);
     result = WaitForSingleObject(cv->Semaphore, timeout);
 
     // send event only on target
@@ -122,15 +130,33 @@ WakeConditionVariable_PREVISTA(PCONDITION_VARIABLE_PREVISTA ConditionVariable)
         return;
     }
 
-    if (ConditionVariable->Waiters == 0) {
+    const LONG waiters = InterlockedCompareExchange(
+        (volatile LONG *)&ConditionVariable->Waiters, 0, 0);
+    if (waiters == 0) {
         return;
     }
 
     // set target for continue event, alert it on first occurance
-    ConditionVariable->Target = ConditionVariable->Waiters - 1;
+    ConditionVariable->Target = waiters - 1;
 
     SignalObjectAndWait(ConditionVariable->Semaphore,
         ConditionVariable->ContinueEvent, INFINITE, FALSE);
+}
+
+inline void
+WakeAllConditionVariable_PREVISTA(
+    PCONDITION_VARIABLE_PREVISTA ConditionVariable)
+{
+    if (!ConditionVariable) {
+        return;
+    }
+
+    LONG waiters = InterlockedCompareExchange(
+        (volatile LONG *)&ConditionVariable->Waiters, 0, 0);
+    if (waiters > 0) {
+        ConditionVariable->Target = -1;
+        ReleaseSemaphore(ConditionVariable->Semaphore, waiters, NULL);
+    }
 }
 
 #    endif /* _WIN32_WINNT < 0x0600 */
@@ -173,6 +199,144 @@ typedef struct sentry__winmutex_s sentry_mutex_t;
 #    define sentry__mutex_free(Lock)                                           \
         DeleteCriticalSection(&(Lock)->critical_section)
 
+/**
+ * A non-recursive read-write lock for short critical sections around protected
+ * variable access. Allows multiple concurrent readers, or a single exclusive
+ * writer.
+ *
+ * Based on `SRWLOCK` on Windows, and `pthread_rwlock_t` on POSIX.
+ */
+#    if _WIN32_WINNT >= 0x0600
+typedef SRWLOCK sentry_rwlock_t;
+#        define SENTRY__RWLOCK_INIT SRWLOCK_INIT
+#        define sentry__rwlock_init(Lock) InitializeSRWLock(Lock)
+#        define sentry__rwlock_read_lock(Lock) AcquireSRWLockShared(Lock)
+#        define sentry__rwlock_read_unlock(Lock) ReleaseSRWLockShared(Lock)
+#        define sentry__rwlock_write_lock(Lock) AcquireSRWLockExclusive(Lock)
+#        define sentry__rwlock_write_unlock(Lock) ReleaseSRWLockExclusive(Lock)
+#        define sentry__rwlock_free(Lock) ((void)0)
+#    else
+typedef struct sentry__winrwlock_s {
+    INIT_ONCE init_once;
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE_PREVISTA readers_cond;
+    CONDITION_VARIABLE_PREVISTA writers_cond;
+    unsigned readers;
+    unsigned writers_waiting;
+    bool writer;
+} sentry_rwlock_t;
+
+#        define SENTRY__RWLOCK_INIT                                            \
+            { INIT_ONCE_STATIC_INIT, { 0 }, { 0 }, { 0 }, 0, 0, false }
+
+static inline BOOL CALLBACK
+sentry__winrwlock_initonce(
+    PINIT_ONCE UNUSED(InitOnce), PVOID data, PVOID *UNUSED(lpContext))
+{
+    sentry_rwlock_t *rwlock = (sentry_rwlock_t *)data;
+    InitializeCriticalSection(&rwlock->lock);
+    InitializeConditionVariable_PREVISTA(&rwlock->readers_cond);
+    InitializeConditionVariable_PREVISTA(&rwlock->writers_cond);
+    rwlock->readers = 0;
+    rwlock->writers_waiting = 0;
+    rwlock->writer = false;
+    return TRUE;
+}
+
+static inline void
+sentry__winrwlock_ensure_init(sentry_rwlock_t *rwlock)
+{
+    InitOnceExecuteOnce(
+        &rwlock->init_once, sentry__winrwlock_initonce, rwlock, NULL);
+}
+
+static inline void
+sentry__winrwlock_init(sentry_rwlock_t *rwlock)
+{
+    sentry_rwlock_t tmp = SENTRY__RWLOCK_INIT;
+    *rwlock = tmp;
+    sentry__winrwlock_ensure_init(rwlock);
+}
+
+static inline void
+sentry__winrwlock_read_lock(sentry_rwlock_t *rwlock)
+{
+    sentry__winrwlock_ensure_init(rwlock);
+    EnterCriticalSection(&rwlock->lock);
+    while (rwlock->writer || rwlock->writers_waiting > 0) {
+        SleepConditionVariableCS_PREVISTA(
+            &rwlock->readers_cond, &rwlock->lock, INFINITE);
+    }
+    rwlock->readers++;
+    if (rwlock->writers_waiting == 0) {
+        WakeConditionVariable_PREVISTA(&rwlock->readers_cond);
+    }
+    LeaveCriticalSection(&rwlock->lock);
+}
+
+static inline void
+sentry__winrwlock_read_unlock(sentry_rwlock_t *rwlock)
+{
+    EnterCriticalSection(&rwlock->lock);
+    assert(rwlock->readers > 0);
+    rwlock->readers--;
+    if (rwlock->readers == 0 && rwlock->writers_waiting > 0) {
+        WakeConditionVariable_PREVISTA(&rwlock->writers_cond);
+    }
+    LeaveCriticalSection(&rwlock->lock);
+}
+
+static inline void
+sentry__winrwlock_write_lock(sentry_rwlock_t *rwlock)
+{
+    sentry__winrwlock_ensure_init(rwlock);
+    EnterCriticalSection(&rwlock->lock);
+    rwlock->writers_waiting++;
+    while (rwlock->writer || rwlock->readers > 0) {
+        SleepConditionVariableCS_PREVISTA(
+            &rwlock->writers_cond, &rwlock->lock, INFINITE);
+    }
+    rwlock->writers_waiting--;
+    rwlock->writer = true;
+    LeaveCriticalSection(&rwlock->lock);
+}
+
+static inline void
+sentry__winrwlock_write_unlock(sentry_rwlock_t *rwlock)
+{
+    EnterCriticalSection(&rwlock->lock);
+    assert(rwlock->writer);
+    rwlock->writer = false;
+    if (rwlock->writers_waiting > 0) {
+        WakeConditionVariable_PREVISTA(&rwlock->writers_cond);
+    } else {
+        WakeConditionVariable_PREVISTA(&rwlock->readers_cond);
+    }
+    LeaveCriticalSection(&rwlock->lock);
+}
+
+static inline void
+sentry__winrwlock_free(sentry_rwlock_t *rwlock)
+{
+    sentry__winrwlock_ensure_init(rwlock);
+    DeleteCriticalSection(&rwlock->lock);
+    CloseHandle(rwlock->readers_cond.Semaphore);
+    CloseHandle(rwlock->readers_cond.ContinueEvent);
+    CloseHandle(rwlock->writers_cond.Semaphore);
+    CloseHandle(rwlock->writers_cond.ContinueEvent);
+}
+
+#        define sentry__rwlock_init(Lock) sentry__winrwlock_init(Lock)
+#        define sentry__rwlock_read_lock(Lock) sentry__winrwlock_read_lock(Lock)
+#        define sentry__rwlock_read_unlock(Lock)                               \
+            sentry__winrwlock_read_unlock(Lock)
+#        define sentry__rwlock_write_lock(Lock)                                \
+            sentry__winrwlock_write_lock(Lock)
+#        define sentry__rwlock_write_unlock(Lock)                              \
+            sentry__winrwlock_write_unlock(Lock)
+#        define sentry__rwlock_free(Lock) sentry__winrwlock_free(Lock)
+#    endif
+
 #    define sentry__thread_init(ThreadId) *ThreadId = INVALID_HANDLE_VALUE
 #    define sentry__thread_spawn(ThreadId, Func, Data)                         \
         (*ThreadId = CreateThread(NULL, 0, Func, Data, 0, NULL),               \
@@ -192,14 +356,19 @@ typedef struct sentry__winmutex_s sentry_mutex_t;
 typedef CONDITION_VARIABLE_PREVISTA sentry_cond_t;
 #        define sentry__cond_init(CondVar)                                     \
             InitializeConditionVariable_PREVISTA(CondVar)
+#        define sentry__cond_free(CondVar)                                     \
+            DeleteConditionVariable_PREVISTA(CondVar)
 #        define sentry__cond_wake WakeConditionVariable_PREVISTA
+#        define sentry__cond_wake_all WakeAllConditionVariable_PREVISTA
 #        define sentry__cond_wait_timeout(CondVar, Lock, Timeout)              \
             SleepConditionVariableCS_PREVISTA(                                 \
                 CondVar, &(Lock)->critical_section, Timeout)
 #    else
 typedef CONDITION_VARIABLE sentry_cond_t;
 #        define sentry__cond_init(CondVar) InitializeConditionVariable(CondVar)
+#        define sentry__cond_free(CondVar) ((void)(CondVar))
 #        define sentry__cond_wake WakeConditionVariable
+#        define sentry__cond_wake_all WakeAllConditionVariable
 #        define sentry__cond_wait_timeout(CondVar, Lock, Timeout)              \
             SleepConditionVariableCS(                                          \
                 CondVar, &(Lock)->critical_section, Timeout)
@@ -248,6 +417,7 @@ void sentry__leave_signal_handler(void);
 
 typedef pthread_t sentry_threadid_t;
 typedef pthread_mutex_t sentry_mutex_t;
+typedef pthread_rwlock_t sentry_rwlock_t;
 typedef pthread_cond_t sentry_cond_t;
 
 #    ifdef SENTRY_PLATFORM_LINUX
@@ -329,12 +499,81 @@ typedef pthread_cond_t sentry_cond_t;
             }                                                                  \
         } while (0)
 #    define sentry__mutex_free(Lock) pthread_mutex_destroy(Lock)
+#    ifdef PTHREAD_RWLOCK_INITIALIZER
+#        define SENTRY__RWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
+#    endif
+
+static inline void
+sentry__rwlock_init(sentry_rwlock_t *rwlock)
+{
+#    ifdef PTHREAD_RWLOCK_INITIALIZER
+    sentry_rwlock_t tmp = SENTRY__RWLOCK_INIT;
+    *rwlock = tmp;
+#    else
+    int rv = pthread_rwlock_init(rwlock, NULL);
+    (void)rv;
+    assert(rv == 0);
+#    endif
+}
+
+#    ifndef PTHREAD_RWLOCK_INITIALIZER
+#        define SENTRY__RWLOCK_INIT_DYN(Rwlock)                                \
+            static sentry_rwlock_t Rwlock;                                     \
+            static pthread_once_t Rwlock##_init_once = PTHREAD_ONCE_INIT;      \
+            static void init_##Rwlock(void) { sentry__rwlock_init(&Rwlock); }
+#        undef SENTRY__RWLOCK_INIT_DYN_ONCE
+#        define SENTRY__RWLOCK_INIT_DYN_ONCE(Rwlock)                           \
+            pthread_once(&Rwlock##_init_once, init_##Rwlock)
+#    endif
+
+static inline void
+sentry__rwlock_read_lock(sentry_rwlock_t *rwlock)
+{
+    if (sentry__block_for_signal_handler()) {
+        int rv = pthread_rwlock_rdlock(rwlock);
+        (void)rv;
+        assert(rv == 0);
+    }
+}
+
+static inline void
+sentry__rwlock_read_unlock(sentry_rwlock_t *rwlock)
+{
+    if (sentry__block_for_signal_handler()) {
+        pthread_rwlock_unlock(rwlock);
+    }
+}
+
+static inline void
+sentry__rwlock_write_lock(sentry_rwlock_t *rwlock)
+{
+    if (sentry__block_for_signal_handler()) {
+        int rv = pthread_rwlock_wrlock(rwlock);
+        (void)rv;
+        assert(rv == 0);
+    }
+}
+
+static inline void
+sentry__rwlock_write_unlock(sentry_rwlock_t *rwlock)
+{
+    if (sentry__block_for_signal_handler()) {
+        pthread_rwlock_unlock(rwlock);
+    }
+}
+
+static inline void
+sentry__rwlock_free(sentry_rwlock_t *rwlock)
+{
+    pthread_rwlock_destroy(rwlock);
+}
 
 #    define sentry__cond_init(CondVar)                                         \
         do {                                                                   \
             sentry_cond_t tmp = PTHREAD_COND_INITIALIZER;                      \
             *(CondVar) = tmp;                                                  \
         } while (0)
+#    define sentry__cond_free(CondVar) pthread_cond_destroy(CondVar)
 #    define sentry__cond_wait(Cond, Mutex)                                     \
         do {                                                                   \
             if (sentry__block_for_signal_handler()) {                          \
@@ -342,6 +581,7 @@ typedef pthread_cond_t sentry_cond_t;
             }                                                                  \
         } while (0)
 #    define sentry__cond_wake pthread_cond_signal
+#    define sentry__cond_wake_all pthread_cond_broadcast
 #    define sentry__thread_init(ThreadId)                                      \
         memset(ThreadId, 0, sizeof(sentry_threadid_t))
 #    define sentry__thread_spawn(ThreadId, Func, Data)                         \
@@ -457,10 +697,86 @@ sentry__atomic_fetch_u64(uint64_t *val)
 #endif
 }
 
+/**
+ * Sets the OS-level name for a thread.
+ *
+ * On macOS, only the current thread can be named.
+ *
+ * Returns 0 on success, or a non-zero value if the platform reports that
+ * setting the thread name failed.
+ */
+int sentry__thread_setname(
+    sentry_threadid_t thread_id, const char *thread_name);
+
 struct sentry_bgworker_s;
 typedef struct sentry_bgworker_s sentry_bgworker_t;
 
+struct sentry_threadpool_s;
+typedef struct sentry_threadpool_s sentry_threadpool_t;
+
 typedef void (*sentry_task_exec_func_t)(void *task_data, void *state);
+
+/**
+ * Creates a thread pool configured with `thread_count` threads and at most
+ * `max_pending` outstanding tasks. Tasks execute in parallel, while completion
+ * callbacks run in submission order.
+ *
+ * `max_pending` includes tasks currently executing and tasks awaiting ordered
+ * completion, and must be greater than zero.
+ */
+sentry_threadpool_t *sentry__threadpool_new(
+    size_t thread_count, size_t max_pending);
+
+/**
+ * Sets a name for pooled threads. Each thread is named `<thread_name>-<index>`,
+ * where `index` starts at 0. Does nothing while the pool is running.
+ *
+ * Should be executed before thread pool start.
+ */
+void sentry__threadpool_setname(
+    sentry_threadpool_t *pool, const char *thread_name);
+
+/**
+ * Starts the pooled threads. Calling this on a running pool succeeds without
+ * effect. A pool can be restarted after shutdown.
+ *
+ * Returns 0 on success, or a non-zero value if `pool` is `NULL` or the pooled
+ * threads cannot be started.
+ */
+int sentry__threadpool_start(sentry_threadpool_t *pool);
+
+/**
+ * Submits a task for execution. `exec_func` runs on a pooled thread. The
+ * optional `complete_func` runs after execution, in submission order, followed
+ * by the optional `cleanup_func`.
+ *
+ * Takes ownership of `task_data` on every call. If the task is rejected,
+ * `cleanup_func` is called immediately when provided.
+ *
+ * Returns 0 if the task was accepted, 1 if the pending-task limit has been
+ * reached, or -1 if the arguments are invalid, the pool is not running or is
+ * stopping, or allocation fails.
+ */
+int sentry__threadpool_submit(sentry_threadpool_t *pool,
+    void (*exec_func)(void *task_data), void (*complete_func)(void *task_data),
+    void (*cleanup_func)(void *task_data), void *task_data);
+
+/**
+ * Blocks until all accepted tasks and their completion and cleanup callbacks
+ * have finished. Does nothing when called from one of the pool's threads.
+ */
+void sentry__threadpool_flush(sentry_threadpool_t *pool);
+
+/**
+ * Stops accepting tasks, drains the queue, and joins all pooled threads. The
+ * pool can be started again after shutdown.
+ */
+void sentry__threadpool_shutdown(sentry_threadpool_t *pool);
+
+/**
+ * Shuts down the pool if necessary and releases its resources.
+ */
+void sentry__threadpool_free(sentry_threadpool_t *pool);
 
 /**
  * Creates a new background worker thread.

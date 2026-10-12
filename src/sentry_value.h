@@ -8,6 +8,11 @@
  */
 sentry_value_t sentry__value_new_string_owned(char *s);
 
+/**
+ * Create a new Value from an owned string with explicit byte length.
+ */
+sentry_value_t sentry__value_new_string_owned_n(char *s, size_t s_len);
+
 #ifdef SENTRY_PLATFORM_WINDOWS
 /**
  * Create a new Value from a Wide String.
@@ -68,12 +73,24 @@ sentry_value_t sentry__value_new_list_with_size(size_t size);
 sentry_value_t sentry__value_new_object_with_size(size_t size);
 
 /**
- * Iterates over the key/value pairs of an object value. The callback receives a
- * borrowed reference for each value. Does nothing if `value` is not an object.
+ * Sets a value by an already-owned key.
+ * Takes ownership of `key` and `v`.
  */
-void sentry__value_foreach_key_value(sentry_value_t value,
-    void (*callback)(const char *key, sentry_value_t value, void *userdata),
-    void *userdata);
+int sentry__value_set_by_key_owned(
+    sentry_value_t value, char *key, size_t key_len, sentry_value_t v);
+
+/**
+ * Replaces `*target` with `value`.
+ * Takes ownership of `value` and releases the previous `*target`.
+ */
+void sentry__value_replace(sentry_value_t *target, sentry_value_t value);
+
+/**
+ * Removes a value by key and returns the owned object key on success.
+ * The caller must free the returned key.
+ */
+char *sentry__value_remove_and_take_key_n(
+    sentry_value_t value, const char *key, size_t key_len);
 
 /**
  * This will parse the Value into a UUID, or return a `nil` UUID on error.
@@ -110,6 +127,18 @@ sentry_value_t sentry__value_clone(sentry_value_t value);
 int sentry__value_merge_objects(sentry_value_t dst, sentry_value_t src);
 
 /**
+ * Shallow-merges the top-level keys from src into dst, keeping keys that dst
+ * already has.
+ *
+ * Unlike `sentry__value_merge_objects`, values are copied whole and are never
+ * merged recursively, so a nested object in src cannot add fields to a
+ * same-keyed object already present in dst.
+ *
+ * Returns 0 on success.
+ */
+int sentry__value_merge_objects_shallow(sentry_value_t dst, sentry_value_t src);
+
+/**
  * Writes the given `value` into the `jsonwriter`.
  */
 void sentry__jsonwriter_write_value(
@@ -127,16 +156,6 @@ char *sentry__value_to_json(sentry_value_t value, size_t *len_out);
  */
 void sentry__value_add_attribute(sentry_value_t attributes,
     sentry_value_t value, const char *type, const char *name);
-
-/**
- * Deserialize a sentry value from msgpack.
- *
- * If the buffer contains multiple sequential msgpack values (as in flat buffers
- * like breadcrumb files), they are automatically wrapped in a list.
- *
- * The returned value must be released with `sentry_value_decref`.
- */
-sentry_value_t sentry__value_from_msgpack(const char *buf, size_t buf_len);
 
 /**
  * Merges two breadcrumb lists in timestamp order, keeping at most `max` items.

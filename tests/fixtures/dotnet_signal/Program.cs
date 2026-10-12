@@ -5,8 +5,8 @@ using System.Runtime.InteropServices;
 
 class Program
 {
-    [DllImport("crash", EntryPoint = "native_crash")]
-    static extern void native_crash();
+    [DllImport("sentry", EntryPoint = "sentry_crash")]
+    static extern void sentry_crash();
 
     [DllImport("crash", EntryPoint = "enable_sigaltstack")]
     static extern void enable_sigaltstack();
@@ -22,6 +22,9 @@ class Program
 
     [DllImport("sentry", EntryPoint = "sentry_options_set_database_path")]
     static extern void sentry_options_set_database_path(IntPtr options, string path);
+
+    [DllImport("sentry", EntryPoint = "sentry_options_set_crash_reporting_mode")]
+    static extern void sentry_options_set_crash_reporting_mode(IntPtr options, int mode);
 
     [DllImport("sentry", EntryPoint = "sentry_init")]
     static extern int sentry_init(IntPtr options);
@@ -52,6 +55,7 @@ class Program
         {
             sentry_options_set_database_path(options, databasePath);
         }
+        sentry_options_set_crash_reporting_mode(options, 1);
         sentry_init(options);
 
         if (args.Contains("reinit"))
@@ -62,12 +66,13 @@ class Program
             sentry_options_set_debug(options, 1);
             if (databasePath != null)
                 sentry_options_set_database_path(options, databasePath);
+            sentry_options_set_crash_reporting_mode(options, 1);
             sentry_init(options);
         }
 
         if (args.Contains("native-crash"))
         {
-            native_crash();
+            sentry_crash();
         }
         else if (args.Contains("managed-exception"))
         {

@@ -2,12 +2,11 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
-from . import check_output, run, Envelope
+from . import check_output, run, run_command, Envelope
 from .assertions import (
     assert_attachment,
     assert_meta,
@@ -18,14 +17,21 @@ from .assertions import (
     assert_minidump,
     assert_before_send,
     assert_no_before_send,
-    assert_crash_timestamp,
+    assert_no_crash_timestamp,
     assert_breakpad_crash,
     assert_exception,
+    wait_for,
 )
-from .conditions import has_breakpad, has_files, is_qemu
+from .conditions import has_breakpad, has_files, is_qemu, is_wine
 
 
 @pytest.mark.skipif(is_qemu, reason="unreliable under qemu-user")
+@pytest.mark.xfail(
+    bool(os.environ.get("TEST_MINGW")),
+    reason="DbgHelp cannot read MinGW DWARF symbols",
+    raises=pytest.RaisesExc(AssertionError, match="^missing symbolicated frames"),
+    strict=True,
+)
 def test_capture_stdout(cmake):
     tmp_path = cmake(
         ["sentry_example"],
@@ -123,24 +129,23 @@ def test_multi_process(cmake):
 
     cwd = tmp_path.joinpath("unicode ❤️ Юля")
     cwd.mkdir()
-    exe = "sentry_example"
-    cmd = (
-        "../{}".format(exe)
-        if sys.platform != "win32"
-        else "{}\\{}.exe".format(tmp_path, exe)
-    )
+    cmd = run_command(str(tmp_path / "sentry_example"))
 
-    child1 = subprocess.Popen([cmd, "sleep"], cwd=cwd)
-    child2 = subprocess.Popen([cmd, "sleep"], cwd=cwd)
-    time.sleep(0.5)
+    child1 = subprocess.Popen([*cmd, "sleep"], cwd=cwd)
+    child2 = subprocess.Popen([*cmd, "sleep"], cwd=cwd)
+
+    def list_db(suffix):
+        try:
+            return [
+                db_run
+                for db_run in os.listdir(os.path.join(cwd, ".sentry-native"))
+                if db_run.endswith(suffix)
+            ]
+        except FileNotFoundError:
+            return []
 
     # while the processes are running, we expect two runs
-    runs = [
-        db_run
-        for db_run in os.listdir(os.path.join(cwd, ".sentry-native"))
-        if db_run.endswith(".run")
-    ]
-    assert len(runs) == 2
+    assert wait_for(lambda: len(list_db(".run")) == 2)
 
     # kill the children
     child1.terminate()
@@ -149,14 +154,10 @@ def test_multi_process(cmake):
     child2.wait()
 
     # and start another process that cleans up the old runs
-    subprocess.run([cmd], cwd=cwd)
+    subprocess.run(cmd, cwd=cwd)
 
-    runs = [
-        db_run
-        for db_run in os.listdir(os.path.join(cwd, ".sentry-native"))
-        if db_run.endswith(".run") or db_run.endswith(".lock")
-    ]
-    assert len(runs) == 0
+    assert len(list_db(".run")) == 0
+    assert len(list_db(".lock")) == 0
 
 
 def run_stdout_for(backend, cmake, example_args, build_args=None, env=None):
@@ -174,12 +175,24 @@ def run_crash_stdout_for(backend, cmake, example_args):
     return run_stdout_for(backend, cmake, ["attachment", "crash"] + example_args)
 
 
+def assert_crash_hint_attachments(envelope, callback):
+    assert not any(
+        item.headers.get("filename") in ("CMakeCache.txt", "bytes.bin")
+        for item in envelope
+    )
+    assert any(
+        item.headers.get("filename") == "callback.txt"
+        and item.payload.bytes == callback.replace("-", "_").encode()
+        for item in envelope
+    )
+
+
 def test_inproc_crash_stdout(cmake):
     tmp_path, output = run_crash_stdout_for("inproc", cmake, [])
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="inproc")
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
@@ -210,7 +223,7 @@ def test_abort_stdout(cmake, backend):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration=backend)
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
@@ -229,10 +242,10 @@ def test_inproc_crash_stdout_before_send(cmake):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="inproc")
     assert_breadcrumb(envelope)
-    assert_attachment(envelope)
+    assert_crash_hint_attachments(envelope, "before-send")
     assert_inproc_crash(envelope)
     assert_before_send(envelope)
 
@@ -244,9 +257,10 @@ def test_inproc_crash_stdout_discarding_on_crash(cmake):
     # since the on_crash() handler discards further processing we expect an empty response
     assert len(output) == 0
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
 
 
+@pytest.mark.skipif(is_qemu, reason="unreliable under qemu-user")
 def test_inproc_crash_stdout_before_send_and_on_crash(cmake):
     tmp_path, output = run_crash_stdout_for(
         "inproc", cmake, ["before-send", "on-crash"]
@@ -257,10 +271,10 @@ def test_inproc_crash_stdout_before_send_and_on_crash(cmake):
     # but we expect no event modification from before_send() since setting on_crash() disables before_send()
     assert_no_before_send(envelope)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="inproc")
     assert_breadcrumb(envelope)
-    assert_attachment(envelope)
+    assert_crash_hint_attachments(envelope, "on-crash")
     assert_inproc_crash(envelope)
 
 
@@ -278,6 +292,7 @@ def test_inproc_crash_stdout_before_send_and_on_crash(cmake):
         ),
     ],
 )
+@pytest.mark.skipif(is_wine, reason="Wine does not terminate after stack overflow")
 def test_inproc_stack_overflow_stdout(cmake, stack_size):
     env = dict(os.environ)
     if stack_size:
@@ -288,7 +303,7 @@ def test_inproc_stack_overflow_stdout(cmake, stack_size):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="inproc")
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
@@ -301,7 +316,7 @@ def test_breakpad_crash_stdout(cmake):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="breakpad")
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
@@ -315,10 +330,10 @@ def test_breakpad_crash_stdout_before_send(cmake):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="breakpad")
     assert_breadcrumb(envelope)
-    assert_attachment(envelope)
+    assert_crash_hint_attachments(envelope, "before-send")
     assert_minidump(envelope)
     assert_before_send(envelope)
     assert_breakpad_crash(envelope)
@@ -331,7 +346,7 @@ def test_breakpad_crash_stdout_discarding_on_crash(cmake):
     # since the on_crash() handler discards further processing we expect an empty response
     assert len(output) == 0
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
 
 
 @pytest.mark.skipif(not has_breakpad or is_qemu, reason="test needs breakpad backend")
@@ -345,10 +360,10 @@ def test_breakpad_crash_stdout_before_send_and_on_crash(cmake):
     # but we expect no event modification from before_send() since setting on_crash() disables before_send()
     assert_no_before_send(envelope)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="breakpad")
     assert_breadcrumb(envelope)
-    assert_attachment(envelope)
+    assert_crash_hint_attachments(envelope, "on-crash")
     assert_breakpad_crash(envelope)
 
 
@@ -373,6 +388,7 @@ def test_breakpad_crash_stdout_before_send_and_on_crash(cmake):
     ],
 )
 @pytest.mark.skipif(not has_breakpad or is_qemu, reason="test needs breakpad backend")
+@pytest.mark.skipif(is_wine, reason="Wine does not terminate after stack overflow")
 def test_breakpad_stack_overflow_stdout(cmake, stack_size):
     env = dict(os.environ)
     if stack_size:
@@ -383,9 +399,38 @@ def test_breakpad_stack_overflow_stdout(cmake, stack_size):
 
     envelope = Envelope.deserialize(output)
 
-    assert_crash_timestamp(has_files, tmp_path)
+    assert_no_crash_timestamp(has_files, tmp_path)
     assert_meta(envelope, integration="breakpad")
     assert_breadcrumb(envelope)
     assert_attachment(envelope)
     assert_minidump(envelope)
     assert_breakpad_crash(envelope)
+
+
+@pytest.mark.skipif(not is_wine, reason="test needs Wine")
+def test_wine_context(cmake):
+    tmp_path = cmake(
+        ["sentry_example"],
+        {
+            "SENTRY_BACKEND": "none",
+            "SENTRY_TRANSPORT": "none",
+        },
+    )
+    env = dict(os.environ)
+    env.pop("STEAM_COMPAT_DATA_PATH", None)
+
+    output = check_output(
+        tmp_path,
+        "sentry_example",
+        ["stdout", "capture-event"],
+        env=env,
+    )
+    context = Envelope.deserialize(output).get_event()["contexts"]["wine"]
+
+    version = subprocess.check_output(["wine", "--version"], text=True).split()[0]
+    assert version.startswith("wine-")
+    assert context == {
+        "type": "runtime",
+        "name": "Wine",
+        "version": version.removeprefix("wine-"),
+    }

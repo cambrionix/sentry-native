@@ -1,11 +1,3 @@
-function(sentry_get_property NAME)
-	get_target_property(prop sentry "${NAME}")
-	if(NOT prop)
-		set(prop)
-	endif()
-	set("SENTRY_${NAME}" "${prop}" PARENT_SCOPE)
-endfunction()
-
 sentry_get_property(SOURCES)
 sentry_get_property(COMPILE_DEFINITIONS)
 sentry_get_property(INTERFACE_INCLUDE_DIRECTORIES)
@@ -19,12 +11,25 @@ add_executable(sentry_benchmark
 	${SENTRY_SOURCES}
 	benchmark_init.cpp
 	benchmark_backend.cpp
+	benchmark_breadcrumbs.cpp
+	benchmark_contexts.cpp
+	benchmark_logs.cpp
+	benchmark_metrics.cpp
+	benchmark_scope.cpp
+	benchmark_tags.cpp
 )
 
 if(SENTRY_BACKEND_CRASHPAD)
 	add_dependencies(sentry_benchmark crashpad::handler)
 	if(WIN32)
 		add_dependencies(sentry_benchmark crashpad::wer)
+	endif()
+endif()
+
+if(SENTRY_BACKEND_NATIVE)
+	add_dependencies(sentry_benchmark sentry-crash)
+	if(WIN32)
+		add_dependencies(sentry_benchmark sentry-wer)
 	endif()
 endif()
 

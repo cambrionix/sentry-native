@@ -22,7 +22,6 @@
 #include "sentry_utils.h"
 #include "sentry_uuid.h"
 #include "sentry_value.h"
-#include "transports/sentry_disk_transport.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -51,12 +50,150 @@
 #    if defined(SENTRY_PLATFORM_LINUX)
 #        include "unwinder/sentry_unwinder.h"
 #    endif
+#    if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+/**
+ * Read one logical line of `/proc/<pid>/maps`. A pathname longer than the
+ * buffer is truncated, and the rest of that line is consumed rather than
+ * handed to the next `fgets` as if it were a mapping of its own.
+ */
+static bool
+read_maps_line(FILE *f, char *line, size_t size)
+{
+    if (!fgets(line, size, f)) {
+        return false;
+    }
+    size_t len = strlen(line);
+    if (len > 0 && line[len - 1] == '\n') {
+        return true;
+    }
+    int c;
+    while ((c = fgetc(f)) != EOF && c != '\n') { }
+    return true;
+}
+#    endif
+#    if defined(__arm__)
+/**
+ * Every mapping of the crashed process, with its permission bits, recorded
+ * by `vma_capture` immediately after a thread's stack bytes have been copied
+ * out. Unlike the module inventory this includes anonymous and special
+ * mappings, so the ARM32 frame-pointer walk can answer "is this a return
+ * address" (executable, not writable) and "is this a saved frame pointer"
+ * (writable, above the current frame) without guessing. It is read after
+ * the stack copy on purpose: only the crashing thread is stopped while the
+ * daemon works, so the freshest view of the mappings is the one taken next
+ * to the bytes it will be asked about. `g_vma_complete` is true only when
+ * the whole file was read and recorded.
+ * ARM32 only: nothing else consumes it, so nothing else pays for it.
+ */
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+    bool write;
+    bool exec;
+} vma_range_t;
+static vma_range_t *g_vmas = NULL;
+static size_t g_vma_count = 0;
+static size_t g_vma_capacity = 0;
+static bool g_vma_alloc_failed = false;
+static bool g_vma_complete = false;
+
+static bool
+vma_record(uint64_t start, uint64_t end, const char *perms)
+{
+    if (g_vma_alloc_failed) {
+        return false;
+    }
+    if (g_vma_count == g_vma_capacity) {
+        size_t capacity = g_vma_capacity ? g_vma_capacity * 2 : 256;
+        if (capacity < g_vma_capacity
+            || capacity > SIZE_MAX / sizeof(vma_range_t)) {
+            g_vma_alloc_failed = true;
+            return false;
+        }
+        vma_range_t *grown = sentry_malloc(capacity * sizeof(vma_range_t));
+        if (!grown) {
+            g_vma_alloc_failed = true;
+            return false;
+        }
+        if (g_vmas) {
+            memcpy(grown, g_vmas, g_vma_count * sizeof(vma_range_t));
+            sentry_free(g_vmas);
+        }
+        g_vmas = grown;
+        g_vma_capacity = capacity;
+    }
+    g_vmas[g_vma_count].start = start;
+    g_vmas[g_vma_count].end = end;
+    g_vmas[g_vma_count].write = perms[1] == 'w';
+    g_vmas[g_vma_count].exec = perms[2] == 'x';
+    g_vma_count++;
+    return true;
+}
+
+static const vma_range_t *
+vma_containing(uint64_t addr)
+{
+    for (size_t i = 0; i < g_vma_count; i++) {
+        if (addr >= g_vmas[i].start && addr < g_vmas[i].end) {
+            return &g_vmas[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Read `/proc/<pid>/maps` into the VMA table, replacing whatever it held.
+ * Called right after a stack copy, so the walk judges the copied bytes
+ * against the mappings as they were at (nearly) the same moment.
+ */
+static void
+vma_capture(pid_t pid)
+{
+    g_vma_count = 0;
+    g_vma_complete = false;
+    g_vma_alloc_failed = false;
+
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *f = fopen(maps_path, "r");
+    if (!f) {
+        SENTRY_WARNF("Failed to open %s for mapping capture", maps_path);
+        return;
+    }
+    char line[1024];
+    bool ok = true;
+    while (read_maps_line(f, line, sizeof(line))) {
+        unsigned long long start, end;
+        char perms[5];
+        if (sscanf(line, "%llx-%llx %4s", &start, &end, perms) != 3) {
+            ok = false; // a line this parser cannot read is a mapping it
+                        // does not know about
+            continue;
+        }
+        if (!vma_record(start, end, perms)) {
+            ok = false;
+        }
+    }
+    g_vma_complete = ok && !ferror(f);
+    fclose(f);
+    SENTRY_DEBUGF("Captured %zu mappings (%s) from %s", g_vma_count,
+        g_vma_complete ? "complete" : "INCOMPLETE", maps_path);
+}
+#    endif
 #elif defined(SENTRY_PLATFORM_WINDOWS)
 #    include <dbghelp.h>
 #    include <fcntl.h>
 #    include <io.h>
 #    include <sys/stat.h>
 #    include <windows.h>
+
+// https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/ns-dbghelp-symbol_info
+#    ifndef SYMFLAG_EXPORT
+#        define SYMFLAG_EXPORT 0x00000200
+#    endif
+
+// Global handle for ReadProcessMemory callback and shared stack-walk session
+static HANDLE g_stack_walk_process = NULL;
 
 // Forward declaration for StackWalk64-based stack unwinding (defined later)
 static size_t walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
@@ -220,15 +357,109 @@ write_attachment_to_envelope(int fd, const char *file_path,
 static bool
 attachment_is_placeholder(const sentry_options_t *options, const char *path)
 {
-    sentry_attachment_t attachment = { 0 };
-    attachment.path = sentry__path_from_str(path);
-    if (!attachment.path) {
-        return false;
-    }
+    sentry_value_t attachment = sentry__attachment_from_file(path);
     bool is_placeholder
-        = sentry__attachment_is_placeholder(&attachment, options);
-    sentry__path_free(attachment.path);
+        = sentry__attachment_is_placeholder(attachment, options);
+    sentry_value_decref(attachment);
     return is_placeholder;
+}
+
+/**
+ * Reads a legacy JSON attachment manifest (TODO: remove in 1.0)
+ */
+static sentry_value_t
+read_legacy_manifest(const sentry_path_t *manifest_path)
+{
+    size_t buf_len = 0;
+    char *buf = sentry__path_read_to_buffer(manifest_path, &buf_len);
+    if (!buf) {
+        return sentry_value_new_list();
+    }
+
+    const char *start = buf;
+    const char *end = buf + buf_len;
+    while (start < end
+        && (*start == ' ' || *start == '\t' || *start == '\r'
+            || *start == '\n')) {
+        start++;
+    }
+    const char *trimmed_end = end;
+    while (trimmed_end > start
+        && (trimmed_end[-1] == ' ' || trimmed_end[-1] == '\t'
+            || trimmed_end[-1] == '\r' || trimmed_end[-1] == '\n')) {
+        trimmed_end--;
+    }
+    sentry_value_t legacy
+        = start < trimmed_end && *start == '[' && trimmed_end[-1] == ']'
+        ? sentry_value_from_json(start, (size_t)(trimmed_end - start))
+        : sentry_value_new_null();
+    sentry_free(buf);
+    if (sentry_value_get_type(legacy) != SENTRY_VALUE_TYPE_LIST) {
+        sentry_value_decref(legacy);
+        return sentry_value_new_null();
+    }
+
+    sentry_value_t attachments = sentry_value_new_list();
+    size_t len = sentry_value_get_length(legacy);
+    for (size_t i = 0; i < len; i++) {
+        sentry_value_t info = sentry_value_get_by_index(legacy, i);
+        const char *path
+            = sentry_value_as_string(sentry_value_get_by_key(info, "path"));
+        const char *filename
+            = sentry_value_as_string(sentry_value_get_by_key(info, "filename"));
+        if (sentry__string_empty(path) || sentry__string_empty(filename)) {
+            continue;
+        }
+        sentry_value_t attachment = sentry__attachment_from_file(path);
+        if (sentry_value_is_null(attachment)) {
+            continue;
+        }
+        sentry_attachment_set_filename(attachment, filename);
+        sentry_attachment_set_type(attachment,
+            sentry_value_as_string(
+                sentry_value_get_by_key(info, "attachment_type")));
+        sentry_attachment_set_content_type(attachment,
+            sentry_value_as_string(
+                sentry_value_get_by_key(info, "content_type")));
+        sentry_value_append(attachments, attachment);
+    }
+    sentry_value_decref(legacy);
+    return attachments;
+}
+
+static sentry_value_t
+read_attachment_manifest(const sentry_path_t *run_folder)
+{
+    sentry_path_t *path
+        = sentry__path_join_str(run_folder, "__sentry-attachments");
+    if (!path) {
+        return sentry_value_new_null();
+    }
+    sentry_value_t attachments = sentry__read_attachment_manifest(path);
+    if (sentry_value_is_null(attachments)) {
+        attachments = read_legacy_manifest(path);
+    }
+    sentry__path_free(path);
+    return attachments;
+}
+
+static void
+write_attachments_from_manifest(
+    int fd, const sentry_options_t *options, const sentry_path_t *run_folder)
+{
+    sentry_value_t attachments = read_attachment_manifest(run_folder);
+    size_t len = sentry_value_get_length(attachments);
+    for (size_t i = 0; i < len; i++) {
+        sentry_value_t attachment = sentry_value_get_by_index(attachments, i);
+        const char *path = sentry__attachment_get_path(attachment);
+        if (!attachment_is_placeholder(options, path)) {
+            write_attachment_to_envelope(fd, path,
+                sentry__attachment_get_filename(attachment),
+                sentry__attachment_get_type(attachment),
+                sentry__attachment_get_content_type(attachment));
+        }
+    }
+    sentry_value_decref(attachments);
 }
 
 // For each large attachment listed in `<run_folder>/__sentry-attachments`,
@@ -242,23 +473,7 @@ add_attachment_refs(sentry_envelope_t *envelope,
         || !options->enable_large_attachments || !run_folder) {
         return;
     }
-    sentry_path_t *attach_list_path
-        = sentry__path_join_str(run_folder, "__sentry-attachments");
-    if (!attach_list_path) {
-        SENTRY_WARN("Failed to resolve attachment manifest path");
-        return;
-    }
-    size_t attach_json_len = 0;
-    char *attach_json
-        = sentry__path_read_to_buffer(attach_list_path, &attach_json_len);
-    sentry__path_free(attach_list_path);
-    if (!attach_json) {
-        return;
-    }
-    sentry_value_t list = attach_json_len > 0
-        ? sentry__value_from_json(attach_json, attach_json_len)
-        : sentry_value_new_null();
-    sentry_free(attach_json);
+    sentry_value_t list = read_attachment_manifest(run_folder);
     if (sentry_value_is_null(list)) {
         SENTRY_WARN("Failed to parse attachment manifest");
         return;
@@ -267,51 +482,19 @@ add_attachment_refs(sentry_envelope_t *envelope,
     bool materialized = false;
     size_t len = sentry_value_get_length(list);
     for (size_t i = 0; i < len; i++) {
-        sentry_value_t info = sentry_value_get_by_index(list, i);
-        const char *path
-            = sentry_value_as_string(sentry_value_get_by_key(info, "path"));
-        const char *filename
-            = sentry_value_as_string(sentry_value_get_by_key(info, "filename"));
-        const char *attachment_type = sentry_value_as_string(
-            sentry_value_get_by_key(info, "attachment_type"));
-        const char *content_type = sentry_value_as_string(
-            sentry_value_get_by_key(info, "content_type"));
-        if (sentry__string_empty(path) || sentry__string_empty(filename)) {
-            SENTRY_WARN("Skipping malformed attachment manifest entry");
-            continue;
-        }
-        sentry_attachment_t attachment = { 0 };
-        attachment.path = sentry__path_from_str(path);
-        attachment.filename = sentry__path_from_str(filename);
-        if (!attachment.path || !attachment.filename) {
-            SENTRY_WARNF("Failed to allocate attachment paths for: %s", path);
-            sentry__path_free(attachment.path);
-            sentry__path_free(attachment.filename);
-            continue;
-        }
-        attachment.type
-            = (char *)((attachment_type && *attachment_type) ? attachment_type
-                                                             : NULL);
-        attachment.content_type
-            = sentry__string_empty(content_type) ? NULL : (char *)content_type;
-        if (!sentry__attachment_is_placeholder(&attachment, options)) {
-            sentry__path_free(attachment.path);
-            sentry__path_free(attachment.filename);
+        sentry_value_t attachment = sentry_value_get_by_index(list, i);
+        if (!sentry__attachment_is_placeholder(attachment, options)) {
             continue;
         }
         if (!materialized && !sentry__envelope_materialize(envelope)) {
             SENTRY_WARN("Failed to materialize envelope for attachment-refs");
-            sentry__path_free(attachment.path);
-            sentry__path_free(attachment.filename);
             break;
         }
         materialized = true;
         if (!sentry__cache_attachment_ref(
-                envelope, &attachment, options->run->cache_path, NULL)) {
+                envelope, attachment, options->run->cache_path, NULL)) {
             SENTRY_WARN("failed to cache attachment-ref");
         }
-        sentry__path_free(attachment.path);
-        sentry__path_free(attachment.filename);
     }
     sentry_value_decref(list);
 }
@@ -418,6 +601,41 @@ build_registers_from_ctx(const sentry_crash_context_t *ctx, size_t thread_idx)
         registers, "sp", sentry__value_new_addr(uctx->uc_mcontext.sp));
     sentry_value_set_by_key(
         registers, "pc", sentry__value_new_addr(uctx->uc_mcontext.pc));
+#    elif defined(__arm__)
+    sentry_value_set_by_key(
+        registers, "r0", sentry__value_new_addr(uctx->uc_mcontext.arm_r0));
+    sentry_value_set_by_key(
+        registers, "r1", sentry__value_new_addr(uctx->uc_mcontext.arm_r1));
+    sentry_value_set_by_key(
+        registers, "r2", sentry__value_new_addr(uctx->uc_mcontext.arm_r2));
+    sentry_value_set_by_key(
+        registers, "r3", sentry__value_new_addr(uctx->uc_mcontext.arm_r3));
+    sentry_value_set_by_key(
+        registers, "r4", sentry__value_new_addr(uctx->uc_mcontext.arm_r4));
+    sentry_value_set_by_key(
+        registers, "r5", sentry__value_new_addr(uctx->uc_mcontext.arm_r5));
+    sentry_value_set_by_key(
+        registers, "r6", sentry__value_new_addr(uctx->uc_mcontext.arm_r6));
+    sentry_value_set_by_key(
+        registers, "r7", sentry__value_new_addr(uctx->uc_mcontext.arm_r7));
+    sentry_value_set_by_key(
+        registers, "r8", sentry__value_new_addr(uctx->uc_mcontext.arm_r8));
+    sentry_value_set_by_key(
+        registers, "r9", sentry__value_new_addr(uctx->uc_mcontext.arm_r9));
+    sentry_value_set_by_key(
+        registers, "r10", sentry__value_new_addr(uctx->uc_mcontext.arm_r10));
+    sentry_value_set_by_key(
+        registers, "fp", sentry__value_new_addr(uctx->uc_mcontext.arm_fp));
+    sentry_value_set_by_key(
+        registers, "ip", sentry__value_new_addr(uctx->uc_mcontext.arm_ip));
+    sentry_value_set_by_key(
+        registers, "sp", sentry__value_new_addr(uctx->uc_mcontext.arm_sp));
+    sentry_value_set_by_key(
+        registers, "lr", sentry__value_new_addr(uctx->uc_mcontext.arm_lr));
+    sentry_value_set_by_key(
+        registers, "pc", sentry__value_new_addr(uctx->uc_mcontext.arm_pc));
+    sentry_value_set_by_key(
+        registers, "cpsr", sentry__value_new_addr(uctx->uc_mcontext.arm_cpsr));
 #    endif
 
 #elif defined(SENTRY_PLATFORM_MACOS)
@@ -588,14 +806,62 @@ static bool
 read_stack_value(const uint8_t *stack_buf, uint64_t stack_start,
     uint64_t stack_size, uint64_t addr, uint64_t *out_value)
 {
-    if (addr < stack_start
-        || addr + sizeof(uint64_t) > stack_start + stack_size) {
+    // Range-check by subtraction: `addr` comes from a frame pointer in a
+    // crashed process, and a corrupted value near the top of the address
+    // space would wrap an `addr + size` sum past the naive comparison.
+    if (addr < stack_start) {
         return false;
     }
     uint64_t offset = addr - stack_start;
-    memcpy(out_value, stack_buf + offset, sizeof(uint64_t));
+    if (offset > stack_size || stack_size - offset < sizeof(uintptr_t)) {
+        return false;
+    }
+    uintptr_t value = 0;
+    memcpy(&value, stack_buf + (size_t)offset, sizeof(value));
+    *out_value = (uint64_t)value;
     return true;
 }
+
+#if defined(__arm__)
+/**
+ * Does a (saved fp, return address) pair look like a frame record?
+ *
+ * Judged against the crashed process's mappings. A return address must be in
+ * an executable mapping that is not writable: that is what separates code
+ * from a stack (writable, and on some systems executable too) and from the
+ * heap. A non-zero saved fp must be above the current frame and in a
+ * writable mapping: stacks are writable, code is not, so the other compiler's
+ * record shape - whose "saved fp" is really a return address - is rejected
+ * even when code sits numerically below the stack. The walk reads frame
+ * records out of the one captured window, so a chain is followed only while
+ * it stays inside that window; a signal stack or a split stack that links to
+ * a lower or non-contiguous segment ends the walk. Not walked either: JIT
+ * code in writable mappings.
+ */
+static bool
+arm_frame_record_plausible(
+    uint64_t saved_fp, uint64_t return_addr, uint64_t current_fp)
+{
+    const vma_range_t *code = vma_containing(return_addr);
+    if (!code || !code->exec || code->write) {
+        return false;
+    }
+    if (saved_fp == 0) {
+        return true;
+    }
+    if (saved_fp <= current_fp) {
+        return false;
+    }
+    const vma_range_t *stack = vma_containing(saved_fp);
+    return stack && stack->write;
+}
+#endif
+
+#if defined(SENTRY_PLATFORM_MACOS) && defined(__aarch64__)
+#    define SENTRY__STRIP_PAC(addr) ((addr) & 0x00007FFFFFFFFFFFULL)
+#else
+#    define SENTRY__STRIP_PAC(addr) (addr)
+#endif
 
 /**
  * Check if an address looks like a valid code pointer.
@@ -605,7 +871,7 @@ static bool
 is_valid_code_addr(uint64_t addr)
 {
     // Must be non-null and in typical code range
-    if (addr == 0 || addr < 0x1000) {
+    if (addr < 0x1000) {
         return false;
     }
 #if defined(__x86_64__) || defined(_M_AMD64)
@@ -645,17 +911,18 @@ enrich_frame_with_module_info(
                 frame, "package", sentry_value_new_string(mod->name));
             // Note: Do NOT set image_addr on frames - it's not present in
             // minidump-derived events and may cause symbolicator issues
-            SENTRY_DEBUGF("Frame 0x%llx -> module %s", (unsigned long long)addr,
+            SENTRY_TRACEF("Frame 0x%llx -> module %s", (unsigned long long)addr,
                 mod->name);
             return;
         }
     }
     // No matching module found - log for debugging
-    SENTRY_DEBUGF("Frame 0x%llx NOT matched to any module (module_count=%u)",
+    SENTRY_TRACEF("Frame 0x%llx NOT matched to any module (module_count=%u)",
         (unsigned long long)addr, module_count);
 }
 
-#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)         \
+    || defined(SENTRY_PLATFORM_MACOS)
 static void enrich_frame_with_symbol(
     const sentry_crash_context_t *ctx, sentry_value_t frame, uint64_t addr);
 #endif
@@ -715,9 +982,9 @@ build_stacktrace_for_thread(
     fp = ctx->platform.mcontext.__ss.__rbp;
     sp = ctx->platform.mcontext.__ss.__rsp;
 #    elif defined(__aarch64__)
-    ip = SENTRY__ARM64_GET_PC(ctx->platform.mcontext.__ss);
-    fp = SENTRY__ARM64_GET_FP(ctx->platform.mcontext.__ss);
-    sp = SENTRY__ARM64_GET_SP(ctx->platform.mcontext.__ss);
+    ip = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_PC(ctx->platform.mcontext.__ss));
+    fp = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_FP(ctx->platform.mcontext.__ss));
+    sp = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_SP(ctx->platform.mcontext.__ss));
 #    endif
 #elif defined(SENTRY_PLATFORM_WINDOWS)
     // Use thread-specific context, defaulting to crashed thread
@@ -784,12 +1051,12 @@ build_stacktrace_for_thread(
         fp = thread->state.__ss.__rbp;
         sp = thread->state.__ss.__rsp;
 #    elif defined(__aarch64__)
-        ip = SENTRY__ARM64_GET_PC(thread->state.__ss);
-        fp = SENTRY__ARM64_GET_FP(thread->state.__ss);
-        sp = SENTRY__ARM64_GET_SP(thread->state.__ss);
+        ip = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_PC(thread->state.__ss));
+        fp = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_FP(thread->state.__ss));
+        sp = SENTRY__STRIP_PAC(SENTRY__ARM64_GET_SP(thread->state.__ss));
 #    endif
 
-        SENTRY_DEBUGF("Thread %zu: IP=0x%llx FP=0x%llx SP=0x%llx", idx,
+        SENTRY_TRACEF("Thread %zu: IP=0x%llx FP=0x%llx SP=0x%llx", idx,
             (unsigned long long)ip, (unsigned long long)fp,
             (unsigned long long)sp);
 
@@ -804,7 +1071,7 @@ build_stacktrace_for_thread(
                     if (bytes_read == (ssize_t)stack_size) {
                         // Stack was captured from SP upward
                         stack_start = sp;
-                        SENTRY_DEBUGF(
+                        SENTRY_TRACEF(
                             "Loaded stack: start=0x%llx size=%llu, FP offset "
                             "from SP=%lld",
                             (unsigned long long)stack_start,
@@ -823,7 +1090,7 @@ build_stacktrace_for_thread(
                 SENTRY_WARNF("Failed to open stack file: %s", stack_path);
             }
         } else {
-            SENTRY_DEBUGF("No stack file for thread %zu", idx);
+            SENTRY_TRACEF("No stack file for thread %zu", idx);
         }
     }
 #elif defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
@@ -849,6 +1116,9 @@ build_stacktrace_for_thread(
                 stack_size = (uint64_t)bytes_read;
                 SENTRY_DEBUGF(
                     "Read %zd bytes of stack from process %d", bytes_read, pid);
+#    if defined(__arm__)
+                vma_capture(pid);
+#    endif
             }
         }
     }
@@ -867,14 +1137,13 @@ build_stacktrace_for_thread(
         walk_thread_id = tctx->thread_id;
     }
 
-    HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-        FALSE, (DWORD)ctx->crashed_pid);
-    if (hProcess) {
+    if (g_stack_walk_process) {
         sentry_frame_info_t stack_frames[MAX_STACK_FRAMES];
         // Make a copy since StackWalk64 may modify the context
         CONTEXT ctx_copy = *walk_context;
-        size_t dbghelp_frame_count = walk_stack_with_dbghelp(hProcess,
-            walk_thread_id, &ctx_copy, ctx, stack_frames, MAX_STACK_FRAMES);
+        size_t dbghelp_frame_count
+            = walk_stack_with_dbghelp(g_stack_walk_process, walk_thread_id,
+                &ctx_copy, ctx, stack_frames, MAX_STACK_FRAMES);
 
         if (dbghelp_frame_count > 0) {
             // Build sentry frames from StackWalk64 results
@@ -920,15 +1189,8 @@ build_stacktrace_for_thread(
             sentry_value_set_by_key(stacktrace, "frames", frames);
             sentry_value_set_by_key(stacktrace, "registers",
                 build_registers_from_ctx(ctx, thread_idx));
-
-            CloseHandle(hProcess);
             return stacktrace;
         }
-
-        CloseHandle(hProcess);
-    } else {
-        SENTRY_WARNF("Failed to open process %d for stack walk (error %lu)",
-            ctx->crashed_pid, GetLastError());
     }
     // Fall through to add at least the IP frame below
 #endif
@@ -962,7 +1224,7 @@ build_stacktrace_for_thread(
                 : 0;
 
             if (remote_count > 0) {
-                SENTRY_DEBUGF("Remote unwound %zu frames for thread %d",
+                SENTRY_TRACEF("Remote unwound %zu frames for thread %d",
                     remote_count, tid);
 
                 for (size_t i = 0;
@@ -1086,7 +1348,8 @@ build_stacktrace_for_thread(
         sentry_value_set_by_key(temp_frames[frame_count], "trust",
             sentry_value_new_string("context"));
         enrich_frame_with_module_info(ctx, temp_frames[frame_count], ip);
-#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)         \
+    || defined(SENTRY_PLATFORM_MACOS)
         enrich_frame_with_symbol(ctx, temp_frames[frame_count], ip);
 #endif
         frame_count++;
@@ -1096,6 +1359,16 @@ build_stacktrace_for_thread(
     if (stack_buf && fp != 0 && frame_count < MAX_STACK_FRAMES) {
         uint64_t current_fp = fp;
         int walk_count = 0;
+#if defined(__arm__)
+        // Fail closed: without a complete picture of the mappings neither
+        // frame-record shape can be told from the other, and guessing would
+        // emit fabricated frames rather than a shorter, honest stack.
+        if (!g_vma_complete) {
+            SENTRY_TRACE(
+                "Mappings incomplete; skipping the ARM32 frame-pointer walk");
+            walk_count = MAX_STACK_FRAMES;
+        }
+#endif
 
         // Check if FP is within captured stack range
         uint64_t stack_end = stack_start + stack_size;
@@ -1109,11 +1382,49 @@ build_stacktrace_for_thread(
             uint64_t saved_fp = 0;
             uint64_t return_addr = 0;
 
+#if defined(__arm__)
+            // Two frame-record shapes coexist in one ARM32 process. GCC's
+            // `push {.., fp, lr}; add fp, sp, #N` leaves fp on the LR slot
+            // ([fp-4] = saved fp, [fp] = return address), while clang/LLVM's
+            // leaves it on the saved-fp slot ([fp] = saved fp, [fp+4] = return
+            // address). Read both records and keep the one shaped like a
+            // frame.
+            {
+                uint64_t fp_llvm = 0, ret_llvm = 0, fp_gcc = 0, ret_gcc = 0;
+                bool ok_llvm = read_stack_value(stack_buf, stack_start,
+                                   stack_size, current_fp, &fp_llvm)
+                    && read_stack_value(stack_buf, stack_start, stack_size,
+                        current_fp + sizeof(uintptr_t), &ret_llvm);
+                bool ok_gcc
+                    = read_stack_value(stack_buf, stack_start, stack_size,
+                          current_fp - sizeof(uintptr_t), &fp_gcc)
+                    && read_stack_value(stack_buf, stack_start, stack_size,
+                        current_fp, &ret_gcc);
+                if (ok_llvm
+                    && arm_frame_record_plausible(
+                        fp_llvm, ret_llvm, current_fp)) {
+                    saved_fp = fp_llvm;
+                    return_addr = ret_llvm;
+                } else if (ok_gcc
+                    && arm_frame_record_plausible(
+                        fp_gcc, ret_gcc, current_fp)) {
+                    saved_fp = fp_gcc;
+                    return_addr = ret_gcc;
+                } else {
+                    SENTRY_TRACEF("No frame record at FP=0x%llx (stack: 0x%llx "
+                                  "- 0x%llx)",
+                        (unsigned long long)current_fp,
+                        (unsigned long long)stack_start,
+                        (unsigned long long)stack_end);
+                    break;
+                }
+            }
+#else
             // Read saved frame pointer and return address
-            // Frame layout: [FP+0] = saved FP, [FP+8] = return addr
+            // Frame layout: [FP] = saved FP, [FP + pointer size] = return addr
             if (!read_stack_value(stack_buf, stack_start, stack_size,
                     current_fp, &saved_fp)) {
-                SENTRY_DEBUGF(
+                SENTRY_TRACEF(
                     "Cannot read saved FP at 0x%llx (stack: 0x%llx - 0x%llx)",
                     (unsigned long long)current_fp,
                     (unsigned long long)stack_start,
@@ -1121,19 +1432,22 @@ build_stacktrace_for_thread(
                 break;
             }
             if (!read_stack_value(stack_buf, stack_start, stack_size,
-                    current_fp + sizeof(uint64_t), &return_addr)) {
-                SENTRY_DEBUGF("Cannot read return addr at 0x%llx",
-                    (unsigned long long)(current_fp + sizeof(uint64_t)));
+                    current_fp + sizeof(uintptr_t), &return_addr)) {
+                SENTRY_TRACEF("Cannot read return addr at 0x%llx",
+                    (unsigned long long)(current_fp + sizeof(uintptr_t)));
                 break;
             }
+#endif
+            saved_fp = SENTRY__STRIP_PAC(saved_fp);
+            return_addr = SENTRY__STRIP_PAC(return_addr);
 
-            SENTRY_DEBUGF("Frame %d: FP=0x%llx saved_fp=0x%llx ret=0x%llx",
+            SENTRY_TRACEF("Frame %d: FP=0x%llx saved_fp=0x%llx ret=0x%llx",
                 walk_count, (unsigned long long)current_fp,
                 (unsigned long long)saved_fp, (unsigned long long)return_addr);
 
             // Validate the return address
             if (!is_valid_code_addr(return_addr)) {
-                SENTRY_DEBUGF("Invalid return addr 0x%llx",
+                SENTRY_TRACEF("Invalid return addr 0x%llx",
                     (unsigned long long)return_addr);
                 break;
             }
@@ -1147,7 +1461,8 @@ build_stacktrace_for_thread(
                 sentry_value_new_string("fp"));
             enrich_frame_with_module_info(
                 ctx, temp_frames[frame_count], return_addr);
-#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)         \
+    || defined(SENTRY_PLATFORM_MACOS)
             enrich_frame_with_symbol(
                 ctx, temp_frames[frame_count], return_addr);
 #endif
@@ -1156,7 +1471,7 @@ build_stacktrace_for_thread(
 
             // Check for end of chain
             if (saved_fp == 0 || saved_fp == current_fp) {
-                SENTRY_DEBUGF(
+                SENTRY_TRACEF(
                     "End of frame chain at FP=0x%llx (saved_fp=0x%llx)",
                     (unsigned long long)current_fp,
                     (unsigned long long)saved_fp);
@@ -1165,7 +1480,7 @@ build_stacktrace_for_thread(
 
             // Sanity check: frame pointer should increase (stack grows down)
             if (saved_fp < current_fp) {
-                SENTRY_DEBUGF("FP went backwards: 0x%llx -> 0x%llx",
+                SENTRY_TRACEF("FP went backwards: 0x%llx -> 0x%llx",
                     (unsigned long long)current_fp,
                     (unsigned long long)saved_fp);
                 break;
@@ -1174,7 +1489,7 @@ build_stacktrace_for_thread(
             current_fp = saved_fp;
         }
 
-        SENTRY_DEBUGF("Unwound %d frames total", frame_count);
+        SENTRY_TRACEF("Unwound %d frames total", frame_count);
     }
 
     // Free stack buffer
@@ -1213,7 +1528,7 @@ static size_t
 extract_elf_build_id_for_module(
     const char *elf_path, uint8_t *build_id, size_t max_len)
 {
-    int fd = open(elf_path, O_RDONLY);
+    int fd = sentry__elf_open(elf_path);
     if (fd < 0) {
         return 0;
     }
@@ -1347,7 +1662,7 @@ elf_locate_symtab(const char *path, int allow_dynsym, sym_source_t *src,
         debuglink_out[0] = '\0';
     }
 
-    int fd = open(path, O_RDONLY);
+    int fd = sentry__elf_open(path);
     if (fd < 0) {
         return 0;
     }
@@ -1543,7 +1858,7 @@ get_sym_source(const sentry_module_info_t *mod, uint32_t mod_idx)
             if (mod_bid_len && dbg_bid_len
                 && (mod_bid_len != dbg_bid_len
                     || memcmp(mod_bid, dbg_bid, mod_bid_len) != 0)) {
-                SENTRY_DEBUGF(
+                SENTRY_TRACEF(
                     "Split-debug candidate %s rejected: build-id mismatch",
                     candidate);
                 continue;
@@ -1581,7 +1896,7 @@ static int
 sym_source_lookup(const sym_source_t *src, uint64_t sym_target, char *name_out,
     size_t name_out_size)
 {
-    int fd = open(src->sym_path, O_RDONLY);
+    int fd = sentry__elf_open(src->sym_path);
     if (fd < 0) {
         return 0;
     }
@@ -1707,8 +2022,7 @@ capture_modules_from_proc_maps(sentry_crash_context_t *ctx)
     char line[1024];
     ctx->module_count = 0;
 
-    while (fgets(line, sizeof(line), f)
-        && ctx->module_count < SENTRY_CRASH_MAX_MODULES) {
+    while (read_maps_line(f, line, sizeof(line))) {
 
         // Parse line: "start-end perms offset dev inode pathname"
         unsigned long long start, end, offset;
@@ -1720,6 +2034,10 @@ capture_modules_from_proc_maps(sentry_crash_context_t *ctx)
 
         if (parsed < 4) {
             continue;
+        }
+
+        if (ctx->module_count >= SENTRY_CRASH_MAX_MODULES) {
+            break;
         }
 
         // Must have a valid pathname (not [stack], [heap], etc.)
@@ -1776,6 +2094,10 @@ capture_modules_from_proc_maps(sentry_crash_context_t *ctx)
         memcpy(mod->name, pathname, copy_len);
         mod->name[copy_len] = '\0';
 
+        if (!sentry__elf_is_file(mod->name)) {
+            continue;
+        }
+
         // Extract Build ID from ELF file
         memset(mod->uuid, 0, sizeof(mod->uuid));
         mod->pdb_age = 0; // Not used on Linux, only for Windows PE modules
@@ -1785,7 +2107,7 @@ capture_modules_from_proc_maps(sentry_crash_context_t *ctx)
         // Convert to little-endian GUID format for Sentry debug_id
         sentry__uuid_swap_guid_bytes(mod->uuid);
 
-        SENTRY_DEBUGF("Captured module: %s base=0x%llx size=0x%llx", mod->name,
+        SENTRY_TRACEF("Captured module: %s base=0x%llx size=0x%llx", mod->name,
             (unsigned long long)mod->base_address,
             (unsigned long long)mod->size);
 
@@ -1886,12 +2208,523 @@ enumerate_threads_from_proc(sentry_crash_context_t *ctx)
 }
 #endif // SENTRY_PLATFORM_LINUX || SENTRY_PLATFORM_ANDROID
 
+#if defined(SENTRY_PLATFORM_MACOS)
+#    include <libkern/OSByteOrder.h>
+#    include <mach-o/fat.h>
+#    include <mach-o/loader.h>
+#    include <mach-o/nlist.h>
+
+// Upper bound on a resolved symbol name; mirrors dbghelp's MAX_SYM_NAME.
+#    define SENTRY_MAX_SYM_NAME 2000
+
+#    if defined(__x86_64__)
+#        define SENTRY_MACHO_CPU_TYPE CPU_TYPE_X86_64
+#    elif defined(__aarch64__)
+#        define SENTRY_MACHO_CPU_TYPE CPU_TYPE_ARM64
+#    endif
+
+/**
+ * Location of the symbol/string tables and the LC_FUNCTION_STARTS payload
+ * within a Mach-O file. All offsets are absolute file offsets (already
+ * adjusted for the fat slice on universal binaries).
+ */
+typedef struct {
+    char path[SENTRY_CRASH_MAX_PATH];
+    int state; // 0 = unused, 1 = usable, -1 = no symbol table found
+    uint64_t text_vmaddr; // unslid __TEXT vmaddr of this image
+    uint64_t symtab_off;
+    uint32_t nsyms;
+    uint64_t strtab_off;
+    uint32_t strtab_size;
+    uint64_t fn_starts_off;
+    uint32_t fn_starts_size; // 0 when LC_FUNCTION_STARTS is absent
+} macho_sym_info_t;
+
+/**
+ * Per-module symbol sources: the module's own symbol table plus the dSYM
+ * companion consulted when the module was stripped of local symbols. The
+ * companion is resolved lazily on the first lookup miss in the module's
+ * own table.
+ */
+typedef struct {
+    macho_sym_info_t own;
+    macho_sym_info_t dsym;
+} sym_source_t;
+
+// Direct-mapped by module index; see enrich_frame_with_symbol. Being BSS,
+// only the slots touched during resolution are committed to physical memory.
+static sym_source_t g_sym_sources[SENTRY_CRASH_MAX_MODULES];
+
+static int
+is_zero_uuid(const uint8_t uuid[16])
+{
+    for (int i = 0; i < 16; i++) {
+        if (uuid[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * Parse the Mach-O file at `path` and record the location of its symbol
+ * table, its __TEXT vmaddr and its LC_FUNCTION_STARTS payload in `info`;
+ * the LC_UUID is reported via `uuid_out` for validation against the loaded
+ * image. Universal (fat) binaries are resolved to the slice matching the
+ * daemon's own architecture, which on macOS always matches the crashed
+ * process. Returns 1 when a usable symbol table was found, 0 otherwise
+ * (`info` may still carry usable function-starts data in that case).
+ */
+static int
+macho_locate_symtab(const char *path, macho_sym_info_t *info, uint8_t *uuid_out,
+    int *has_uuid_out)
+{
+    memset(info, 0, sizeof(*info));
+    *has_uuid_out = 0;
+    if ((size_t)snprintf(info->path, sizeof(info->path), "%s", path)
+        >= sizeof(info->path)) {
+        return 0;
+    }
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    // Universal binaries store fat headers big-endian.
+    uint64_t slice_off = 0;
+    struct fat_header fh;
+    if (pread(fd, &fh, sizeof(fh), 0) != sizeof(fh)) {
+        close(fd);
+        return 0;
+    }
+    if (fh.magic == FAT_MAGIC || fh.magic == FAT_CIGAM
+        || fh.magic == FAT_MAGIC_64 || fh.magic == FAT_CIGAM_64) {
+        int is64 = fh.magic == FAT_MAGIC_64 || fh.magic == FAT_CIGAM_64;
+        uint32_t nfat = OSSwapBigToHostInt32(fh.nfat_arch);
+        if (nfat > 128) {
+            close(fd);
+            return 0;
+        }
+        for (uint32_t i = 0; i < nfat && !slice_off; i++) {
+            if (is64) {
+                struct fat_arch_64 fa;
+                if (pread(fd, &fa, sizeof(fa),
+                        (off_t)(sizeof(fh) + i * sizeof(fa)))
+                    != sizeof(fa)) {
+                    break;
+                }
+                if ((cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa.cputype)
+                    == SENTRY_MACHO_CPU_TYPE) {
+                    slice_off = OSSwapBigToHostInt64(fa.offset);
+                }
+            } else {
+                struct fat_arch fa;
+                if (pread(fd, &fa, sizeof(fa),
+                        (off_t)(sizeof(fh) + i * sizeof(fa)))
+                    != sizeof(fa)) {
+                    break;
+                }
+                if ((cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa.cputype)
+                    == SENTRY_MACHO_CPU_TYPE) {
+                    slice_off = OSSwapBigToHostInt32(fa.offset);
+                }
+            }
+        }
+        if (!slice_off) {
+            close(fd);
+            return 0;
+        }
+    }
+
+    struct mach_header_64 mh;
+    if (pread(fd, &mh, sizeof(mh), (off_t)slice_off) != sizeof(mh)
+        || mh.magic != MH_MAGIC_64 || mh.cputype != SENTRY_MACHO_CPU_TYPE) {
+        close(fd);
+        return 0;
+    }
+
+    // Cap keeps a corrupt sizeofcmds from driving a huge allocation.
+    if (mh.sizeofcmds == 0 || mh.sizeofcmds > 32 * 1024 * 1024) {
+        close(fd);
+        return 0;
+    }
+    uint8_t *cmds = sentry_malloc(mh.sizeofcmds);
+    if (!cmds
+        || pread(fd, cmds, mh.sizeofcmds, (off_t)(slice_off + sizeof(mh)))
+            != (ssize_t)mh.sizeofcmds) {
+        sentry_free(cmds);
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    int have_text = 0;
+    struct symtab_command symtab;
+    int have_symtab = 0;
+
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < mh.ncmds; i++) {
+        if (pos + sizeof(struct load_command) > mh.sizeofcmds) {
+            break;
+        }
+        const struct load_command *lc
+            = (const struct load_command *)(cmds + pos);
+        if (lc->cmdsize < sizeof(struct load_command)
+            || lc->cmdsize > mh.sizeofcmds - pos) {
+            break;
+        }
+
+        if (lc->cmd == LC_SEGMENT_64
+            && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg
+                = (const struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, SEG_TEXT, sizeof(seg->segname)) == 0) {
+                info->text_vmaddr = seg->vmaddr;
+                have_text = 1;
+            }
+        } else if (lc->cmd == LC_SYMTAB
+            && lc->cmdsize >= sizeof(struct symtab_command)) {
+            symtab = *(const struct symtab_command *)lc;
+            have_symtab = 1;
+        } else if (lc->cmd == LC_FUNCTION_STARTS
+            && lc->cmdsize >= sizeof(struct linkedit_data_command)) {
+            const struct linkedit_data_command *led
+                = (const struct linkedit_data_command *)lc;
+            info->fn_starts_off = slice_off + led->dataoff;
+            info->fn_starts_size = led->datasize;
+        } else if (lc->cmd == LC_UUID
+            && lc->cmdsize >= sizeof(struct uuid_command)) {
+            memcpy(uuid_out, ((const struct uuid_command *)lc)->uuid, 16);
+            *has_uuid_out = 1;
+        }
+
+        pos += lc->cmdsize;
+    }
+    sentry_free(cmds);
+
+    // Function starts are deltas from the __TEXT vmaddr; without it they
+    // cannot be interpreted.
+    if (!have_text) {
+        info->fn_starts_size = 0;
+        return 0;
+    }
+    if (!have_symtab || symtab.nsyms == 0 || symtab.strsize == 0) {
+        return 0;
+    }
+    info->symtab_off = slice_off + symtab.symoff;
+    info->nsyms = symtab.nsyms;
+    info->strtab_off = slice_off + symtab.stroff;
+    info->strtab_size = symtab.strsize;
+    return 1;
+}
+
+/**
+ * Find the start address of the function containing `target` (an unslid
+ * vmaddr) using the module's LC_FUNCTION_STARTS payload (ULEB128 deltas
+ * accumulating from the __TEXT vmaddr). The payload survives `strip`, so
+ * it bounds symbol matches even when the symbol table doesn't: without the
+ * bound, addresses in symbol-table gaps would be attributed to unrelated
+ * neighboring functions (the ELF resolver gets the same guarantee from
+ * st_size). Returns 1 and sets `start_out` when the target falls at or
+ * after some function start, 0 otherwise.
+ */
+static int
+fn_starts_find(
+    const macho_sym_info_t *info, uint64_t target, uint64_t *start_out)
+{
+    // The payload is a few MB even for very large binaries; read it whole.
+    if (info->fn_starts_size == 0 || info->fn_starts_size > 64 * 1024 * 1024) {
+        return 0;
+    }
+    int fd = open(info->path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    uint8_t *buf = sentry_malloc(info->fn_starts_size);
+    if (!buf
+        || pread(fd, buf, info->fn_starts_size, (off_t)info->fn_starts_off)
+            != (ssize_t)info->fn_starts_size) {
+        sentry_free(buf);
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    uint64_t address = info->text_vmaddr;
+    uint64_t prev = 0;
+    int have_prev = 0;
+    size_t pos = 0;
+    while (pos < info->fn_starts_size) {
+        uint64_t delta = 0;
+        unsigned shift = 0;
+        int complete = 0;
+        while (pos < info->fn_starts_size && shift < 64) {
+            uint8_t byte = buf[pos++];
+            delta |= (uint64_t)(byte & 0x7f) << shift;
+            shift += 7;
+            if (!(byte & 0x80)) {
+                complete = 1;
+                break;
+            }
+        }
+        if (!complete || delta == 0) {
+            break; // truncated entry or zero-padding terminator
+        }
+        address += delta;
+        if (address > target) {
+            break;
+        }
+        prev = address;
+        have_prev = 1;
+    }
+    sentry_free(buf);
+
+    if (!have_prev) {
+        return 0;
+    }
+    *start_out = prev;
+    return 1;
+}
+
+/**
+ * Resolve the dSYM companion for a module following the standard bundle
+ * layout `<X>.dSYM/Contents/Resources/DWARF/<binary>`. Candidates are
+ * checked next to the module itself and - for executables nested in an
+ * .app bundle (the Unreal Engine packaged-game layout) - next to the
+ * bundle. Candidates are validated by LC_UUID equality with the loaded
+ * image; a companion without a matching UUID would resolve unrelated
+ * names.
+ */
+static void
+resolve_dsym(const sentry_module_info_t *mod, macho_sym_info_t *info)
+{
+    static const char app_suffix[] = ".app/Contents/MacOS/";
+
+    const char *slash = strrchr(mod->name, '/');
+    const char *base = slash ? slash + 1 : mod->name;
+    size_t base_len = strlen(base);
+
+    char candidate[SENTRY_CRASH_MAX_PATH];
+    for (int c = 0; c < 2; c++) {
+        int n;
+        if (c == 0) {
+            n = snprintf(candidate, sizeof(candidate),
+                "%s.dSYM/Contents/Resources/DWARF/%s", mod->name, base);
+        } else {
+            // <dir>/<name>.app/Contents/MacOS/<name> -> <dir>/<name>.dSYM
+            size_t suffix_len = base_len + (sizeof(app_suffix) - 1) + base_len;
+            size_t full_len = strlen(mod->name);
+            if (full_len <= suffix_len) {
+                continue;
+            }
+            size_t app_pos = full_len - suffix_len;
+            if (strncmp(mod->name + app_pos, base, base_len) != 0
+                || strncmp(mod->name + app_pos + base_len, app_suffix,
+                       sizeof(app_suffix) - 1)
+                    != 0) {
+                continue;
+            }
+            n = snprintf(candidate, sizeof(candidate),
+                "%.*s%s.dSYM/Contents/Resources/DWARF/%s", (int)app_pos,
+                mod->name, base, base);
+        }
+        if (n < 0 || (size_t)n >= sizeof(candidate)) {
+            continue;
+        }
+
+        uint8_t uuid[16];
+        int has_uuid = 0;
+        if (!macho_locate_symtab(candidate, info, uuid, &has_uuid)) {
+            continue;
+        }
+        if (has_uuid && !is_zero_uuid(mod->uuid)
+            && memcmp(uuid, mod->uuid, 16) != 0) {
+            SENTRY_TRACEF(
+                "dSYM candidate %s rejected: UUID mismatch", candidate);
+            continue;
+        }
+
+        SENTRY_DEBUGF("Using dSYM %s for module %s", candidate, mod->name);
+        info->state = 1;
+        return;
+    }
+
+    info->state = -1;
+}
+
+/**
+ * Find the symbol covering `target` (an unslid vmaddr in `info`'s address
+ * space) in the file's symbol table and copy its name into `name_out`. The
+ * table is scanned in fixed-size chunks and only the winning name is read
+ * from the string table, so large tables (dSYM companions of big binaries)
+ * are never loaded wholesale. When `fn_start` is non-NULL only a symbol
+ * placed exactly at the containing function's entry matches (Mach-O nlist
+ * entries carry no size, so nothing looser can be validated). Returns 1
+ * when a name was resolved.
+ */
+static int
+macho_sym_lookup(const macho_sym_info_t *info, uint64_t target,
+    const uint64_t *fn_start, char *name_out, size_t name_out_size)
+{
+    int fd = open(info->path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    struct nlist_64 chunk[256];
+
+    uint64_t best_value = 0;
+    uint32_t best_strx = 0;
+    int have_best = 0;
+
+    for (uint32_t idx = 0; idx < info->nsyms && !(have_best && fn_start);) {
+        size_t n = info->nsyms - idx;
+        if (n > sizeof(chunk) / sizeof(chunk[0])) {
+            n = sizeof(chunk) / sizeof(chunk[0]);
+        }
+        ssize_t want = (ssize_t)(n * sizeof(chunk[0]));
+        if (pread(fd, chunk, (size_t)want,
+                (off_t)(info->symtab_off + (uint64_t)idx * sizeof(chunk[0])))
+            != want) {
+            break;
+        }
+
+        for (size_t k = 0; k < n; k++) {
+            uint8_t type = chunk[k].n_type;
+            if ((type & N_STAB) || (type & N_TYPE) != N_SECT) {
+                continue;
+            }
+            uint64_t value = chunk[k].n_value;
+            uint32_t strx = chunk[k].n_un.n_strx;
+            if (value == 0 || strx == 0 || strx >= info->strtab_size) {
+                continue;
+            }
+            if (fn_start) {
+                if (value == *fn_start) {
+                    best_value = value;
+                    best_strx = strx;
+                    have_best = 1;
+                    break;
+                }
+            } else if (value <= target && (!have_best || value > best_value)) {
+                best_value = value;
+                best_strx = strx;
+                have_best = 1;
+            }
+        }
+
+        idx += (uint32_t)n;
+    }
+
+    int resolved = 0;
+    if (have_best) {
+        size_t max_read = info->strtab_size - best_strx;
+        if (max_read > name_out_size - 1) {
+            max_read = name_out_size - 1;
+        }
+        ssize_t got = pread(
+            fd, name_out, max_read, (off_t)(info->strtab_off + best_strx));
+        if (got > 0) {
+            name_out[got] = '\0';
+            resolved = name_out[0] != '\0';
+        }
+    }
+
+    close(fd);
+    return resolved;
+}
+
+/**
+ * Resolve the symbol name for a given instruction address from the Mach-O
+ * symbol table of the containing module (or its dSYM companion when the
+ * module was stripped of local symbols) and set the "function" key on the
+ * frame value.
+ */
+static void
+enrich_frame_with_symbol(
+    const sentry_crash_context_t *ctx, sentry_value_t frame, uint64_t addr)
+{
+    uint32_t module_count = MIN(ctx->module_count, SENTRY_CRASH_MAX_MODULES);
+    for (uint32_t i = 0; i < module_count; i++) {
+        const sentry_module_info_t *mod = &ctx->modules[i];
+        if (addr < mod->base_address || addr >= mod->base_address + mod->size) {
+            continue;
+        }
+
+        // The cache is direct-mapped by module index: within a frozen crash
+        // context each index maps to exactly one module, so a slot is
+        // resolved at most once and reused for every frame in that module.
+        sym_source_t *slot = &g_sym_sources[i];
+        if (slot->own.state == 0) {
+            uint8_t uuid[16];
+            int has_uuid = 0;
+            int usable
+                = macho_locate_symtab(mod->name, &slot->own, uuid, &has_uuid);
+            // A stale binary on disk would resolve unrelated names; trust
+            // the file only when its UUID matches the loaded image.
+            if (has_uuid && !is_zero_uuid(mod->uuid)
+                && memcmp(uuid, mod->uuid, 16) != 0) {
+                SENTRY_TRACEF(
+                    "Module file %s rejected: UUID mismatch", mod->name);
+                usable = 0;
+                slot->own.fn_starts_size = 0;
+            }
+            slot->own.state = usable ? 1 : -1;
+        }
+
+        uint64_t fn_start_rel = 0;
+        int have_bounds = 0;
+        if (slot->own.fn_starts_size > 0) {
+            uint64_t own_target
+                = addr - mod->base_address + slot->own.text_vmaddr;
+            uint64_t fn_start = 0;
+            if (!fn_starts_find(&slot->own, own_target, &fn_start)) {
+                // Not covered by any known function: an unresolved frame
+                // beats a wrong name.
+                return;
+            }
+            fn_start_rel = fn_start - slot->own.text_vmaddr;
+            have_bounds = 1;
+        }
+
+        char name[SENTRY_MAX_SYM_NAME];
+        int resolved = 0;
+        if (slot->own.state > 0) {
+            uint64_t target = addr - mod->base_address + slot->own.text_vmaddr;
+            uint64_t fn_start = fn_start_rel + slot->own.text_vmaddr;
+            resolved = macho_sym_lookup(&slot->own, target,
+                have_bounds ? &fn_start : NULL, name, sizeof(name));
+        }
+        if (!resolved) {
+            // A miss in the module's own table typically means stripped
+            // local symbols.
+            if (slot->dsym.state == 0) {
+                resolve_dsym(mod, &slot->dsym);
+            }
+            if (slot->dsym.state > 0) {
+                uint64_t target
+                    = addr - mod->base_address + slot->dsym.text_vmaddr;
+                uint64_t fn_start = fn_start_rel + slot->dsym.text_vmaddr;
+                resolved = macho_sym_lookup(&slot->dsym, target,
+                    have_bounds ? &fn_start : NULL, name, sizeof(name));
+            }
+        }
+
+        if (resolved) {
+            // Mach-O symbol names carry the C-ABI leading underscore.
+            const char *fn_name = name[0] == '_' ? name + 1 : name;
+            sentry_value_set_by_key(
+                frame, "function", sentry_value_new_string(fn_name));
+        }
+        return;
+    }
+}
+#endif // SENTRY_PLATFORM_MACOS
+
 #if defined(SENTRY_PLATFORM_WINDOWS)
 #    include <psapi.h>
 #    include <tlhelp32.h>
-
-// Global handle for ReadProcessMemory callback (set during stack walk)
-static HANDLE g_stack_walk_process = NULL;
 
 /**
  * Custom read memory callback for StackWalk64 to read from crashed process
@@ -1974,18 +2807,13 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
             sentry__stringbuilder_append_buf(&sb, path, dir_len);
         }
         char *path_utf8 = sentry__stringbuilder_into_string(&sb);
-        if (path_utf8 && path_utf8[0]) {
+        if (!sentry__string_empty(path_utf8)) {
             s_sym_search_path = sentry__string_to_wstr(path_utf8);
         }
         sentry_free(path_utf8);
     }
-
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
-        | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
-    if (!SymInitializeW(hProcess, s_sym_search_path, TRUE)) {
-        SENTRY_WARNF("SymInitialize failed: %lu", GetLastError());
-        CloseHandle(hThread);
-        return 0;
+    if (s_sym_search_path) {
+        SymSetSearchPathW(hProcess, s_sym_search_path);
     }
 
     CONTEXT ctx = *ctx_record;
@@ -2019,7 +2847,6 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
     stack_frame.AddrStack.Offset = ctx.Sp;
 #    else
     // Unsupported architecture
-    SymCleanup(hProcess);
     CloseHandle(hThread);
     return 0;
 #    endif
@@ -2048,8 +2875,10 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
             sym_info->SizeOfStruct = sizeof(SYMBOL_INFOW);
             sym_info->MaxNameLen = MAX_SYM_NAME;
 
+            // reject SYMFLAG_EXPORT: export fallback can misidentify functions
             if (SymFromAddrW(
-                    hProcess, stack_frame.AddrPC.Offset, NULL, sym_info)) {
+                    hProcess, stack_frame.AddrPC.Offset, NULL, sym_info)
+                && !(sym_info->Flags & SYMFLAG_EXPORT)) {
                 frames[frame_count].symbol
                     = sentry__string_from_wstr(sym_info->Name);
                 frames[frame_count].symbol_addr
@@ -2057,7 +2886,7 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
             }
         }
 
-        SENTRY_DEBUGF("StackWalk64 frame %zu: 0x%llx %s", frame_count,
+        SENTRY_TRACEF("StackWalk64 frame %zu: 0x%llx %s", frame_count,
             (unsigned long long)stack_frame.AddrPC.Offset,
             frames[frame_count].symbol ? frames[frame_count].symbol : "");
         frame_count++;
@@ -2065,11 +2894,9 @@ walk_stack_with_dbghelp(HANDLE hProcess, DWORD crashed_tid,
 
     sentry_free(sym_info);
 
-    SymCleanup(hProcess);
     CloseHandle(hThread);
-    g_stack_walk_process = NULL;
 
-    SENTRY_DEBUGF("StackWalk64 captured %zu frames", frame_count);
+    SENTRY_TRACEF("StackWalk64 captured %zu frames", frame_count);
     return frame_count;
 }
 
@@ -2251,7 +3078,7 @@ extract_pdb_info_from_process(HANDLE hProcess, uint64_t module_base,
             }
         }
 
-        SENTRY_DEBUGF("Extracted PDB info: age=%u, pdb=%s", *pdb_age,
+        SENTRY_TRACEF("Extracted PDB info: age=%u, pdb=%s", *pdb_age,
             pdb_name ? pdb_name : "(null)");
         return true;
     }
@@ -2314,7 +3141,7 @@ capture_modules_from_process(sentry_crash_context_t *ctx)
         extract_pdb_info_from_process(hProcess, mod->base_address, mod->uuid,
             &mod->pdb_age, mod->pdb_name, sizeof(mod->pdb_name));
 
-        SENTRY_DEBUGF("Captured module: %s base=0x%llx size=0x%llx pdb_age=%u",
+        SENTRY_TRACEF("Captured module: %s base=0x%llx size=0x%llx pdb_age=%u",
             mod->name, (unsigned long long)mod->base_address,
             (unsigned long long)mod->size, mod->pdb_age);
 
@@ -2472,7 +3299,7 @@ enumerate_threads_from_process(sentry_crash_context_t *ctx)
             ctx->platform.threads[thread_count].context = thread_ctx;
             thread_count++;
 
-            SENTRY_DEBUGF("Captured context for thread %lu",
+            SENTRY_TRACEF("Captured context for thread %lu",
                 (unsigned long)te32.th32ThreadID);
         } while (Thread32Next(hSnapshot, &te32));
     }
@@ -2517,16 +3344,8 @@ read_breadcrumb_ring_file(const sentry_path_t *run_folder, const char *name)
         sentry_free(buf);
         return sentry_value_new_null();
     }
-    sentry_value_t list = sentry__value_from_msgpack(buf, size);
+    sentry_value_t list = sentry_value_from_msgpack_stream(buf, size);
     sentry_free(buf);
-    // `sentry__value_from_msgpack` only builds a list when the file holds 2+
-    // concatenated values; a file with a single breadcrumb decodes to a bare
-    // object. Wrap it so the merge step (which ignores non-lists) keeps it.
-    if (sentry_value_get_type(list) == SENTRY_VALUE_TYPE_OBJECT) {
-        sentry_value_t wrapper = sentry_value_new_list();
-        sentry_value_append(wrapper, list);
-        return wrapper;
-    }
     return list;
 }
 
@@ -2562,6 +3381,38 @@ apply_breadcrumbs_from_ring_files(sentry_value_t event,
     }
 }
 
+#if defined(SENTRY_PLATFORM_WINDOWS)
+static bool
+is_wer_done(const sentry_crash_context_t *ctx)
+{
+    return sentry__atomic_fetch((volatile long *)&ctx->platform.wer_done) != 0;
+}
+
+static void
+apply_wer_context(sentry_value_t event, const sentry_crash_context_t *ctx)
+{
+    if (!is_wer_done(ctx)
+        || sentry__string_empty(ctx->platform.wer_report_id)) {
+        return;
+    }
+
+    sentry_value_t contexts = sentry_value_get_by_key(event, "contexts");
+    if (sentry_value_get_type(contexts) != SENTRY_VALUE_TYPE_OBJECT) {
+        contexts = sentry_value_new_object();
+        sentry_value_set_by_key(event, "contexts", contexts);
+    }
+
+    sentry_value_t wer = sentry_value_get_by_key(contexts, "wer");
+    if (sentry_value_get_type(wer) != SENTRY_VALUE_TYPE_OBJECT) {
+        wer = sentry_value_new_object();
+        sentry_value_set_by_key(contexts, "wer", wer);
+    }
+
+    sentry_value_set_by_key(
+        wer, "report_id", sentry_value_new_string(ctx->platform.wer_report_id));
+}
+#endif
+
 /**
  * Build a native event and set the level, mechanism, and handled state
  *
@@ -2579,7 +3430,7 @@ build_native_event(const sentry_crash_context_t *ctx,
 {
     // Read base event from parent's file
     sentry_value_t event = sentry_value_new_null();
-    if (event_file_path && event_file_path[0]) {
+    if (!sentry__string_empty(event_file_path)) {
         sentry_path_t *ev_path = sentry__path_from_str(event_file_path);
         if (ev_path) {
             size_t event_size = 0;
@@ -2587,7 +3438,7 @@ build_native_event(const sentry_crash_context_t *ctx,
                 = sentry__path_read_to_buffer(ev_path, &event_size);
             sentry__path_free(ev_path);
             if (event_json && event_size > 0) {
-                event = sentry__value_from_json(event_json, event_size);
+                event = sentry_value_from_json(event_json, event_size);
                 sentry_free(event_json);
             }
         }
@@ -2600,6 +3451,9 @@ build_native_event(const sentry_crash_context_t *ctx,
     }
 
     apply_breadcrumbs_from_ring_files(event, run_folder, ctx);
+#if defined(SENTRY_PLATFORM_WINDOWS)
+    apply_wer_context(event, ctx);
+#endif
 
     // Set platform to native
     sentry_value_set_by_key(
@@ -2608,13 +3462,14 @@ build_native_event(const sentry_crash_context_t *ctx,
     sentry_value_set_by_key(event, "level", sentry_value_new_string(level));
 
     // Build exception
-    const char *signal_name = "UNKNOWN";
 #if defined(SENTRY_PLATFORM_UNIX)
     int signal_number = ctx->platform.signum;
-    signal_name = get_signal_name(signal_number);
+    const char *signal_name = get_signal_name(signal_number);
 #elif defined(SENTRY_PLATFORM_WINDOWS)
     // Exception code is used directly below as unsigned
-    signal_name = "EXCEPTION";
+    const char *signal_name = "EXCEPTION";
+#else
+#    error Unsupported platform
 #endif
 
     sentry_value_t exc = sentry_value_new_object();
@@ -2653,6 +3508,23 @@ build_native_event(const sentry_crash_context_t *ctx,
     sentry_value_set_by_key(exc, "mechanism", mechanism);
 
     // Add stacktrace to exception
+#if defined(SENTRY_PLATFORM_WINDOWS)
+    g_stack_walk_process
+        = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE,
+            (DWORD)ctx->crashed_pid);
+    if (g_stack_walk_process) {
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
+            | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+        if (!SymInitializeW(g_stack_walk_process, NULL, TRUE)) {
+            SENTRY_WARNF("SymInitialize failed: %lu", GetLastError());
+            CloseHandle(g_stack_walk_process);
+            g_stack_walk_process = NULL;
+        }
+    } else {
+        SENTRY_WARNF("Failed to open process %d for stack walk (error %lu)",
+            ctx->crashed_pid, GetLastError());
+    }
+#endif
     sentry_value_set_by_key(exc, "stacktrace", build_stacktrace_from_ctx(ctx));
 
     // Wrap exception in values array
@@ -2666,6 +3538,16 @@ build_native_event(const sentry_crash_context_t *ctx,
     {
         sentry_value_t threads = sentry_value_new_object();
         sentry_value_t thread_values = sentry_value_new_list();
+
+        // Threads are always listed with their id and name. Whether the
+        // non-crashed ones also get a stacktrace depends on the configured
+        // stackwalk mode - walking every thread of a process with a high
+        // thread count can add a noticeable delay to crash collection.
+        const bool walk_all_threads = ctx->thread_stackwalk_mode
+            != SENTRY_THREAD_STACKWALK_MODE_CRASHED_ONLY;
+        if (!walk_all_threads) {
+            SENTRY_DEBUG("Stackwalk limited to the crashed thread");
+        }
 
 #if defined(SENTRY_PLATFORM_MACOS)
         // Add all captured threads
@@ -2691,7 +3573,7 @@ build_native_event(const sentry_crash_context_t *ctx,
 
             // Build stacktrace for non-crashed threads only
             // (crashed thread's stacktrace is already in exception.values)
-            if (!is_crashed) {
+            if (!is_crashed && walk_all_threads) {
                 sentry_value_t stacktrace = build_stacktrace_for_thread(ctx, i);
                 if (!sentry_value_is_null(stacktrace)) {
                     sentry_value_set_by_key(thread, "stacktrace", stacktrace);
@@ -2725,7 +3607,7 @@ build_native_event(const sentry_crash_context_t *ctx,
 
             // Build stacktrace for non-crashed threads only
             // (crashed thread's stacktrace is already in exception.values)
-            if (!is_crashed) {
+            if (!is_crashed && walk_all_threads) {
                 sentry_value_t stacktrace = build_stacktrace_for_thread(ctx, i);
                 if (!sentry_value_is_null(stacktrace)) {
                     sentry_value_set_by_key(thread, "stacktrace", stacktrace);
@@ -2761,7 +3643,7 @@ build_native_event(const sentry_crash_context_t *ctx,
 
             // Build stacktrace for non-crashed threads only
             // (crashed thread's stacktrace is already in exception.values)
-            if (!is_crashed) {
+            if (!is_crashed && walk_all_threads) {
                 sentry_value_t stacktrace = build_stacktrace_for_thread(ctx, i);
                 if (!sentry_value_is_null(stacktrace)) {
                     sentry_value_set_by_key(thread, "stacktrace", stacktrace);
@@ -2789,6 +3671,14 @@ build_native_event(const sentry_crash_context_t *ctx,
         sentry_value_set_by_key(threads, "values", thread_values);
         sentry_value_set_by_key(event, "threads", threads);
     }
+
+#if defined(SENTRY_PLATFORM_WINDOWS)
+    if (g_stack_walk_process) {
+        SymCleanup(g_stack_walk_process);
+        CloseHandle(g_stack_walk_process);
+        g_stack_walk_process = NULL;
+    }
+#endif
 
     // Add debug_meta with module images from crashed process
     // (ctx->modules[] was captured in the signal handler of the crashed
@@ -3023,7 +3913,7 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
     sentry_free(event_json);
 
     // Add minidump as attachment if provided
-    if (minidump_path && minidump_path[0]) {
+    if (!sentry__string_empty(minidump_path)) {
 #if defined(SENTRY_PLATFORM_UNIX)
         int minidump_fd = open(minidump_path, O_RDONLY);
 #elif defined(SENTRY_PLATFORM_WINDOWS)
@@ -3096,54 +3986,7 @@ write_envelope_with_native_stacktrace(const sentry_options_t *options,
 
     // Add scope attachments using metadata file
     if (run_folder) {
-        sentry_path_t *attach_list_path
-            = sentry__path_join_str(run_folder, "__sentry-attachments");
-        if (attach_list_path) {
-            size_t attach_json_len = 0;
-            char *attach_json = sentry__path_read_to_buffer(
-                attach_list_path, &attach_json_len);
-            sentry__path_free(attach_list_path);
-
-            if (attach_json && attach_json_len > 0) {
-                // Parse attachment list JSON
-                sentry_value_t attach_list
-                    = sentry__value_from_json(attach_json, attach_json_len);
-                sentry_free(attach_json);
-
-                if (!sentry_value_is_null(attach_list)) {
-                    size_t len = sentry_value_get_length(attach_list);
-                    for (size_t i = 0; i < len; i++) {
-                        sentry_value_t attach_info
-                            = sentry_value_get_by_index(attach_list, i);
-                        sentry_value_t path_val
-                            = sentry_value_get_by_key(attach_info, "path");
-                        sentry_value_t filename_val
-                            = sentry_value_get_by_key(attach_info, "filename");
-                        sentry_value_t attachment_type_val
-                            = sentry_value_get_by_key(
-                                attach_info, "attachment_type");
-                        sentry_value_t content_type_val
-                            = sentry_value_get_by_key(
-                                attach_info, "content_type");
-
-                        const char *path = sentry_value_as_string(path_val);
-                        const char *filename
-                            = sentry_value_as_string(filename_val);
-                        const char *attachment_type
-                            = sentry_value_as_string(attachment_type_val);
-                        const char *content_type
-                            = sentry_value_as_string(content_type_val);
-
-                        if (path && filename
-                            && !attachment_is_placeholder(options, path)) {
-                            write_attachment_to_envelope(fd, path, filename,
-                                attachment_type, content_type);
-                        }
-                    }
-                    sentry_value_decref(attach_list);
-                }
-            }
-        }
+        write_attachments_from_manifest(fd, options, run_folder);
     }
 
     // Add screenshot attachment if captured by the daemon
@@ -3198,8 +4041,7 @@ write_envelope_with_minidump(const sentry_options_t *options,
         char *base_json = sentry__path_read_to_buffer(ev_path, &base_size);
         sentry__path_free(ev_path);
         if (base_json && base_size > 0) {
-            sentry_value_t event
-                = sentry__value_from_json(base_json, base_size);
+            sentry_value_t event = sentry_value_from_json(base_json, base_size);
             if (sentry_value_is_null(event)) {
                 // Parsing the base event failed (e.g. truncated buffer or
                 // OOM). Don't serialize the null into "null" and ship an
@@ -3210,6 +4052,9 @@ write_envelope_with_minidump(const sentry_options_t *options,
                 event_size = event_json ? base_size : 0;
             } else {
                 apply_breadcrumbs_from_ring_files(event, run_folder, ctx);
+#if defined(SENTRY_PLATFORM_WINDOWS)
+                apply_wer_context(event, ctx);
+#endif
                 event_id = sentry__string_clone(sentry_value_as_string(
                     sentry_value_get_by_key(event, "event_id")));
                 event_json = sentry__value_to_json(event, &event_size);
@@ -3370,54 +4215,7 @@ write_envelope_with_minidump(const sentry_options_t *options,
 
     // Add scope attachments using metadata file
     if (run_folder) {
-        sentry_path_t *attach_list_path
-            = sentry__path_join_str(run_folder, "__sentry-attachments");
-        if (attach_list_path) {
-            size_t attach_json_len = 0;
-            char *attach_json = sentry__path_read_to_buffer(
-                attach_list_path, &attach_json_len);
-            sentry__path_free(attach_list_path);
-
-            if (attach_json && attach_json_len > 0) {
-                // Parse attachment list JSON
-                sentry_value_t attach_list
-                    = sentry__value_from_json(attach_json, attach_json_len);
-                sentry_free(attach_json);
-
-                if (!sentry_value_is_null(attach_list)) {
-                    size_t len = sentry_value_get_length(attach_list);
-                    for (size_t i = 0; i < len; i++) {
-                        sentry_value_t attach_info
-                            = sentry_value_get_by_index(attach_list, i);
-                        sentry_value_t path_val
-                            = sentry_value_get_by_key(attach_info, "path");
-                        sentry_value_t filename_val
-                            = sentry_value_get_by_key(attach_info, "filename");
-                        sentry_value_t attachment_type_val
-                            = sentry_value_get_by_key(
-                                attach_info, "attachment_type");
-                        sentry_value_t content_type_val
-                            = sentry_value_get_by_key(
-                                attach_info, "content_type");
-
-                        const char *path = sentry_value_as_string(path_val);
-                        const char *filename
-                            = sentry_value_as_string(filename_val);
-                        const char *attachment_type
-                            = sentry_value_as_string(attachment_type_val);
-                        const char *content_type
-                            = sentry_value_as_string(content_type_val);
-
-                        if (path && filename
-                            && !attachment_is_placeholder(options, path)) {
-                            write_attachment_to_envelope(fd, path, filename,
-                                attachment_type, content_type);
-                        }
-                    }
-                    sentry_value_decref(attach_list);
-                }
-            }
-        }
+        write_attachments_from_manifest(fd, options, run_folder);
     }
 
     // Add screenshot attachment if captured by the daemon
@@ -3486,14 +4284,13 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
     bool use_native_mode = (mode == SENTRY_CRASH_REPORTING_MODE_NATIVE
         || mode == SENTRY_CRASH_REPORTING_MODE_NATIVE_WITH_MINIDUMP);
 
-    // Generate minidump path in database directory
+    // Generate minidump path in run directory
     char minidump_path[SENTRY_CRASH_MAX_PATH] = { 0 };
-    const char *db_dir = ctx->database_path;
+    const char *run_dir = ctx->run_path;
 
     if (need_minidump) {
         int path_len = snprintf(minidump_path, sizeof(minidump_path),
-            "%s/sentry-minidump-%lu-%lu.dmp", db_dir,
-            (unsigned long)ctx->crashed_pid, (unsigned long)ctx->crashed_tid);
+            "%s/__sentry-crash.dmp", run_dir);
 
         if (path_len < 0 || path_len >= (int)sizeof(minidump_path)) {
             SENTRY_WARN("Minidump path truncated or invalid");
@@ -3565,39 +4362,25 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
     sentry_path_t *ev_path = sentry__path_from_str(event_path);
     sentry_path_t *run_folder = ev_path ? sentry__path_dir(ev_path) : NULL;
 
-    // Acquire the run directory lock file so that process_old_runs() in a
-    // new SDK run will skip this directory while the daemon is still
-    // processing the crash. The crashed process's flock() is released on
-    // death, so without this the new run could delete the directory.
-    sentry_filelock_t *run_lock = NULL;
-    if (run_folder) {
-        sentry_path_t *lock_path = sentry__path_append_str(run_folder, ".lock");
-        if (lock_path) {
-            run_lock = sentry__filelock_new(lock_path);
-            if (run_lock) {
-                if (!sentry__filelock_try_lock(run_lock)) {
-                    SENTRY_WARN("daemon could not acquire run folder lock");
-                    sentry__filelock_free(run_lock);
-                    run_lock = NULL;
-                }
-            }
-        }
+    // The crashing process dumps its pending logs, sessions, and transactions
+    // before notifying the daemon. Queue those before writing the crash
+    // envelope so an attachment-ref prewrite is not captured a second time.
+    if (run_folder && options && options->transport && options->run) {
+        sentry__process_run_envelopes(options, run_folder);
+    } else {
+        SENTRY_DEBUG("No run folder or transport for additional envelopes");
     }
 
-    // Create envelope file in database directory
+    // Create envelope file in run directory
     char envelope_path[SENTRY_CRASH_MAX_PATH];
-    int path_len = snprintf(envelope_path, sizeof(envelope_path),
-        "%s/sentry-envelope-%lu.env", db_dir, (unsigned long)ctx->crashed_pid);
+    int path_len = snprintf(
+        envelope_path, sizeof(envelope_path), "%s", ctx->envelope_path);
 
     if (path_len < 0 || path_len >= (int)sizeof(envelope_path)) {
         SENTRY_WARN("Envelope path truncated or invalid");
         sentry__path_free(ev_path);
         if (run_folder) {
             sentry__path_free(run_folder);
-        }
-        if (run_lock) {
-            sentry__filelock_unlock(run_lock);
-            sentry__filelock_free(run_lock);
         }
         goto done;
     }
@@ -3670,6 +4453,25 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
             enumerate_threads_from_process(ctx);
         }
     }
+
+#    if !defined(SENTRY_PLATFORM_XBOX)
+    // wer_enabled only confirms WER module registration. Wait only when
+    // wer_integration indicates the report ID and other metadata are expected,
+    // to avoid waiting for the full crash-handler timeout when the WER service
+    // is inactive.
+    if (ctx->platform.wer_enabled && ctx->platform.wer_integration
+        && !is_wer_done(ctx)) {
+        SENTRY_DEBUG("Waiting for WER report ID, allowing app process to exit");
+        sentry__atomic_store(&ctx->state, SENTRY_CRASH_STATE_PROCESSED);
+
+        int elapsed_ms = 0;
+        while (elapsed_ms < SENTRY_CRASH_HANDLER_WAIT_TIMEOUT_MS
+            && !is_wer_done(ctx)) {
+            Sleep(SENTRY_CRASH_HANDLER_POLL_INTERVAL_MS);
+            elapsed_ms += SENTRY_CRASH_HANDLER_POLL_INTERVAL_MS;
+        }
+    }
+#    endif
 #endif
 
     // Write envelope based on mode
@@ -3698,10 +4500,6 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
         sentry__path_free(ev_path);
         if (run_folder) {
             sentry__path_free(run_folder);
-        }
-        if (run_lock) {
-            sentry__filelock_unlock(run_lock);
-            sentry__filelock_free(run_lock);
         }
         goto done;
     }
@@ -3756,12 +4554,7 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
 
     SENTRY_DEBUG("Envelope loaded, capturing");
 
-    if (options->cache_keep && options->external_crash_reporter
-        && !sentry__envelope_materialize(envelope)) {
-        SENTRY_WARN("Failed to materialize envelope for external crash report");
-    }
-
-    // Capture directly, or pass to external crash reporter
+    // Launch reporter, or fall back to transport (consent/caching in core).
     if (!sentry__launch_external_crash_reporter(options, envelope)) {
         if (has_attachment_refs && options && options->run) {
             if (!sentry__run_write_envelope(options->run, envelope)) {
@@ -3782,25 +4575,27 @@ sentry__process_crash(const sentry_options_t *options, sentry_crash_ipc_t *ipc)
         crash_captured = true;
     }
 
-    // Clean up temporary envelope file (keep minidump for
-    // inspection/debugging)
+    // Keep the original crash envelope for the callback on the next launch.
+    if (!ctx->has_on_crashed_last_run) {
 #if defined(SENTRY_PLATFORM_UNIX)
-    unlink(envelope_path);
+        unlink(envelope_path);
 #elif defined(SENTRY_PLATFORM_WINDOWS)
-    wchar_t *wenvelope_unlink = sentry__string_to_wstr(envelope_path);
-    if (wenvelope_unlink) {
-        _wunlink(wenvelope_unlink);
-        sentry_free(wenvelope_unlink);
-    }
+        wchar_t *wenvelope_unlink = sentry__string_to_wstr(envelope_path);
+        if (wenvelope_unlink) {
+            _wunlink(wenvelope_unlink);
+            sentry_free(wenvelope_unlink);
+        }
 #endif
+    }
 
 cleanup:
     // Send the staged session-replay envelope same-session, enriched from the
     // crash event (`<run>/__sentry-event`) so it shares the crash's
-    // tags/contexts/trace. Only flush when the crash itself was delivered:
-    // `cleanup` is also reached via `goto` on error paths where the crash was
-    // never captured, and flushing there would consume (and delete) the staged
-    // replay for a crash that never arrived.
+    // tags/contexts/trace and embeds its breadcrumbs. Only flush when the
+    // crash itself was delivered: `cleanup` is also reached via `goto` on
+    // error paths where the crash was never captured, and flushing there
+    // would consume (and delete) the staged replay for a crash that never
+    // arrived.
     if (crash_captured && options && options->transport
         && sentry__session_replay_has_pending(options)) {
         sentry_value_t crash_event = sentry_value_new_null();
@@ -3808,65 +4603,22 @@ cleanup:
             size_t ev_len = 0;
             char *ev_json = sentry__path_read_to_buffer(ev_path, &ev_len);
             if (ev_json) {
-                crash_event = sentry__value_from_json(ev_json, ev_len);
+                crash_event = sentry_value_from_json(ev_json, ev_len);
                 sentry_free(ev_json);
             }
+        }
+        if (!sentry_value_is_null(crash_event)) {
+            // `__sentry-event` is scope-applied without breadcrumbs; merge
+            // the ring files so the replay recording can embed them
+            apply_breadcrumbs_from_ring_files(crash_event, run_folder, ctx);
         }
         sentry__session_replay_flush_pending(
             options, options->transport, crash_event);
         sentry_value_decref(crash_event);
     }
 
-    // Send all other envelopes from run folder (logs, etc.) before cleanup
-    if (run_folder && options && options->transport && options->run) {
-        SENTRY_DEBUG("Checking for additional envelopes in run folder");
-        sentry_pathiter_t *piter = sentry__path_iter_directory(run_folder);
-        if (piter) {
-            SENTRY_DEBUG("Iterating run folder for envelope files");
-            const sentry_path_t *file_path;
-            int envelope_count = 0;
-            while ((file_path = sentry__pathiter_next(piter)) != NULL) {
-                // Check if this is an envelope file (ends with .envelope)
-                const char *path_str = file_path->path;
-                size_t len = strlen(path_str);
-                if (len > 9 && strcmp(path_str + len - 9, ".envelope") == 0) {
-                    SENTRY_DEBUGF(
-                        "Sending envelope from run folder: %s", path_str);
-                    sentry_envelope_t *run_envelope
-                        = sentry__envelope_from_path(file_path);
-                    if (run_envelope) {
-                        sentry__capture_envelope(
-                            options->transport, run_envelope, options);
-                        envelope_count++;
-                    } else {
-                        SENTRY_WARNF("Failed to load envelope: %s", path_str);
-                    }
-                }
-            }
-            SENTRY_DEBUGF(
-                "Sent %d additional envelopes from run folder", envelope_count);
-            sentry__pathiter_free(piter);
-        } else {
-            SENTRY_DEBUG("Could not iterate run folder");
-        }
-    } else {
-        SENTRY_DEBUG("No run folder or transport for additional envelopes");
-    }
-
-    // Clean up the entire run folder (contains breadcrumbs, etc.)
-    if (run_folder) {
-        SENTRY_DEBUG("Cleaning up run folder");
-        sentry__path_remove_all(run_folder);
-        sentry__path_free(run_folder);
-    }
+    sentry__path_free(run_folder);
     sentry__path_free(ev_path);
-
-    // Release and clean up the lock file
-    if (run_lock) {
-        sentry__filelock_unlock(run_lock);
-        sentry__filelock_free(run_lock);
-    }
-    SENTRY_DEBUG("Cleaned up crash run folder and lock file");
 
     SENTRY_DEBUG("Crash processing completed successfully");
 
@@ -3874,6 +4626,22 @@ done:
     SENTRY_DEBUG("Processing crash - END");
     SENTRY_DEBUG("Crash processing complete");
     return crash_captured;
+}
+
+static void
+remove_pending_run_envelopes(const sentry_path_t *run_path)
+{
+    sentry_pathiter_t *it = sentry__path_iter_directory(run_path);
+    const sentry_path_t *file;
+    while (it && (file = sentry__pathiter_next(it)) != NULL) {
+        if (sentry__path_is_file(file) && !sentry__path_is_symlink(file)
+            && sentry__path_ends_with(file, ".envelope")
+            && !sentry__path_filename_matches(
+                file, "__sentry-crash.envelope")) {
+            sentry__path_remove(file);
+        }
+    }
+    sentry__pathiter_free(it);
 }
 
 /**
@@ -3954,17 +4722,14 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     }
 
     // Set up logging to file for daemon BEFORE redirecting streams
-    // Use same naming scheme as shared memory (PID ^ TID hash) to handle
-    // multiple threads in same process
     char log_path[SENTRY_CRASH_MAX_PATH];
     FILE *log_file = NULL;
-    uint32_t id = (uint32_t)((app_pid ^ (app_tid & 0xFFFFFFFF)) & 0xFFFFFFFF);
 
 #if defined(SENTRY_PLATFORM_WINDOWS)
     // On Windows, convert UTF-8 path to wide characters for proper file
     // handling
     int log_path_len = snprintf(log_path, sizeof(log_path),
-        "%s\\sentry-daemon-%08x.log", ipc->shmem->database_path, id);
+        "%s\\sentry-daemon.log", ipc->shmem->run_path);
 
     if (log_path_len > 0 && log_path_len < (int)sizeof(log_path)) {
         wchar_t *wlog_path = sentry__string_to_wstr(log_path);
@@ -3975,7 +4740,7 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     }
 #else
     int log_path_len = snprintf(log_path, sizeof(log_path),
-        "%s/sentry-daemon-%08x.log", ipc->shmem->database_path, id);
+        "%s/sentry-daemon.log", ipc->shmem->run_path);
 
     if (log_path_len > 0 && log_path_len < (int)sizeof(log_path)) {
         log_file = fopen(log_path, "w");
@@ -4038,6 +4803,8 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         return 1;
     }
 
+    sentry_options_set_database_path(options, ipc->shmem->database_path);
+
     // Use debug logging and screenshot settings from parent process
     sentry_options_set_debug(options, ipc->shmem->debug_enabled);
     options->attach_screenshot = ipc->shmem->attach_screenshot;
@@ -4079,17 +4846,17 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         options->user_agent = sentry__string_clone(ipc->shmem->user_agent);
     }
 
-    // Create run with database path
-    SENTRY_DEBUG("Creating run with database path");
-    sentry_path_t *db_path = sentry__path_from_str(ipc->shmem->database_path);
-    if (db_path) {
-        options->run = sentry__run_new(db_path);
+    // Adopt existing run
+    SENTRY_DEBUG("Adopting existing run");
+    sentry_path_t *run_path = sentry__path_from_str(ipc->shmem->run_path);
+    if (options->database_path && run_path) {
+        options->run = sentry__run_adopt(options->database_path, run_path);
         if (options->run) {
             options->run->require_user_consent
                 = ipc->shmem->require_user_consent;
         }
-        sentry__path_free(db_path);
     }
+    sentry__path_free(run_path);
 
     // Set external crash reporter if configured
     if (ipc->shmem->external_reporter_path[0] != '\0') {
@@ -4100,18 +4867,6 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
         if (reporter) {
             options->external_crash_reporter = reporter;
         }
-    }
-
-    // Transport is already initialized by sentry_options_new(), just start it
-    if (options->transport) {
-        SENTRY_DEBUG("Starting transport");
-        sentry__transport_startup(options->transport, options);
-        // Set http_retry after transport startup to keep daemon-side retry
-        // polling disabled, while letting capture cache consent-revoked
-        // envelopes in retry format for the app to send on restart.
-        options->http_retry = ipc->shmem->http_retry;
-    } else {
-        SENTRY_WARN("No transport available");
     }
 
     SENTRY_DEBUG("Daemon options fully initialized");
@@ -4142,6 +4897,23 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
     // Signal to parent that daemon is ready
     SENTRY_DEBUG("Signaling ready to parent");
     sentry__crash_ipc_signal_ready(ipc);
+
+    // Transport is already initialized by sentry_options_new(), except when
+    // SENTRY_TRANSPORT=none. Mirror sentry_init() by installing the internal
+    // null transport in that case, then start it.
+    if (!options->transport) {
+        options->transport = sentry__transport_new_null();
+    }
+    if (options->transport) {
+        SENTRY_DEBUG("Starting transport");
+        sentry__transport_startup(options->transport, options);
+        // Set http_retry after transport startup to keep daemon-side retry
+        // polling disabled, while letting capture cache consent-revoked
+        // envelopes in retry format for the app to send on restart.
+        options->http_retry = ipc->shmem->http_retry;
+    } else {
+        SENTRY_WARN("No transport available");
+    }
 
     SENTRY_DEBUG("Entering main loop");
 
@@ -4205,13 +4977,15 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
             if (rv != 0) {
                 SENTRY_WARN("transport did not shut down cleanly");
             }
-            dumped_envelopes = sentry__transport_dump_queue(
-                options->transport, options->run);
-            if (rv == 0 && !dumped_envelopes && options->run) {
-                sentry__run_clean(options->run, true);
+
+            if (crash_processed) {
+                dumped_envelopes = sentry__transport_dump_queue(
+                    options->transport, options->run);
+                if (rv == 0 && !dumped_envelopes && options->run) {
+                    remove_pending_run_envelopes(options->run->run_path);
+                }
             }
         }
-        sentry_options_free(options);
     }
     if (crash_processed) {
         // Mark as done
@@ -4225,283 +4999,15 @@ sentry__crash_daemon_main(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
 
     // Close log file
     if (log_file) {
+        sentry__logger_disable();
         fclose(log_file);
     }
 
+    if (options) {
+        sentry_options_free(options);
+    }
+
     return 0;
-}
-
-#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
-pid_t
-sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, int notify_eventfd,
-    int ready_eventfd, const char *handler_path)
-#elif defined(SENTRY_PLATFORM_MACOS)
-pid_t
-sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid,
-    int notify_pipe_read, int ready_pipe_write, int shm_fd,
-    const char *handler_path)
-#elif defined(SENTRY_PLATFORM_WINDOWS)
-pid_t
-sentry__crash_daemon_start(pid_t app_pid, uint64_t app_tid, HANDLE event_handle,
-    HANDLE ready_event_handle, const char *handler_path)
-#endif
-{
-#if defined(SENTRY_PLATFORM_MACOS)
-    // macOS: Use posix_spawn instead of fork+exec for App Sandbox
-    // compatibility. posix_spawn is Apple's recommended API and works correctly
-    // in sandboxed processes, unlike fork() which can have issues with sandbox
-    // inheritance.
-
-    // Resolve daemon path
-    char daemon_path[SENTRY_CRASH_MAX_PATH];
-    if (!sentry__string_empty(handler_path)) {
-        strncpy(daemon_path, handler_path, sizeof(daemon_path) - 1);
-        daemon_path[sizeof(daemon_path) - 1] = '\0';
-    } else {
-        char exe_path[SENTRY_CRASH_MAX_PATH];
-        uint32_t exe_size = sizeof(exe_path);
-        if (_NSGetExecutablePath(exe_path, &exe_size) != 0) {
-            SENTRY_WARN("Failed to get executable path for daemon");
-            return -1;
-        }
-        const char *slash = strrchr(exe_path, '/');
-        if (!slash
-            || (size_t)(slash - exe_path + 1) + strlen("sentry-crash")
-                >= sizeof(daemon_path)) {
-            SENTRY_WARN("Daemon path too long");
-            return -1;
-        }
-        size_t dir_len = (size_t)(slash - exe_path + 1);
-        memcpy(daemon_path, exe_path, dir_len);
-        strcpy(daemon_path + dir_len, "sentry-crash");
-    }
-
-    // Build argument strings (6 args: pid, tid, notify_fd, ready_fd, shm_fd)
-    char pid_str[32], tid_str[32], notify_str[32], ready_str[32], shm_str[32];
-    snprintf(pid_str, sizeof(pid_str), "%d", (int)app_pid);
-    snprintf(tid_str, sizeof(tid_str), "%" PRIx64, app_tid);
-    snprintf(notify_str, sizeof(notify_str), "%d", notify_pipe_read);
-    snprintf(ready_str, sizeof(ready_str), "%d", ready_pipe_write);
-    snprintf(shm_str, sizeof(shm_str), "%d", shm_fd);
-
-    char *spawn_argv[] = { "sentry-crash", pid_str, tid_str, notify_str,
-        ready_str, shm_str, NULL };
-
-    // Set up posix_spawn attributes
-    posix_spawnattr_t attr;
-    posix_spawnattr_init(&attr);
-    // POSIX_SPAWN_SETSID: create new session (like setsid() after fork)
-    // POSIX_SPAWN_CLOEXEC_DEFAULT: close all fds except explicitly inherited
-    short spawn_flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT;
-    posix_spawnattr_setflags(&attr, spawn_flags);
-
-    // Explicitly inherit only the fds the daemon needs
-    posix_spawn_file_actions_t file_actions;
-    posix_spawn_file_actions_init(&file_actions);
-    posix_spawn_file_actions_addinherit_np(&file_actions, notify_pipe_read);
-    posix_spawn_file_actions_addinherit_np(&file_actions, ready_pipe_write);
-    posix_spawn_file_actions_addinherit_np(&file_actions, shm_fd);
-    // Open /dev/null on stdin/stdout/stderr so the daemon starts with valid
-    // standard fds. Without this, POSIX_SPAWN_CLOEXEC_DEFAULT closes them,
-    // and the first fopen() in the daemon would get fd 0, which the daemon's
-    // own close(STDIN_FILENO) would then destroy.
-    // Skip if an IPC fd occupies that slot (e.g. caller closed stdin before
-    // sentry_init), to avoid clobbering it with /dev/null.
-    int std_fds[3] = { STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO };
-    int std_modes[3] = { O_RDONLY, O_WRONLY, O_WRONLY };
-    for (int i = 0; i < 3; i++) {
-        if (std_fds[i] != notify_pipe_read && std_fds[i] != ready_pipe_write
-            && std_fds[i] != shm_fd) {
-            posix_spawn_file_actions_addopen(
-                &file_actions, std_fds[i], "/dev/null", std_modes[i], 0);
-        }
-    }
-
-    pid_t daemon_pid;
-    int spawn_result = posix_spawn(&daemon_pid, daemon_path, &file_actions,
-        &attr, spawn_argv, *_NSGetEnviron());
-
-    posix_spawn_file_actions_destroy(&file_actions);
-    posix_spawnattr_destroy(&attr);
-
-    if (spawn_result != 0) {
-        SENTRY_WARNF("posix_spawn failed for %s: %s", daemon_path,
-            strerror(spawn_result));
-        return -1;
-    }
-
-    return daemon_pid;
-
-#elif defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_ANDROID)
-    // Linux: Use fork+exec
-    pid_t daemon_pid = fork();
-
-    if (daemon_pid < 0) {
-        SENTRY_WARN("Failed to fork daemon process");
-        return -1;
-    } else if (daemon_pid == 0) {
-        // Child process - exec sentry-crash
-        setsid();
-
-        // Clear FD_CLOEXEC on notify and ready fds so they survive exec
-        int notify_flags = fcntl(notify_eventfd, F_GETFD);
-        if (notify_flags != -1) {
-            fcntl(notify_eventfd, F_SETFD, notify_flags & ~FD_CLOEXEC);
-        }
-        int ready_flags = fcntl(ready_eventfd, F_GETFD);
-        if (ready_flags != -1) {
-            fcntl(ready_eventfd, F_SETFD, ready_flags & ~FD_CLOEXEC);
-        }
-
-        // Convert arguments to strings for exec
-        char pid_str[32], tid_str[32], notify_str[32], ready_str[32];
-        snprintf(pid_str, sizeof(pid_str), "%d", (int)app_pid);
-        snprintf(tid_str, sizeof(tid_str), "%" PRIx64, app_tid);
-        snprintf(notify_str, sizeof(notify_str), "%d", notify_eventfd);
-        snprintf(ready_str, sizeof(ready_str), "%d", ready_eventfd);
-
-        char *argv[]
-            = { "sentry-crash", pid_str, tid_str, notify_str, ready_str, NULL };
-
-        if (!sentry__string_empty(handler_path)) {
-            execv(handler_path, argv);
-        } else {
-            char exe_path[SENTRY_CRASH_MAX_PATH];
-            char daemon_exec_path[SENTRY_CRASH_MAX_PATH];
-
-            ssize_t exe_len
-                = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-            if (exe_len > 0) {
-                exe_path[exe_len] = '\0';
-                const char *slash = strrchr(exe_path, '/');
-                if (slash) {
-                    size_t dir_len = (size_t)(slash - exe_path + 1);
-                    if (dir_len + strlen("sentry-crash")
-                        < sizeof(daemon_exec_path)) {
-                        memcpy(daemon_exec_path, exe_path, dir_len);
-                        strcpy(daemon_exec_path + dir_len, "sentry-crash");
-                        execv(daemon_exec_path, argv);
-                    }
-                }
-            }
-        }
-
-        // exec failed - exit with error
-        perror("Failed to exec sentry-crash");
-        _exit(1);
-    }
-
-    // Parent process - return daemon PID
-    return daemon_pid;
-
-#elif defined(SENTRY_PLATFORM_WINDOWS)
-    // On Windows, create a separate daemon process using CreateProcess
-    // Spawn the sentry-crash.exe executable
-
-    wchar_t daemon_path_w[SENTRY_CRASH_MAX_PATH];
-
-    // If handler_path was explicitly set via options, use it directly
-    if (!sentry__string_empty(handler_path)) {
-        wchar_t *wpath = sentry__string_to_wstr(handler_path);
-        if (wpath) {
-            wcsncpy(daemon_path_w, wpath, SENTRY_CRASH_MAX_PATH - 1);
-            daemon_path_w[SENTRY_CRASH_MAX_PATH - 1] = L'\0';
-            sentry_free(wpath);
-        } else {
-            SENTRY_WARN("Failed to convert handler_path to wide string");
-            return (pid_t)-1;
-        }
-    } else {
-        // Try to find sentry-crash.exe in the same directory as the current
-        // executable
-        wchar_t exe_dir[SENTRY_CRASH_MAX_PATH];
-        DWORD len = GetModuleFileNameW(NULL, exe_dir, SENTRY_CRASH_MAX_PATH);
-        if (len == 0 || len >= SENTRY_CRASH_MAX_PATH) {
-            SENTRY_WARN("Failed to get current executable path");
-            return (pid_t)-1;
-        }
-
-        // Remove filename to get directory
-        wchar_t *last_slash = wcsrchr(exe_dir, L'\\');
-        if (last_slash) {
-            *(last_slash + 1) = L'\0'; // Keep the trailing backslash
-        }
-
-        // Build full path to sentry-crash.exe
-        int path_len = _snwprintf(daemon_path_w, SENTRY_CRASH_MAX_PATH,
-            L"%ssentry-crash.exe", exe_dir);
-        if (path_len < 0 || path_len >= SENTRY_CRASH_MAX_PATH) {
-            SENTRY_WARN("Daemon path too long");
-            return (pid_t)-1;
-        }
-    }
-
-    // Log the daemon path we're trying to launch for debugging
-    char *daemon_path_utf8 = sentry__string_from_wstr(daemon_path_w);
-    if (daemon_path_utf8) {
-        SENTRY_DEBUGF("Attempting to launch daemon: %s", daemon_path_utf8);
-        sentry_free(daemon_path_utf8);
-    }
-
-    // Build command line: sentry-crash.exe <app_pid> <app_tid> <event_handle>
-    // <ready_event_handle>
-    wchar_t cmd_line[SENTRY_CRASH_MAX_PATH + 128];
-    int cmd_len = _snwprintf(cmd_line, sizeof(cmd_line) / sizeof(wchar_t),
-        L"\"%s\" %lu %llx %llu %llu", daemon_path_w, (unsigned long)app_pid,
-        (unsigned long long)app_tid,
-        (unsigned long long)(uintptr_t)event_handle,
-        (unsigned long long)(uintptr_t)ready_event_handle);
-
-    if (cmd_len < 0 || cmd_len >= (int)(sizeof(cmd_line) / sizeof(wchar_t))) {
-        SENTRY_WARN("Command line too long for daemon spawn");
-        return (pid_t)-1;
-    }
-
-    // Prepare process creation structures
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    // Hide console window for daemon
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    ZeroMemory(&pi, sizeof(pi));
-
-    // Create the daemon process
-    if (!CreateProcessW(NULL, // Application name (use command line)
-            cmd_line, // Command line
-            NULL, // Process security attributes
-            NULL, // Thread security attributes
-            TRUE, // Inherit handles (for event_handle)
-            CREATE_NO_WINDOW | DETACHED_PROCESS, // Creation flags
-            NULL, // Environment
-            NULL, // Current directory
-            &si, // Startup info
-            &pi)) { // Process information
-        DWORD error = GetLastError();
-        char *daemon_path_err = sentry__string_from_wstr(daemon_path_w);
-        if (daemon_path_err) {
-            SENTRY_WARNF("Failed to create daemon process at '%s': Error %lu%s",
-                daemon_path_err, error,
-                error == 2       ? " (File not found)"
-                    : error == 3 ? " (Path not found)"
-                                 : "");
-            sentry_free(daemon_path_err);
-        } else {
-            SENTRY_WARNF("Failed to create daemon process: %lu", error);
-        }
-        return (pid_t)-1;
-    }
-
-    // Close thread handle (we don't need it)
-    CloseHandle(pi.hThread);
-
-    // Close process handle (daemon is independent)
-    CloseHandle(pi.hProcess);
-
-    // Return daemon process ID
-    return pi.dwProcessId;
-#endif
 }
 
 // When built as standalone executable, provide main entry point
